@@ -1,0 +1,177 @@
+# AUTOMATON TRADING
+
+A multi-agent trading system on Alpaca built from *Mortality Engineering* — the theory in
+**"I Built an AI That Dies If It Stops Making Money"**. Delivered as an installable
+DeepSeek Harness plugin: six agent-facing tools' worth of runtime, ten tools, a Web UI
+dashboard, and a paper/live trading population where the unprofitable **die**, the
+profitable **reproduce**, and every death leaves a record the living read.
+
+> Not investment advice. Paper mode is the default; live mode is gated by three
+> independent operator actions. Read `docs/ARCHITECTURE.md` §9 before pointing it at money.
+
+## What is here
+
+```
+docs/ARCHITECTURE.md      theory -> trading mapping, six roles + stoplines, death rules, brakes
+docs/CONTRACTS.md         module interfaces, data shapes, config defaults
+docs/RUNBOOK.md           operating guide: phases, commands, emergency procedures
+docs/VERIFICATION.md      what was verified, how to reproduce it, what was not
+packages/automaton-trading/   the plugin bundle (zero runtime dependencies)
+  index.js                Host plugin: 10 automaton_* tools + GET /automaton/state
+  client.js               Web UI dashboard (Settings -> Plugins tab; composer strip)
+  src/                    engine: treasurer, prospector, builder, executor, replicator,
+                          external reaper, ledger, registry, brakes, journal, brokers, sim
+  bin/automaton.mjs       operator CLI (probe, tick, run, simulate, journal, brakes, stop)
+  test/                   node:test suites (mortality, market, plugin, integration, security)
+.env.example              Alpaca credential template
+automaton-data/           runtime state (gitignored): registry, ledger, obituaries, traces
+```
+
+## Quick start
+
+```powershell
+cd D:\CounterStikers
+
+# 1. credentials (paper) — this build's .env is already populated for the supplied paper account
+Copy-Item .env.example .env   # only if .env is missing
+notepad .env        # ALPACA_API_KEY_ID=...  ALPACA_API_SECRET_KEY=...
+
+# 2. verify the account (no orders)
+node packages/automaton-trading/bin/automaton.mjs probe
+node packages/automaton-trading/bin/automaton.mjs config
+node packages/automaton-trading/bin/automaton.mjs brakes
+
+# 3. observe selection pressure without touching the broker
+node packages/automaton-trading/bin/automaton.mjs simulate --cycles 200 --population 100 --seed 7
+
+# 4. run the population (starts the external Reaper for paper/live)
+node packages/automaton-trading/bin/automaton.mjs run
+```
+
+The account must be able to carry the population: `population.initial × endowmentUsd` must stay
+inside the 80% allocation cap of broker equity. This build ships `automaton.config.json` tuned for
+the supplied **$2,000 paper account** and the requested population: **30 agents × $20 endowment**
+($600 allocated, 30%), $1 death floor, 20% drawdown death, $10 child endowment, 40 hypothesis
+candidates per cycle so every agent can trade its own strategy. Edit that file to scale the
+economics if the account or population changes (keep the `automaton-data/` mirror in sync — the
+Harness Host process runs with a different working directory).
+
+The population is **already seeded**: 30 generation-0 agents, each with a distinct deterministic
+genome (unique symbol × strategy-family pair, unique parameters) and a compiled strategy spec.
+At the 2026-10-24 paper snapshot: 30 alive / 0 dead / cap 60, $20.00 each, reconciliation `ok`.
+
+In the Harness chat: `automaton_status`, `automaton_tick`, `automaton_start`,
+`automaton_obituaries`, `automaton_brakes`, `automaton_simulate`, `automaton_config`,
+`automaton_agents`, `automaton_stop`, `automaton_emergency_stop`.
+Control panel: a **sidebar entry** (Automaton icon in the left sidebar) that opens the full
+dashboard in the central column — no floating window; the same dashboard is also a page in
+**Settings → Plugins → Automaton Trading**.
+
+Inside the dashboard: header stats, Start / Stop / Emergency controls, the operator Reaper row,
+and a clickable table of all agents. **Agents have memorable strategy names** instead of random
+ids (`Momentum AAPL`, `MeanRev NVDA`, `Breakout TSLA` …; the `atm-xxxxxxxx` id stays as the
+immutable key and secondary label). Each row shows both the inherited **Genome** strategy and the
+**Trading (spec)** actually compiled by the Builder, with a `≠` when they differ. Clicking a row
+opens a detail pane with **current holdings** (symbol, qty, avg/last price, market value,
+unrealized P&L, opened-at) and **past activity** (newest-first fills with side, qty, price,
+notional, realized P&L, time), plus strategy parameters, role costs and death info.
+
+The plugin is already installed in this profile: `@local/automaton-trading` v1.0.0, enabled,
+application `applied`. Reconfigure via its row in
+`packages/automaton-trading/cordis.patch.yml` (`stateDir`, `envFile`, `mode`, `autoStart`).
+
+## The idea in one paragraph
+
+In a normal agent economy, doing nothing is free, so agents idle. Give an agent a
+*metabolism* — an endowment that pays for inference, market data, and hosting, visible as
+**runway hours** rather than a balance — and doing nothing becomes the fastest way to die.
+The death condition lives outside the agent (a separate Reaper process that liquidates and
+writes the obituary, with `grace = 0`), so it cannot be argued away. Deaths are structured
+data; children inherit the parent genome plus **exactly one mutation** plus the obituary
+lessons. No role may both decide and act: the Treasurer never trades, the Prospector never
+sizes, the Builder never chooses the symbol, the Executor never sees account equity, the
+Replicator never computes surplus, and the Reaper is not reachable from the engine.
+
+Where trading differs from the article: an agent earns *return on capital*, not service
+revenue, so risk-of-ruin deaths (drawdown / daily loss) fire long before pure cost-burn
+would. Both are implemented; the simulation's `accelerated` preset makes costs dominant so
+selection is observable in minutes (it is labelled as such in every result and is **not**
+the operating config).
+
+## Safety
+
+- 14 hard denials enforced in code, before the broker client sees an order: no transfers/
+  withdrawals/ACH/wires/crypto/account changes (the methods do not exist), no margin,
+  leverage, shorting, or options, no off-session trading, symbol/size/spread caps, daily
+  order caps, daily-loss and drawdown deaths, live-mode arming, proof-required trades,
+  replication gates, kill switch, allocation cap, one-way death.
+- Paper is default. Live needs `mode=live` **and** `allowLive=true` **and** an operator
+  `LIVE_ARMED` marker (`automaton arm-live --confirm "ARM LIVE"`). Keys are read only from
+  `.env`; tool output and the status route are redacted.
+- The engine has no control surface over the Reaper. `automaton_stop` stops the loop only;
+  the Reaper keeps liquidating condemned agents.
+
+## Status (this build)
+
+- 5 test suites: mortality 55, market 21, plugin 28, independent integration 21 and
+  security 41 — **166 tests, 166 pass, 0 fail**. Run each file directly, e.g.
+  `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- Independent verification found 9 real defects across two rounds (Reaper kills not
+  persisted → resurrectable zombies; dry-run brake always NO_PROOF; unreachable
+  daily-loss death; generation truthiness; stale counters; sub-cent costs rounded away;
+  sim mode never executing death; replication gate ignoring the drawdown rule and thus
+  letting a birth kill the parent; day P&L not persisted). All fixed and re-verified;
+  `scripts/verify-fixes.mjs` runs 18 checks covering them.
+- **30-agent population seeded** for the $2,000 paper account: 30 × $20 = $600 allocated
+  (30%), $1 death floor, 20% drawdown death, $10 child endowment, cap 60. Each agent has a
+  distinct deterministic genome (10 symbols × momentum/meanrev/breakout, randomized
+  lookback/entryZ/exitZ/stop/target/hold/size/session) and a persisted compiled spec — 22
+  distinct proven symbol×family pairs, 30 distinct compiled strategy parameter sets.
+- **Sidebar control panel is live**: verified through the Client slot inspector —
+  `sidebar.panellist` has an active `automaton-trading` occupant (order 30) and the keyed `main`
+  slot has the `automaton-trading` dashboard panel; the old `shell.overlay` floating entry is
+  gone. The dashboard shows strategy **agent names**, genome-vs-spec, and per-agent drill-down
+  with holdings and past activity (30 unique names, tested). Operator controls go through a
+  loopback-only `POST /automaton/control`
+  (`start | stop | emergency-stop | reaper-stop`, confirm required where destructive).
+- **Reaper orphan incident (hardened)**: a Reaper left over from the previous app generation kept
+  saving a stale registry snapshot every 30 s (wiping agent names). A new Reaper now reloads
+  `registry.json`/`ledger.json` **before every sweep** and writes a heartbeat
+  (`reaper.heartbeat.json`, v2); `engine.start()` refuses to reuse a Reaper without a matching
+  heartbeat; the panel shows the Reaper row plus an operator-only two-step **Stop Reaper**
+  (`POST /automaton/control {"action":"reaper-stop","confirm":"STOP"}`, implemented in the Harness
+  Host). The engine still exposes no way to stop the Reaper and no agent tool exists for it.
+  If the Host cannot signal that process, run once in your own terminal:
+  `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*reaper-process.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`.
+- **Harness restart required** to load the new Host routes (`reaper-stop`, REAPER_UNAVAILABLE
+  handling) and the fixed engine modules. The client half (sidebar + main dashboard) is already
+  hot-loaded and its slots are active. After the restart the Reaper row can stop the stale
+  orphan, then **Start** spawns a fresh heartbeat-v2 Reaper: **1) Stop Reaper (if the stale
+  banner shows), 2) Start**.
+- Plugin installed and live: 10 `automaton_*` tools registered (verified returning the
+  30-agent snapshot), dashboard tab registered, kill-switch path verified end-to-end
+  (armed → file → status → cleared).
+- Simulated population (100 agents, 200 cycles, seed 7, accelerated preset): 17–25 dead by
+  drawdown, 75–83 alive; reproduction requires a parent that has actually grown, so it is
+  verified deterministically in the test suites and fires in paper/live only on real surplus.
+- **Paper account connectivity is verified against Alpaca** (2026-10-24): `probe` reads the real
+  account (equity $2,000, ACTIVE, market closed). A full 30-agent cycle consumed 1,172 real
+  hourly bars for 10 symbols, produced 22 dated-proof hypotheses, 30 compiled specs and 30
+  executions, placed **0 orders**, and the broker independently reports 0 orders / 0 positions.
+  The D3 wall denies with `MARKET_CLOSED` using the broker's own clock (next open Monday 09:30 ET).
+- **External Reaper verified against the paper account**: `engine.start()` spawns it detached
+  (pid alive), it swept the real account (`checked=2 killed=0`), and `engine.stop()` left it
+  running by design; it was then stopped as the operator.
+- Paper verification surfaced 3 more real defects, now fixed: the data API returns **no bars**
+  without an explicit window and pages multi-symbol requests one symbol at a time (broker now
+  requests a bounded window per symbol); D3 only checked the weekday time window, so a Saturday
+  signal could have been submitted (the broker clock is now forwarded into the brake chain);
+  weekend IEX spreads are gross so the paper spread ceiling is 100 bps.
+- **Harness restart required** to load the new Host routes and the fixed engine modules
+  (the plugin's module graph is cached); CLI and test runs already use the fixed code.
+- **Still unverified: actual paper fills and live trading.** The market was closed for the whole
+  build, so no order could legitimately fill; live mode was never armed. Control-panel rendering
+  is verified structurally (active slot occupant) but not visually.
+- The paper keys were supplied in chat and live only in the gitignored `.env`; they are not in the
+  package, the profile config, tool output, or the status route. Rotate them in the Alpaca dashboard
+  if you consider the chat exposure a risk.

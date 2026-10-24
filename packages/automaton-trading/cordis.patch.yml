@@ -1,0 +1,9 @@
+- insert:
+    - id: automaton-trading
+      name: '@local/automaton-trading'
+      config:
+        stateDir: 'D:\CounterStikers\automaton-data'
+        envFile: 'D:\CounterStikers\.env'
+        mode: paper
+        autoStart: false
+        allowLive: false

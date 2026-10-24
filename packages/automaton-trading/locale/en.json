@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Automaton Trading",
+    "description": "Mortality-engineered multi-agent trading on Alpaca: six roles, a death rule, replication with mutation, and an external Reaper. Adds the automaton_* agent tools, a live population dashboard in Settings, and a status strip under the chat composer."
+  }
+}

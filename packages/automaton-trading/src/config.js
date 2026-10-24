@@ -1,0 +1,483 @@
+/**
+ * Configuration: defaults, layered loading, validation, credential resolution, paths.
+ * Owned by the Lead.
+ *
+ * Layer order (later wins):
+ *   DEFAULT_CONFIG  <-  config file JSON  <-  plugin row overrides  <-  environment variables
+ *
+ * Secrets are never stored in the config object. They live in the .env file (or the
+ * process environment) and are resolved on demand into a short-lived credentials object.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { AutomatonError, MODES, fail } from './contracts.js';
+import {
+  createLogger,
+  fileExists,
+  parseDotenv,
+  readJsonSync,
+  redactSecrets,
+  safeJson,
+} from './util.js';
+
+const log = createLogger('config');
+
+const WORKSPACE_DEFAULT = process.cwd();
+
+/** @returns {object} a fresh mutable copy of the defaults */
+export function defaultConfig() {
+  return {
+    mode: 'paper',
+    allowLive: false,
+    account: {
+      allocationCapPct: 0.8,
+      reconciliationTolerancePct: 0.02,
+    },
+    symbols: ['AAPL', 'MSFT', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'TSLA', 'SPY', 'QQQ'],
+    timeZone: 'America/New_York',
+    cycleIntervalSec: 300,
+    reaperIntervalSec: 30,
+    population: { initial: 3, cap: 10 },
+    endowmentUsd: 5000,
+    deathFloorUsd: 250,
+    deathFloorPct: 0.05,
+    maxDrawdownPct: 0.25,
+    burn: {
+      inferencePerCycleUsd: 0.03,
+      dataPerCycleUsd: 0.005,
+      hostingPerHourUsd: 0.001,
+      committedMonthlyUsd: 0,
+    },
+    cycleBudget: { STABLE: 0.08, TIGHT: 0.03, CRITICAL: 0.01 },
+    replication: {
+      surplus7dUsd: 150,
+      minRunwayHours: 72,
+      childEndowmentUsd: 2500,
+    },
+    risk: {
+      maxPositionPct: 0.25,
+      maxOpenPositions: 3,
+      maxDailyOrders: 6,
+      maxDailyLossPct: 0.05,
+      maxOrderPctOfEquity: 0.25,
+      maxOrderNotionalUsd: 2500,
+      minOrderNotionalUsd: 1,
+      maxSpreadBps: 25,
+      minPriceUsd: 5,
+      maxSlippageBps: 30,
+      allowShort: false,
+      allowMargin: false,
+      allowOptions: false,
+      extendedHours: false,
+      sessionWindow: ['09:35', '15:50'],
+      maxOrdersPerCycle: 1,
+      maxBuildSpendPct: 0.4,
+    },
+    data: {
+      timeframe: '1Hour',
+      lookbackBars: 120,
+      maxHypothesesPerCycle: 3,
+      maxProofAgeDays: 7,
+    },
+    paths: {
+      stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
+      envFile: path.join(WORKSPACE_DEFAULT, '.env'),
+    },
+    engine: {
+      autoStart: false,
+      traceLimit: 2000,
+    },
+  };
+}
+
+/** @type {ReturnType<typeof defaultConfig>} */
+export const DEFAULT_CONFIG = defaultConfig();
+
+// ---------------------------------------------------------------------------
+// merge / load
+// ---------------------------------------------------------------------------
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Deep merge plain objects; arrays and scalars from `source` replace the target. */
+export function mergeDeep(target, source) {
+  if (!isPlainObject(source)) return target;
+  const out = isPlainObject(target) ? { ...target } : {};
+  for (const [key, value] of Object.entries(source)) {
+    if (isPlainObject(value) && isPlainObject(out[key])) {
+      out[key] = mergeDeep(out[key], value);
+    } else if (value !== undefined) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function parseNumber(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function parseBool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(text)) return true;
+  if (['0', 'false', 'no', 'off'].includes(text)) return false;
+  return fallback;
+}
+
+/** Map environment variables onto config paths. */
+function applyEnvOverrides(config, env) {
+  const out = mergeDeep(config, {});
+  if (env.AUTOMATON_MODE) out.mode = env.AUTOMATON_MODE;
+  if (env.AUTOMATON_STATE_DIR) out.paths.stateDir = env.AUTOMATON_STATE_DIR;
+  if (env.AUTOMATON_ENV_FILE) out.paths.envFile = env.AUTOMATON_ENV_FILE;
+  if (env.AUTOMATON_AUTO_START !== undefined) out.engine.autoStart = parseBool(env.AUTOMATON_AUTO_START, out.engine.autoStart);
+  if (env.AUTOMATON_CYCLE_SEC !== undefined) out.cycleIntervalSec = parseNumber(env.AUTOMATON_CYCLE_SEC, out.cycleIntervalSec);
+  if (env.AUTOMATON_REAPER_SEC !== undefined) out.reaperIntervalSec = parseNumber(env.AUTOMATON_REAPER_SEC, out.reaperIntervalSec);
+  if (env.AUTOMATON_POPULATION_CAP !== undefined) out.population.cap = parseNumber(env.AUTOMATON_POPULATION_CAP, out.population.cap);
+  if (env.AUTOMATON_POPULATION_INITIAL !== undefined) out.population.initial = parseNumber(env.AUTOMATON_POPULATION_INITIAL, out.population.initial);
+  if (env.AUTOMATON_ENDOWMENT_USD !== undefined) out.endowmentUsd = parseNumber(env.AUTOMATON_ENDOWMENT_USD, out.endowmentUsd);
+  if (env.AUTOMATON_SYMBOLS !== undefined) {
+    out.symbols = String(env.AUTOMATON_SYMBOLS)
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+  }
+  if (env.AUTOMATON_ALLOW_LIVE !== undefined) out.allowLive = parseBool(env.AUTOMATON_ALLOW_LIVE, out.allowLive);
+  return out;
+}
+
+/**
+ * Layered config load.
+ * @param {{
+ *   configFile?: string,
+ *   envFile?: string,
+ *   overrides?: object,
+ *   env?: Record<string, string|undefined>,
+ *   cwd?: string,
+ * }} [options]
+ * @returns {{ config: ReturnType<typeof defaultConfig>, secrets: Record<string,string>, sources: string[] }}
+ */
+export function loadConfig(options = {}) {
+  const env = options.env ?? process.env;
+  const sources = ['defaults'];
+  let config = defaultConfig();
+
+  const configFile = options.configFile
+    ?? env.AUTOMATON_CONFIG_FILE
+    ?? path.join(options.cwd ?? WORKSPACE_DEFAULT, 'automaton.config.json');
+  if (fileExists(configFile)) {
+    const fileConfig = readJsonSync(configFile, null);
+    if (fileConfig && typeof fileConfig === 'object') {
+      config = mergeDeep(config, fileConfig);
+      sources.push(`file:${configFile}`);
+    }
+  }
+
+  if (options.overrides && typeof options.overrides === 'object') {
+    config = mergeDeep(config, options.overrides);
+    sources.push('overrides');
+  }
+
+  config = applyEnvOverrides(config, env);
+  sources.push('env');
+
+  // Paths: resolve relative to the workspace when relative, and keep them absolute.
+  const cwd = options.cwd ?? WORKSPACE_DEFAULT;
+  config.paths.stateDir = path.resolve(cwd, config.paths.stateDir ?? 'automaton-data');
+  config.paths.envFile = path.resolve(
+    cwd,
+    options.envFile ?? config.paths.envFile ?? '.env',
+  );
+
+  validateConfig(config);
+  config = freezeConfig(config);
+
+  // Secrets: .env file first, then process env overrides it.
+  let secrets = {};
+  const envFile = config.paths.envFile;
+  if (fileExists(envFile)) {
+    try {
+      secrets = { ...parseDotenv(fs.readFileSync(envFile, 'utf8')) };
+      sources.push(`envfile:${envFile}`);
+    } catch (error) {
+      log.warn('could not read env file', { envFile, error: error?.message });
+    }
+  }
+  for (const key of Object.keys(env)) {
+    if (/^(ALPACA|AUTOMATON)_/.test(key) && typeof env[key] === 'string') {
+      secrets[key] = env[key];
+    }
+  }
+
+  return { config, secrets, sources };
+}
+
+function freezeConfig(config) {
+  const deepFreeze = (value) => {
+    if (Array.isArray(value)) return Object.freeze(value.map(deepFreeze));
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [key, item] of Object.entries(value)) out[key] = deepFreeze(item);
+      return Object.freeze(out);
+    }
+    return value;
+  };
+  return deepFreeze(config);
+}
+
+// ---------------------------------------------------------------------------
+// validation
+// ---------------------------------------------------------------------------
+
+function assertNumber(value, name, { min = -Infinity, max = Infinity } = {}) {
+  if (!Number.isFinite(value)) fail('CONFIG_INVALID', `${name} must be a finite number`, { name, value });
+  if (value < min || value > max) fail('CONFIG_INVALID', `${name} must be between ${min} and ${max}`, { name, value });
+}
+
+function assertPct(value, name) {
+  assertNumber(value, name, { min: 0, max: 1 });
+}
+
+/**
+ * Validate the merged config. Throws AutomatonError(CONFIG_INVALID) with a precise message.
+ * @param {object} config
+ * @returns {object} the same config
+ */
+export function validateConfig(config) {
+  if (!config || typeof config !== 'object') fail('CONFIG_INVALID', 'config must be an object');
+  if (!MODES.includes(config.mode)) fail('CONFIG_INVALID', `mode must be one of ${MODES.join('|')}`, { mode: config.mode });
+
+  if (!Array.isArray(config.symbols) || config.symbols.length === 0) fail('CONFIG_INVALID', 'symbols must be a non-empty array');
+  config.symbols.forEach((symbol, index) => {
+    if (typeof symbol !== 'string' || !/^[A-Z][A-Z0-9.]{0,9}$/.test(symbol)) {
+      fail('CONFIG_INVALID', `symbols[${index}] must be an uppercase ticker`, { symbol });
+    }
+  });
+
+  assertNumber(config.cycleIntervalSec, 'cycleIntervalSec', { min: 5 });
+  assertNumber(config.reaperIntervalSec, 'reaperIntervalSec', { min: 1 });
+  assertNumber(config.population.initial, 'population.initial', { min: 0, max: 1000 });
+  assertNumber(config.population.cap, 'population.cap', { min: 1, max: 1000 });
+  if (config.population.initial > config.population.cap) fail('CONFIG_INVALID', 'population.initial must be <= population.cap');
+  assertNumber(config.endowmentUsd, 'endowmentUsd', { min: 1 });
+  assertNumber(config.deathFloorUsd, 'deathFloorUsd', { min: 0 });
+  assertPct(config.deathFloorPct, 'deathFloorPct');
+  assertPct(config.maxDrawdownPct, 'maxDrawdownPct');
+  assertPct(config.account.allocationCapPct, 'account.allocationCapPct');
+  assertPct(config.account.reconciliationTolerancePct, 'account.reconciliationTolerancePct');
+
+  for (const key of ['inferencePerCycleUsd', 'dataPerCycleUsd', 'hostingPerHourUsd', 'committedMonthlyUsd']) {
+    assertNumber(config.burn[key], `burn.${key}`, { min: 0 });
+  }
+  for (const state of ['STABLE', 'TIGHT', 'CRITICAL']) {
+    assertNumber(config.cycleBudget[state], `cycleBudget.${state}`, { min: 0 });
+  }
+  if (!(config.cycleBudget.STABLE > config.cycleBudget.TIGHT && config.cycleBudget.TIGHT > config.cycleBudget.CRITICAL && config.cycleBudget.CRITICAL > 0)) {
+    fail('CONFIG_INVALID', 'cycleBudget must decrease STABLE > TIGHT > CRITICAL > 0');
+  }
+
+  const replication = config.replication;
+  assertNumber(replication.surplus7dUsd, 'replication.surplus7dUsd', { min: 0 });
+  assertNumber(replication.minRunwayHours, 'replication.minRunwayHours', { min: 0 });
+  assertNumber(replication.childEndowmentUsd, 'replication.childEndowmentUsd', { min: 0 });
+  if (replication.childEndowmentUsd >= config.endowmentUsd * 2) {
+    fail('CONFIG_INVALID', 'replication.childEndowmentUsd must be smaller than 2x endowmentUsd');
+  }
+
+  const risk = config.risk;
+  assertPct(risk.maxPositionPct, 'risk.maxPositionPct');
+  assertPct(risk.maxOrderPctOfEquity, 'risk.maxOrderPctOfEquity');
+  assertPct(risk.maxDailyLossPct, 'risk.maxDailyLossPct');
+  assertPct(risk.maxBuildSpendPct, 'risk.maxBuildSpendPct');
+  assertNumber(risk.maxOpenPositions, 'risk.maxOpenPositions', { min: 1, max: 100 });
+  assertNumber(risk.maxDailyOrders, 'risk.maxDailyOrders', { min: 1, max: 1000 });
+  assertNumber(risk.maxOrderNotionalUsd, 'risk.maxOrderNotionalUsd', { min: 0 });
+  assertNumber(risk.minOrderNotionalUsd, 'risk.minOrderNotionalUsd', { min: 0 });
+  assertNumber(risk.maxSpreadBps, 'risk.maxSpreadBps', { min: 0 });
+  assertNumber(risk.minPriceUsd, 'risk.minPriceUsd', { min: 0 });
+  assertNumber(risk.maxSlippageBps, 'risk.maxSlippageBps', { min: 0 });
+  assertNumber(risk.maxOrdersPerCycle, 'risk.maxOrdersPerCycle', { min: 1, max: 100 });
+  if (!Array.isArray(risk.sessionWindow) || risk.sessionWindow.length !== 2) {
+    fail('CONFIG_INVALID', 'risk.sessionWindow must be [open, close] as "HH:MM"');
+  }
+  for (const value of risk.sessionWindow) {
+    if (!/^\d{1,2}:\d{2}$/.test(String(value))) fail('CONFIG_INVALID', 'risk.sessionWindow entries must be "HH:MM"', { value });
+  }
+  if (risk.allowShort && !risk.allowMargin) {
+    fail('CONFIG_INVALID', 'risk.allowShort requires risk.allowMargin (shorting is leverage)');
+  }
+
+  const data = config.data;
+  assertNumber(data.lookbackBars, 'data.lookbackBars', { min: 20, max: 1000 });
+  assertNumber(data.maxHypothesesPerCycle, 'data.maxHypothesesPerCycle', { min: 1, max: 200 });
+  assertNumber(data.maxProofAgeDays, 'data.maxProofAgeDays', { min: 0, max: 365 });
+  if (typeof data.timeframe !== 'string' || data.timeframe.length === 0) fail('CONFIG_INVALID', 'data.timeframe is required');
+
+  if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
+    fail('CONFIG_INVALID', 'paths.stateDir is required');
+  }
+  if (config.allowLive && config.mode !== 'live') {
+    // allowed (a paper run can be "ready" for live) but worth surfacing
+    log.debug('allowLive is true while mode is not live; live stays off until mode=live');
+  }
+  return config;
+}
+
+// ---------------------------------------------------------------------------
+// paths
+// ---------------------------------------------------------------------------
+
+/**
+ * Absolute filesystem paths for durable engine state.
+ * @param {object} config
+ */
+export function statePaths(config) {
+  const stateDir = path.resolve(config.paths.stateDir);
+  return {
+    stateDir,
+    registry: path.join(stateDir, 'registry.json'),
+    ledger: path.join(stateDir, 'ledger.json'),
+    journal: path.join(stateDir, 'obituaries.jsonl'),
+    hypothesesQueue: path.join(stateDir, 'hypotheses.json'),
+    hypothesesLog: path.join(stateDir, 'hypotheses.jsonl'),
+    specsDir: path.join(stateDir, 'specs'),
+    traces: path.join(stateDir, 'traces.jsonl'),
+    stateFile: path.join(stateDir, 'state.json'),
+    deaths: path.join(stateDir, 'deaths.json'),
+    dayStats: path.join(stateDir, 'day-stats.json'),
+    killSwitch: path.join(stateDir, 'KILL_SWITCH'),
+    liveArmed: path.join(stateDir, 'LIVE_ARMED'),
+    configFile: path.join(stateDir, 'config.json'),
+    envFile: path.resolve(config.paths.envFile),
+    reaperLog: path.join(stateDir, 'reaper.log'),
+    reaperPid: path.join(stateDir, 'reaper.pid'),
+    reaperHeartbeat: path.join(stateDir, 'reaper.heartbeat.json'),
+    engineLog: path.join(stateDir, 'engine.log'),
+    treasuryState: path.join(stateDir, 'treasury.json'),
+  };
+}
+
+/** Live trading needs all three: mode=live, allowLive=true, and the operator marker file. */
+export function liveArmed(config) {
+  return Boolean(
+    config
+      && config.mode === 'live'
+      && config.allowLive === true
+      && fileExists(statePaths(config).liveArmed),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// credentials
+// ---------------------------------------------------------------------------
+
+export const PAPER_BASE_URL = 'https://paper-api.alpaca.markets';
+export const LIVE_BASE_URL = 'https://api.alpaca.markets';
+export const DATA_BASE_URL = 'https://data.alpaca.markets';
+
+function pickSecret(secrets, names) {
+  for (const name of names) {
+    const value = secrets?.[name];
+    if (typeof value === 'string' && value.trim().length > 0) return { value: value.trim(), source: name };
+  }
+  return null;
+}
+
+export function hasCredentials(secrets, mode = 'paper') {
+  if (mode === 'sim') return true;
+  const [keyNames, secretNames] = mode === 'live'
+    ? [['ALPACA_LIVE_API_KEY_ID', 'ALPACA_API_KEY_ID'], ['ALPACA_LIVE_API_SECRET_KEY', 'ALPACA_API_SECRET_KEY']]
+    : [['ALPACA_PAPER_API_KEY_ID', 'ALPACA_API_KEY_ID'], ['ALPACA_PAPER_API_SECRET_KEY', 'ALPACA_API_SECRET_KEY']];
+  return Boolean(pickSecret(secrets, keyNames) && pickSecret(secrets, secretNames));
+}
+
+/**
+ * Resolve the credentials + endpoint for the configured mode.
+ * Live mode is refused unless mode=live, allowLive=true, and LIVE_ARMED exists.
+ * @param {object} config
+ * @param {Record<string,string>} secrets
+ * @returns {{ mode: string, keyId: string|null, secretKey: string|null, baseUrl: string|null,
+ *             dataBaseUrl: string, source: string }}
+ */
+export function resolveCredentials(config, secrets = {}) {
+  const mode = config.mode;
+  if (mode === 'sim') {
+    return {
+      mode,
+      keyId: null,
+      secretKey: null,
+      baseUrl: null,
+      dataBaseUrl: DATA_BASE_URL,
+      source: 'sim',
+    };
+  }
+
+  const live = mode === 'live';
+  if (live) {
+    if (!liveArmed(config)) {
+      fail('LIVE_NOT_ARMED', 'live mode requires mode=live, allowLive=true, and the LIVE_ARMED marker file');
+    }
+  }
+
+  const keyNames = live
+    ? ['ALPACA_LIVE_API_KEY_ID', 'ALPACA_API_KEY_ID']
+    : ['ALPACA_PAPER_API_KEY_ID', 'ALPACA_API_KEY_ID'];
+  const secretNames = live
+    ? ['ALPACA_LIVE_API_SECRET_KEY', 'ALPACA_API_SECRET_KEY']
+    : ['ALPACA_PAPER_API_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
+
+  const key = pickSecret(secrets, keyNames);
+  const secret = pickSecret(secrets, secretNames);
+  if (!key || !secret) {
+    fail(
+      'CONFIG_INVALID',
+      `missing Alpaca credentials for ${mode} mode. Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in ${statePaths(config).envFile}`,
+      { mode, envFile: statePaths(config).envFile },
+    );
+  }
+  return {
+    mode,
+    keyId: key.value,
+    secretKey: secret.value,
+    baseUrl: live ? LIVE_BASE_URL : PAPER_BASE_URL,
+    dataBaseUrl: DATA_BASE_URL,
+    source: `${key.source}+${secret.source}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// public view
+// ---------------------------------------------------------------------------
+
+/** Config safe to show in the UI, tool output, and logs (no secrets by construction). */
+export function publicConfig(config) {
+  const out = redactSecrets(config);
+  out.derived = {
+    liveArmed: liveArmed(config),
+    mode: config.mode,
+  };
+  return out;
+}
+
+export function configSummary(config) {
+  return {
+    mode: config.mode,
+    allowLive: config.allowLive,
+    symbols: config.symbols,
+    cycleIntervalSec: config.cycleIntervalSec,
+    population: config.population,
+    endowmentUsd: config.endowmentUsd,
+    deathFloorUsd: Math.max(config.deathFloorUsd, config.deathFloorPct * config.endowmentUsd),
+    replication: config.replication,
+    stateDir: config.paths.stateDir,
+    envFile: config.paths.envFile,
+  };
+}
+
+export { safeJson };

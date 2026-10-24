@@ -1,0 +1,43 @@
+{
+  "mode": "paper",
+  "population": {
+    "initial": 30,
+    "cap": 60
+  },
+  "endowmentUsd": 20,
+  "deathFloorUsd": 1,
+  "deathFloorPct": 0.05,
+  "maxDrawdownPct": 0.2,
+  "burn": {
+    "inferencePerCycleUsd": 0.0002,
+    "dataPerCycleUsd": 0.00005,
+    "hostingPerHourUsd": 0.00001,
+    "committedMonthlyUsd": 0
+  },
+  "replication": {
+    "surplus7dUsd": 3,
+    "minRunwayHours": 72,
+    "childEndowmentUsd": 10
+  },
+  "risk": {
+    "maxPositionPct": 0.5,
+    "maxOpenPositions": 2,
+    "maxSpreadBps": 100,
+    "maxDailyOrders": 6,
+    "maxDailyLossPct": 0.2,
+    "maxOrderPctOfEquity": 0.5,
+    "maxOrderNotionalUsd": 20,
+    "minOrderNotionalUsd": 1
+  },
+  "data": {
+    "timeframe": "1Hour",
+    "lookbackBars": 120,
+    "maxHypothesesPerCycle": 40,
+    "maxProofAgeDays": 7
+  },
+  "engine": {
+    "autoStart": false,
+    "traceLimit": 2000,
+    "seed": 7
+  }
+}
