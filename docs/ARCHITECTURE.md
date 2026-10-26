@@ -69,6 +69,28 @@ them without touching money. A role must pay for its own inference — a seventh
 would be a named rejection nothing else performs, or it is a line item on the bill.
 (Per-role costs are attributed in the ledger, so this is measurable, not rhetorical.)
 
+### The research sidecar (advisory, isolated per agent)
+
+A per-agent news analyst sits **beside** the six roles, never as a seventh decision
+authority: it may only *advise* the Executor. Each living agent gets its own isolated LLM
+call (hourly by default) whose context contains exactly that agent's genome, spec, virtual
+book, news for its own symbols, and its own previous briefings — no other agent's book, no
+other role's memory, no shared conversation. Briefings are persisted per agent in
+`automaton-data/research/<agentId>.jsonl`.
+
+The advisory outputs are `sentiment`, `confidence`, `verdict` (`HOLD`/`AVOID`/`ALERT`),
+`catalysts`, `risks`, `summary`, `sources`. The Executor applies them only when
+`research.enabled && research.influence` and the briefing is fresh (`maxAgeSec`): a veto on
+new entries (recorded as `research_veto`, never a brake), a **size multiplier that can only
+shrink** orders, and an `research_alert` exit pressure on held positions. Every order still
+passes the full brake wall; the analyst has no order tool, no wallet access and no equality
+with a role.
+
+Economics: each successful briefing is charged to that agent's own ledger
+(category `research`, role `prospector`) at `research.costPerRunUsd` (~$0.001). The bill
+therefore shortens runway exactly like real inference does — research that does not pay for
+itself kills the agent that bought it. Full contract: `docs/RESEARCH.md`.
+
 ---
 
 ## 3. Metabolism, runway, death

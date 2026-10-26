@@ -26,6 +26,7 @@ import {
   statePaths,
 } from './config.js';
 import { createAutomaton } from './orchestrator.js';
+import { createHttpResearchGenerator } from './research.js';
 import { createBroker as createAlpacaBroker } from './broker-alpaca.js';
 import { createBroker as createSimBroker } from './broker-sim.js';
 import { createJournal } from './journal.js';
@@ -186,6 +187,22 @@ export function createEngine(options = {}) {
     return createAlpacaBroker(config, { secrets });
   }
 
+  /**
+   * LLM seam for the per-agent research sidecar. The Harness plugin injects a bridge to the
+   * Host `llm` service; a headless CLI falls back to the DeepSeek HTTP API when the key is in
+   * .env (`DEEPSEEK_API_KEY`). No key and no plugin bridge → research reports configured:false
+   * and trading continues deterministically.
+   */
+  function resolveResearchGenerate(state) {
+    if (typeof options.researchGenerate === 'function') return options.researchGenerate;
+    if (state.config.research?.enabled === false) return null;
+    return createHttpResearchGenerator({
+      env: { ...process.env, ...(state.secrets ?? {}) },
+      config: state.config,
+      logger,
+    });
+  }
+
   async function ensureAutomaton() {
     const state = await load();
     if (automaton) return automaton;
@@ -196,6 +213,7 @@ export function createEngine(options = {}) {
       broker,
       clock,
       logger,
+      researchGenerate: resolveResearchGenerate(state),
     });
     return automaton;
   }
@@ -358,10 +376,10 @@ export function createEngine(options = {}) {
         ...base.engine,
         running: automaton ? automaton.isRunning() : false,
         reaper: await reaperInfo(state),
+        research: base.engine?.research ?? null,
       },
     };
   }
-
   async function staticStatus(state) {
     const journal = createJournal({ paths: state.paths, config: state.config });
     const snapshot = await readJson(state.paths.stateFile, null);
@@ -377,6 +395,7 @@ export function createEngine(options = {}) {
         lastError: null,
         killSwitch: fileExists(state.paths.killSwitch),
         liveArmed: liveArmed(state.config),
+        research: null,
       },
       account: null,
       treasury: null,

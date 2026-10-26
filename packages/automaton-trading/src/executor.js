@@ -15,6 +15,11 @@
  * `sizePct * mandate.sizeBudgetUsd` and capped by absolute notional caps, rounded to
  * 4 decimal fractional shares, stamped `atm:<agentId>:<specId>:<seq>`.
  *
+ * Optional advisory input: `research` (an isolated per-agent briefing). When the
+ * sidecar is enabled and influencing, and the briefing is fresh, it can only veto an
+ * entry, shrink an entry, or force an exit. It never creates an order, never widens a
+ * size, and never bypasses the brake wall.
+ *
  * Contract: docs/CONTRACTS.md § "Data feeder / market helpers" (executor.js).
  * Owner: market teammate.
  *
@@ -22,7 +27,7 @@
  */
 
 import { fail } from './contracts.js';
-import { HOUR_MS, mean, round2, round4, SYSTEM_CLOCK } from './util.js';
+import { clamp, HOUR_MS, mean, round2, round4, SYSTEM_CLOCK } from './util.js';
 
 const MAX_BARS_FETCH = 240;
 
@@ -55,6 +60,53 @@ function timestampOf(value) {
     return Number.isFinite(ms) ? ms : null;
   }
   return null;
+}
+
+/** Research verdicts the executor understands; anything else behaves as HOLD. */
+export const RESEARCH_VERDICTS = Object.freeze(['HOLD', 'AVOID', 'ALERT']);
+
+/**
+ * Resolve whether a research briefing may influence this execution cycle.
+ *
+ * Research is advisory and double-gated: `config.research.enabled` (sidecar on) and
+ * `config.research.influence` (not shadow mode), plus freshness within `maxAgeSec`.
+ * Malformed/missing/stale briefings resolve to null, which means "exactly today's
+ * behaviour" — research can never widen a size, bypass a brake, or create an order.
+ *
+ * @param {{
+ *   research?: object|null,
+ *   config?: object,
+ *   atMs: number,
+ * }} input
+ * @returns {{verdict:string, sentiment:number, confidence:number, risks:string[], at:number}|null}
+ */
+export function resolveResearchBriefing({ research, config, atMs }) {
+  const cfg = config && typeof config === 'object' && config.research && typeof config.research === 'object'
+    ? config.research
+    : null;
+  if (!cfg || cfg.enabled !== true || cfg.influence !== true) return null;
+  if (!research || typeof research !== 'object') return null;
+  const maxAgeSec = numberOrNull(cfg.maxAgeSec);
+  if (maxAgeSec === null || maxAgeSec <= 0) return null;
+  const observedAtMs = timestampOf(research.atMs ?? research.at ?? research.observedAt ?? research.createdAt);
+  if (observedAtMs === null) return null;
+  const ageMs = atMs - observedAtMs;
+  if (ageMs > maxAgeSec * 1000) return null; // stale: ignored entirely
+  const rawSentiment = numberOrNull(research.sentiment);
+  if (rawSentiment === null) return null; // malformed briefing: ignored
+  const rawVerdict = typeof research.verdict === 'string' ? research.verdict.trim().toUpperCase() : 'HOLD';
+  const verdict = RESEARCH_VERDICTS.includes(rawVerdict) ? rawVerdict : 'HOLD';
+  const confidence = clamp(numberOrNull(research.confidence) ?? 0, 0, 1);
+  const risks = Array.isArray(research.risks)
+    ? research.risks.filter((risk) => typeof risk === 'string' && risk.trim() !== '')
+    : [];
+  return {
+    verdict,
+    sentiment: clamp(rawSentiment, -1, 1),
+    confidence,
+    risks,
+    at: observedAtMs,
+  };
 }
 
 /** Normalize one quote to { symbol, bid, ask, last, ts }. */
@@ -247,6 +299,9 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   const hardMaxNotionalUsd = Number.isFinite(risk.maxOrderNotionalUsd) ? risk.maxOrderNotionalUsd : Infinity;
   const maxOrderPctOfEquity = Number.isFinite(risk.maxOrderPctOfEquity) ? risk.maxOrderPctOfEquity : 0.25;
   const timeframe = config.data?.timeframe ?? '1Hour';
+  // Research influence is opt-in and gated by config.research (shadow mode = influence:false).
+  const researchConfig = config.research && typeof config.research === 'object' ? config.research : {};
+  const researchInfluenceEnabled = researchConfig.enabled === true && researchConfig.influence === true;
 
   /** Monotonic per-agent order sequence, so client_order_id never repeats. */
   const orderSeq = new Map();
@@ -265,11 +320,13 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      *   quotes?: Record<string, {bid?:number, ask?:number, last?:number, ts?:number}>,
      *   bars?: Record<string, Array<object>>|Array<object>,
      *   dayStats?: object, now?: number|string|Date,
+     *   research?: object|null,   // research.latest(agentId); advisory, fresh-only
+     *   marketOpen?: boolean, marketClock?: object,
      * }} args
      * @returns {Promise<{agentId:string, actions:Array<object>, orders:Array<object>,
      *           denied:Array<{code:string, reason:string}>, spentUsd:number}>}
      */
-    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, marketOpen, marketClock } = {}) {
+    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, marketOpen, marketClock } = {}) {
       const atMs = normalizeNow(nowInput, now);
       const at = new Date(atMs).toISOString();
       const agentId = String(agent?.id ?? agent?.agentId ?? spec?.agentId ?? '');
@@ -419,6 +476,32 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         ? mandate.allowedSymbols.map((s) => String(s).toUpperCase())
         : null;
 
+      // --- research influence (advisory, fresh-only, config-gated) -----------------
+      // `research` is research.latest(agentId). Research can only veto, shrink, or
+      // exit: it never increases a size, creates an order, or bypasses a brake.
+      const researchBriefing = researchInfluenceEnabled
+        ? resolveResearchBriefing({ research, config, atMs })
+        : null;
+      const researchEffect = researchBriefing
+        ? { verdict: researchBriefing.verdict, sentiment: researchBriefing.sentiment }
+        : null;
+      const researchVeto = Boolean(
+        researchBriefing
+        && (researchBriefing.verdict === 'AVOID'
+          || researchBriefing.verdict === 'ALERT'
+          || researchBriefing.sentiment <= -0.35
+          || researchBriefing.risks.length >= 2),
+      );
+      const researchExitAlert = Boolean(
+        researchBriefing
+        && (researchBriefing.verdict === 'ALERT' || researchBriefing.sentiment <= -0.5),
+      );
+      const researchSizeFactor = researchBriefing
+        ? researchBriefing.sentiment > 0
+          ? clamp(0.5 + researchBriefing.confidence * 0.5, 0.4, 1.0)
+          : 0.6
+        : 1;
+
       // --- own position book (never broker.getAccount) ----------------------------
       // Reconcile pending fills BEFORE reading the book so today's fills become positions.
       await reconcileBrokerFills();
@@ -509,7 +592,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
        * Check the brakes, submit, and book the fill for one intended order.
        * @returns {Promise<object|null>} submitted order or null when denied/skipped
        */
-      async function submitChecked({ symbol, side, qty, priceUsd, reason, kind, quote, positionsSnapshot }) {
+      async function submitChecked({ symbol, side, qty, priceUsd, reason, kind, quote, positionsSnapshot, research: actionResearch = null }) {
         const ticker = String(symbol).toUpperCase();
         const orderQty = round4(qty);
         if (!(orderQty > 0)) {
@@ -615,6 +698,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           orderId: resolvedOrder?.id ?? null,
           fillPriceUsd: bookedQty > 0 ? round2(booked.price) : null,
           pending: bookedQty === 0,
+          ...(actionResearch ? { research: actionResearch } : {}),
         });
         // Position book changed; keep the local map current for the rest of the cycle.
         if (bookedQty > 0) {
@@ -654,7 +738,13 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         const maxHoldBars = spec.params?.maxHoldBars ?? 12;
 
         let exitReason = null;
-        if (position.avgPriceUsd > 0 && quote.last <= stopPrice) exitReason = 'stop';
+        let exitResearch = null;
+        if (researchExitAlert) {
+          // Research pressure is risk-reducing, so it runs in the exit pass and before
+          // the mechanical rules: an isolated analyst calling ALERT forces the exit.
+          exitReason = 'research_alert';
+          exitResearch = { ...researchEffect, applied: 'exit' };
+        } else if (position.avgPriceUsd > 0 && quote.last <= stopPrice) exitReason = 'stop';
         else if (position.avgPriceUsd > 0 && quote.last >= targetPrice) exitReason = 'target';
         else if (barsHeld >= maxHoldBars) exitReason = 'max_hold';
         else if (signal.exit) exitReason = 'signal';
@@ -677,6 +767,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           kind: 'exit',
           quote,
           positionsSnapshot: Object.fromEntries(positions),
+          research: exitResearch,
         });
       }
 
@@ -712,9 +803,20 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
               reason: signal.reason ?? 'no_signal',
               z: signal.z,
             });
+          } else if (researchVeto) {
+            // The isolated analyst vetoed the entry that the signal would otherwise take.
+            // This is an advisory skip, not a brake denial: no order ever reaches the wall.
+            result.actions.push({
+              type: 'skip',
+              symbol,
+              reason: 'research_veto',
+              research: { ...researchEffect, applied: 'veto' },
+            });
           } else {
             const price = round4(quote.ask ?? quote.last);
-            const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd];
+            // Research sizing can only shrink: the factor multiplies the target notional
+            // before the existing mandate/risk caps are applied below.
+            const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor];
             if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
             if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
             if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -742,6 +844,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
               kind: 'entry',
               quote,
               positionsSnapshot: Object.fromEntries(positions),
+              research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
             });
           }
         }
@@ -759,6 +862,12 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         maxOrderPctOfEquity,
         timeframe,
         readsAccountEquity: false,
+        research: {
+          enabled: researchConfig.enabled === true,
+          influence: researchConfig.influence === true,
+          influenceActive: researchInfluenceEnabled,
+          maxAgeSec: Number.isFinite(Number(researchConfig.maxAgeSec)) ? Number(researchConfig.maxAgeSec) : null,
+        },
       };
     },
   };

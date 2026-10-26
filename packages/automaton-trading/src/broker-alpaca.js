@@ -6,6 +6,9 @@
  * wire, crypto, account-configuration, or margin-enablement method here, and no way
  * to add one from config. Their absence is the wall.
  *
+ * Data reads include the advisory news feed (`getNews`) used by the isolated research
+ * sidecar — read-only, never a trading capability.
+ *
  * The client never logs or returns key material. All timestamps are normalized to
  * epoch milliseconds and all broker numbers to JavaScript floats.
  *
@@ -153,6 +156,54 @@ export function mapPosition(raw) {
     marketValueUsd: parseNumber(raw.market_value, null),
     unrealizedPlUsd: parseNumber(raw.unrealized_pl, null),
   };
+}
+
+/**
+ * Map one raw Alpaca news item to the research-sidecar news shape.
+ * Returns null for an unusable item (empty headline / unparseable timestamp); a single
+ * bad item must never break the feed.
+ * @param {unknown} raw
+ * @returns {{id:string, headline:string, summary:string, source:string, url:string|null,
+ *            symbols:string[], createdAt:number}|null}
+ */
+export function mapNewsItem(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const headline = typeof raw.headline === 'string' ? raw.headline.trim() : '';
+  if (headline === '') return null; // empty headlines are not news
+  const createdAt = parseTimestamp(raw.created_at ?? raw.createdAt);
+  if (createdAt === null) return null;
+  const rawSymbols = Array.isArray(raw.symbols)
+    ? raw.symbols
+    : typeof raw.symbols === 'string'
+      ? raw.symbols.split(',')
+      : [];
+  const symbols = rawSymbols
+    .map((item) => String(item ?? '').trim().toUpperCase())
+    .filter((item) => item !== '');
+  return {
+    id: raw.id !== null && raw.id !== undefined && String(raw.id).trim() !== ''
+      ? String(raw.id)
+      : `${createdAt}:${headline.slice(0, 48)}`,
+    headline,
+    summary: typeof raw.summary === 'string' ? raw.summary : '',
+    source: typeof raw.source === 'string' ? raw.source : '',
+    url: typeof raw.url === 'string' && raw.url.trim() !== '' ? raw.url : null,
+    symbols,
+    createdAt,
+  };
+}
+
+/** Normalize a news start/end filter (epoch ms or ISO string) to a request ISO string. */
+function isoParam(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const ms = parseTimestamp(value);
+  return ms === null ? String(value) : new Date(ms).toISOString();
+}
+
+/** Normalize a news start/end filter to epoch ms for client-side filtering. */
+function filterMs(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return parseTimestamp(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +507,60 @@ export function createBroker(config, options = {}) {
         ask: parseNumber(quote.ap, null),
         ts: parseTimestamp(quote.t),
       };
+    },
+
+    /**
+     * Advisory company/market news for a set of symbols (research sidecar only).
+     *
+     * Read-only data: news never places orders and is never a trading capability. The
+     * feed is mapped defensively — one unusable item is dropped, never fatal — and the
+     * list is returned newest-first. A news outage is treated as "no news" (except for
+     * auth/rate-limit/config failures, which are surfaced so the operator can see them).
+     *
+     * @param {{symbols: string|string[], limit?: number, start?: string|number,
+     *          end?: string|number}} params
+     * @returns {Promise<Array<{id:string, headline:string, summary:string, source:string,
+     *           url:string|null, symbols:string[], createdAt:number}>>}
+     */
+    async getNews({ symbols, limit = 6, start, end } = {}) {
+      const list = normalizeSymbols(symbols);
+      if (list.length === 0) return [];
+      const effectiveLimit = Math.max(1, Math.min(50, Number(limit) || 6));
+      const startMs = filterMs(start);
+      const endMs = filterMs(end);
+      let raw;
+      try {
+        raw = await request('/v1beta1/news', {
+          dataHost: true,
+          query: {
+            symbols: list.join(','),
+            limit: effectiveLimit,
+            start: isoParam(start),
+            end: isoParam(end),
+          },
+        });
+      } catch (error) {
+        if (error?.code === 'BROKER_AUTH' || error?.code === 'BROKER_RATE_LIMIT' || error?.code === 'CONFIG_INVALID') {
+          throw error;
+        }
+        // Research is advisory: a flaky/absent news endpoint must not stop trading.
+        return [];
+      }
+      const rows = Array.isArray(raw?.news) ? raw.news : Array.isArray(raw) ? raw : [];
+      const items = [];
+      for (const row of rows) {
+        try {
+          const item = mapNewsItem(row);
+          if (!item) continue;
+          if (startMs !== null && item.createdAt < startMs) continue;
+          if (endMs !== null && item.createdAt > endMs) continue;
+          items.push(item);
+        } catch {
+          /* tolerate a single malformed item */
+        }
+      }
+      items.sort((left, right) => right.createdAt - left.createdAt);
+      return items.slice(0, effectiveLimit);
     },
 
     /**

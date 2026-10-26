@@ -77,6 +77,36 @@ window.__ModuleLoader__.load({
       reaperHealthyNote: 'fresh generation (heartbeat v2) — operator stop not required',
       reaperStopped: 'Reaper stopped',
       reaperStopFailed: 'Reaper stop failed',
+      research: 'Research',
+      researchTitle: 'Research — isolated hourly analyst',
+      researchEmpty: 'no briefing yet (first hourly run pending)',
+      researchDisabled: 'research disabled: no LLM bridge / key',
+      researchDisabledConfig: 'research disabled in config — briefings not collected',
+      researchShadow: 'shadow — briefings logged, not applied to orders',
+      researchInfluence: 'influence — briefings can veto / resize / force exits',
+      researchUnknown: 'research status unknown',
+      researchVerdict: 'Verdict',
+      researchSentiment: 'Sentiment',
+      researchConfidence: 'Confidence',
+      researchSummary: 'Summary',
+      researchCatalysts: 'Catalysts',
+      researchRisks: 'Risks',
+      researchSources: 'Sources',
+      researchNoSources: 'no sources',
+      researchNoCatalysts: '—',
+      researchNoRisks: '—',
+      researchStale: 'stale',
+      researchAge: 'age',
+      researchRuns: 'runs',
+      researchErrors: 'errors',
+      researchInterval: 'interval',
+      researchLastRun: 'last run',
+      researchNextDue: 'next due',
+      researchModel: 'model',
+      researchProvider: 'provider',
+      researchHourly: 'hourly',
+      researchBadgeHint: 'isolated hourly news analyst',
+      researchNone: '—',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -218,6 +248,36 @@ window.__ModuleLoader__.load({
       reaperHealthyNote: '世代正常（心跳 v2）— 无需操作员停止',
       reaperStopped: 'Reaper 已停止',
       reaperStopFailed: '停止 Reaper 失败',
+      research: '研究',
+      researchTitle: '研究 —— 隔离的每小时分析师',
+      researchEmpty: '暂无简报（首次每小时运行尚未发生）',
+      researchDisabled: '研究已禁用：没有 LLM 桥接 / 密钥',
+      researchDisabledConfig: '配置已禁用研究 —— 不会收集简报',
+      researchShadow: '影子模式 —— 只记录简报，不影响订单',
+      researchInfluence: '影响模式 —— 简报可否决 / 调整仓位 / 强制退出',
+      researchUnknown: '研究状态未知',
+      researchVerdict: '结论',
+      researchSentiment: '情绪',
+      researchConfidence: '置信度',
+      researchSummary: '摘要',
+      researchCatalysts: '催化剂',
+      researchRisks: '风险',
+      researchSources: '来源',
+      researchNoSources: '暂无来源',
+      researchNoCatalysts: '—',
+      researchNoRisks: '—',
+      researchStale: '过期',
+      researchAge: '时长',
+      researchRuns: '运行',
+      researchErrors: '错误',
+      researchInterval: '间隔',
+      researchLastRun: '最近运行',
+      researchNextDue: '下次到期',
+      researchModel: '模型',
+      researchProvider: '提供者',
+      researchHourly: '每小时',
+      researchBadgeHint: '隔离的每小时新闻分析',
+      researchNone: '—',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -631,6 +691,153 @@ window.__ModuleLoader__.load({
         .map((role) => ({ role, amountUsd: toNumber(costs[role]) ?? 0 }));
     }
 
+    // -----------------------------------------------------------------------
+    // research sidecar mapping (pure)
+    // -----------------------------------------------------------------------
+
+    const RESEARCH_VERDICTS = Object.freeze(['HOLD', 'AVOID', 'ALERT']);
+    const RESEARCH_SOURCE_URL = /^https?:\/\//i;
+
+    function clampRange(value, min, max) {
+      const number = toNumber(value);
+      if (number === null) return null;
+      return Math.max(min, Math.min(max, number));
+    }
+
+    function researchStringList(value, limit = 4) {
+      if (!Array.isArray(value)) return [];
+      return value
+        .filter((item) => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+        .slice(0, limit);
+    }
+
+    function mapResearchSource(raw, index) {
+      const source = plainObject(raw);
+      const title = typeof source.title === 'string' && source.title.trim().length > 0
+        ? source.title.trim()
+        : (typeof source.source === 'string' && source.source.trim().length > 0 ? source.source.trim() : 'source');
+      const url = typeof source.url === 'string' && RESEARCH_SOURCE_URL.test(source.url.trim())
+        ? source.url.trim()
+        : null;
+      return {
+        key: `research-source-${index}`,
+        title,
+        source: typeof source.source === 'string' ? source.source : null,
+        url,
+        at: source.at ?? null,
+      };
+    }
+
+    /**
+     * Normalize one agent's `research` briefing. Returns null when absent/malformed.
+     * Pure helper shared by the table badge, the detail section and the tests.
+     * @param {object|null} raw status.agents[*].research
+     * @returns {object|null}
+     */
+    function mapResearchBriefing(raw) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+      const rawVerdict = typeof raw.verdict === 'string' ? raw.verdict.trim().toUpperCase() : '';
+      const verdict = RESEARCH_VERDICTS.includes(rawVerdict) ? rawVerdict : null;
+      const summary = typeof raw.summary === 'string' && raw.summary.trim().length > 0 ? raw.summary.trim() : null;
+      const at = typeof raw.at === 'string' && raw.at.length > 0 ? raw.at : null;
+      const catalysts = researchStringList(raw.catalysts, 4);
+      const risks = researchStringList(raw.risks, 4);
+      const sources = (Array.isArray(raw.sources) ? raw.sources : []).slice(0, 6).map(mapResearchSource);
+      if (verdict === null && summary === null && at === null && catalysts.length === 0 && risks.length === 0 && sources.length === 0) {
+        return null;
+      }
+      return {
+        at,
+        ageSec: toNumber(raw.ageSec),
+        verdict,
+        sentiment: clampRange(raw.sentiment, -1, 1),
+        confidence: clampRange(raw.confidence, 0, 1),
+        summary,
+        catalysts,
+        risks,
+        sources,
+        stale: raw.stale === true,
+      };
+    }
+
+    /**
+     * Table badge projection: `HOLD +0.2` / `AVOID -0.6` / `ALERT +0.1`, `—` when none.
+     * @param {object|null} research status.agents[*].research
+     */
+    function researchBadge(research) {
+      const briefing = mapResearchBriefing(research);
+      if (!briefing) {
+        return { hasResearch: false, label: '—', tone: 'none', stale: false, verdict: null, sentiment: null, title: '' };
+      }
+      const verdict = briefing.verdict ?? '—';
+      const sentimentText = briefing.sentiment === null
+        ? ''
+        : ` ${briefing.sentiment > 0 ? '+' : ''}${briefing.sentiment.toFixed(1)}`;
+      return {
+        hasResearch: true,
+        label: `${verdict}${sentimentText}`,
+        tone: verdict === 'AVOID' ? 'avoid' : verdict === 'ALERT' ? 'alert' : verdict === 'HOLD' ? 'hold' : 'none',
+        stale: briefing.stale,
+        verdict: briefing.verdict,
+        sentiment: briefing.sentiment,
+        title: briefing.summary ?? '',
+      };
+    }
+
+    /**
+     * `status.engine.research` projection (schedule + configured/shadow state).
+     * @param {object} status the GET /automaton/state payload
+     */
+    function researchStatusSummary(status) {
+      const raw = plainObject(status?.engine?.research ?? status?.research);
+      if (Object.keys(raw).length === 0) {
+        return {
+          available: false,
+          enabled: null,
+          configured: null,
+          influence: null,
+          shadow: false,
+          disabledReason: null,
+          intervalSec: null,
+          lastRunAt: null,
+          nextDueAt: null,
+          provider: null,
+          model: null,
+          runs: null,
+          errors: null,
+        };
+      }
+      const configured = raw.configured === true ? true : raw.configured === false ? false : null;
+      const enabled = raw.enabled === true ? true : raw.enabled === false ? false : null;
+      const influence = raw.influence === true ? true : raw.influence === false ? false : null;
+      const disabledReason = configured === false ? 'unconfigured' : enabled === false ? 'disabled' : null;
+      return {
+        available: true,
+        enabled,
+        configured,
+        influence,
+        shadow: influence === false,
+        disabledReason,
+        intervalSec: toNumber(raw.intervalSec),
+        lastRunAt: raw.lastRunAt ?? null,
+        nextDueAt: raw.nextDueAt ?? null,
+        provider: raw.provider ?? null,
+        model: raw.model ?? null,
+        runs: toNumber(raw.runs),
+        errors: toNumber(raw.errors),
+      };
+    }
+
+    /** i18n key describing the current influence mode (shadow vs influence). */
+    function researchModeKey(statusResearch) {
+      if (!statusResearch || statusResearch.available !== true) return 'researchUnknown';
+      if (statusResearch.influence === true) return 'researchInfluence';
+      if (statusResearch.influence === false) return 'researchShadow';
+      return 'researchUnknown';
+    }
+
+
     /**
      * Turn one status payload into table/detail rows. Pure: no DOM, no fetch, no mutation
      * of `status`, safe with missing fields and with 0-100 agents.
@@ -662,6 +869,7 @@ window.__ModuleLoader__.load({
         const activity = buildActivityRows(safeAgent.recentTrades);
         const roleCosts = roleCostRows(safeAgent.roleCosts);
         const roleCostsTotal = round2(roleCosts.reduce((total, entry) => total + entry.amountUsd, 0));
+        const research = mapResearchBriefing(safeAgent.research);
         const parentId = safeAgent.parentId ? String(safeAgent.parentId) : null;
         const mutation = plainObject(safeAgent.mutation);
         const hasMutation = Object.keys(mutation).length > 0;
@@ -714,6 +922,8 @@ window.__ModuleLoader__.load({
           positionCount: positions.length,
           activity,
           tradesCount: toNumber(safeAgent.tradesCount) ?? activity.length,
+          research,
+          researchBadge: researchBadge(research),
           roleCosts,
           roleCostsTotal,
         };
@@ -777,6 +987,7 @@ window.__ModuleLoader__.load({
         brakesCount: toNumber(status?.brakes?.count) ?? 14,
         obituaryStats: status?.obituaries?.stats ?? null,
         at: status?.at ?? null,
+        research: researchStatusSummary(status),
         control: status?.control ?? null,
       };
     }
@@ -1140,6 +1351,20 @@ window.__ModuleLoader__.load({
 .atm-reaper-label{font-weight:600;color:var(--dsw-alias-label-primary,inherit);white-space:nowrap}
 .atm-reaper-detail{white-space:nowrap}
 .atm-reaper-stale{color:var(--dsw-alias-state-error-primary,inherit);font-weight:600}
+.atm-research{display:inline-flex;align-items:center;gap:3px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 6px;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-research[data-tone="hold"]{color:var(--dsw-alias-state-business-primary,inherit)}
+.atm-research[data-tone="avoid"]{color:var(--dsw-alias-state-error-primary,inherit)}
+.atm-research[data-tone="alert"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor;font-weight:600}
+.atm-research[data-stale="true"]{opacity:.55;font-style:italic}
+.atm-research-section{display:flex;flex-direction:column;gap:5px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px;padding:6px 8px}
+.atm-research-head{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.atm-research-meta{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-research-block{display:flex;flex-direction:column;gap:2px}
+.atm-research-block > b{font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);font-weight:600}
+.atm-research-list{margin:0;padding-left:15px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-primary,inherit)}
+.atm-research-list li{margin:0}
+.atm-source-link{color:var(--dsw-alias-state-business-primary,inherit);text-decoration:underline;overflow-wrap:anywhere}
+.atm-research-summary{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
 .atm-close{font:inherit;font-size:13px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:6px;padding:0 7px;cursor:pointer}
 .atm-close:hover{color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-interactive-bg-hover,transparent)}
 .atm-icon{display:block}
@@ -1390,6 +1615,118 @@ window.__ModuleLoader__.load({
         row.cause ? h('span', { key: 'cause' }, ` · ${row.cause}`) : null);
     }
 
+    /** Compact research badge for the agent table (`HOLD +0.2` / `AVOID -0.6` / `—`). */
+    function ResearchBadge({ t, row }) {
+      const badge = row.researchBadge ?? researchBadge(row.research);
+      if (!badge.hasResearch) {
+        return h('span', { className: 'atm-muted', title: t('researchBadgeHint') }, '—');
+      }
+      return h('span', {
+        className: 'atm-research',
+        'data-tone': badge.tone,
+        'data-stale': badge.stale ? 'true' : undefined,
+        title: `${t('researchBadgeHint')}${badge.title ? ` — ${badge.title}` : ''}`,
+      }, badge.label);
+    }
+
+    function ResearchListBlock({ t, labelKey, items, emptyKey }) {
+      return h('div', { className: 'atm-research-block' }, [
+        h('b', { key: 'label' }, t(labelKey)),
+        items.length === 0
+          ? h('span', { className: 'atm-muted', key: 'empty' }, t(emptyKey))
+          : h('ul', { className: 'atm-research-list', key: 'list' }, items.map((item, index) => h('li', { key: `${labelKey}-${index}` }, item))),
+      ]);
+    }
+
+    /**
+     * Detail-pane "Research — isolated hourly analyst" section: latest briefing,
+     * catalysts/risks/sources, and the shadow-vs-influence mode from the engine status.
+     */
+    function ResearchSection({ t, research, researchStatus }) {
+      const briefing = mapResearchBriefing(research);
+      const modeKey = researchModeKey(researchStatus);
+      const meta = [];
+      if (researchStatus?.available) {
+        meta.push(`${t('researchProvider')} ${researchStatus.provider ?? '—'} / ${t('researchModel')} ${researchStatus.model ?? '—'}`);
+        if (researchStatus.intervalSec !== null) meta.push(`${t('researchInterval')} ${Math.round(researchStatus.intervalSec / 60)}m`);
+        if (researchStatus.lastRunAt) meta.push(`${t('researchLastRun')} ${fmtAgo(researchStatus.lastRunAt)}`);
+        if (researchStatus.runs !== null) meta.push(`${t('researchRuns')} ${fmtNum(researchStatus.runs)}`);
+        if (researchStatus.errors !== null && researchStatus.errors > 0) meta.push(`${t('researchErrors')} ${fmtNum(researchStatus.errors)}`);
+      }
+      const children = [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, t('researchTitle')),
+        h('p', { className: 'atm-note', key: 'mode' }, t(modeKey)),
+      ];
+      if (meta.length > 0) {
+        children.push(h('div', { className: 'atm-research-meta', key: 'meta' }, meta.map((text, index) => h('span', { key: `meta-${index}` }, text))));
+      }
+      if (researchStatus?.disabledReason) {
+        children.push(h('p', {
+          className: 'atm-warn',
+          key: 'disabled',
+        }, t(researchStatus.disabledReason === 'disabled' ? 'researchDisabledConfig' : 'researchDisabled')));
+      }
+      if (!briefing) {
+        children.push(h('p', { className: 'atm-empty', key: 'empty' }, t('researchEmpty')));
+        return h('div', { className: 'atm-research-section', key: 'research' }, children);
+      }
+      const badge = researchBadge(briefing);
+      const ageText = briefing.ageSec === null
+        ? fmtAgo(briefing.at)
+        : `${fmtAgo(briefing.at)} (${Math.round(briefing.ageSec)}s)`;
+      children.push(h('div', { className: 'atm-research-head', key: 'head' }, [
+        h('span', {
+          className: 'atm-research',
+          'data-tone': badge.tone,
+          'data-stale': briefing.stale ? 'true' : undefined,
+          key: 'verdict',
+        }, badge.label),
+        h('span', { className: 'atm-muted', key: 'age' }, `${t('researchAge')} ${ageText}`),
+        briefing.stale ? h('span', { className: 'atm-warn', key: 'stale' }, `⚠ ${t('researchStale')}`) : null,
+      ]));
+      if (briefing.summary) {
+        children.push(h('p', { className: 'atm-research-summary', key: 'summary' }, briefing.summary));
+      }
+      children.push(h('div', { className: 'atm-research-meta', key: 'metrics' }, [
+        h('span', { key: 'verdict' }, `${t('researchVerdict')} ${briefing.verdict ?? '—'}`),
+        h('span', { key: 'sentiment' }, `${t('researchSentiment')} ${briefing.sentiment === null ? '—' : briefing.sentiment.toFixed(2)}`),
+        h('span', { key: 'confidence' }, `${t('researchConfidence')} ${briefing.confidence === null ? '—' : briefing.confidence.toFixed(2)}`),
+      ]));
+      children.push(h(ResearchListBlock, {
+        key: 'catalysts',
+        t,
+        labelKey: 'researchCatalysts',
+        items: briefing.catalysts,
+        emptyKey: 'researchNoCatalysts',
+      }));
+      children.push(h(ResearchListBlock, {
+        key: 'risks',
+        t,
+        labelKey: 'researchRisks',
+        items: briefing.risks,
+        emptyKey: 'researchNoRisks',
+      }));
+      children.push(h('div', { className: 'atm-research-block', key: 'sources' }, [
+        h('b', { key: 'label' }, t('researchSources')),
+        briefing.sources.length === 0
+          ? h('span', { className: 'atm-muted', key: 'empty' }, t('researchNoSources'))
+          : h('ul', { className: 'atm-research-list', key: 'list' }, briefing.sources.map((source) => h('li', { key: source.key }, [
+            source.url
+              ? h('a', {
+                key: 'link',
+                className: 'atm-source-link',
+                href: source.url,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+              }, source.title)
+              : h('span', { key: 'title' }, source.title),
+            source.source ? h('span', { key: 'source', className: 'atm-muted' }, ` — ${source.source}`) : null,
+            source.at ? h('span', { key: 'at', className: 'atm-muted' }, ` (${fmtAgo(source.at)})`) : null,
+          ]))),
+      ]));
+      return h('div', { className: 'atm-research-section', key: 'research' }, children);
+    }
+
     /** Runway bar fill percent: 72 h = healthy full bar; unknown/dead = 0. */
     const RUNWAY_FULL_HOURS = 72;
     function runwayPercent(hours) {
@@ -1417,6 +1754,7 @@ window.__ModuleLoader__.load({
       { key: 'generation', labelKey: 'gen', sortable: true },
       { key: 'genome', labelKey: 'genome', sortable: false },
       { key: 'trading', labelKey: 'trading', sortable: false },
+      { key: 'research', labelKey: 'research', sortable: false },
       { key: 'equityUsd', labelKey: 'equity', sortable: true },
       { key: 'pnlUsd', labelKey: 'pnl', sortable: true },
       { key: 'dayPnlPct', labelKey: 'dayPnl', sortable: true },
@@ -1508,6 +1846,7 @@ window.__ModuleLoader__.load({
                   h('span', { key: 'spec' }, row.specText ?? t('none')),
                   row.tradingDiffers ? h('span', { key: 'diff', className: 'atm-warn', title: t('specDiffers') }, ' ≠') : null,
                 ]),
+                h('td', { key: 'research', title: row.research?.summary ?? '' }, h(ResearchBadge, { t, row })),
                 h('td', { key: 'equity', className: 'atm-mono' }, fmtUsd(row.equityUsd)),
                 h('td', {
                   key: 'pnl',
@@ -1600,7 +1939,7 @@ window.__ModuleLoader__.load({
       ])));
     }
 
-    function AgentDetail({ t, row, onClose }) {
+    function AgentDetail({ t, row, researchStatus, onClose }) {
       React.useEffect(() => {
         const onKeyDown = (event) => {
           if (event.key === 'Escape') onClose();
@@ -1667,6 +2006,7 @@ window.__ModuleLoader__.load({
           h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('activity')} · ${fmtNum(row.tradesCount)}`),
           h(ActivityFeed, { key: 'feed', t, row }),
         ]),
+        h(ResearchSection, { key: 'research', t, research: row.research, researchStatus }),
         h('div', { key: 'strategy' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, t('strategyParams')),
           h('p', { className: 'atm-note', key: 'genome-label' }, `${t('genomeParams')} · ${row.genomeText}`),
@@ -1760,6 +2100,9 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'atm-root' }, [
         summary.halted ? h('p', { className: 'atm-halt', key: 'halted' }, t('halted')) : null,
         snapshot.error ? h('p', { className: 'atm-err', key: 'fetch-error' }, `${t('lastError')}: ${errorText(snapshot.error)}`) : null,
+        summary.research?.disabledReason
+          ? h('p', { className: 'atm-warn', key: 'research-note' }, t(summary.research.disabledReason === 'disabled' ? 'researchDisabledConfig' : 'researchDisabled'))
+          : null,
         h(HeaderStats, { key: 'stats', t, summary }),
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
         h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
@@ -1778,7 +2121,7 @@ window.__ModuleLoader__.load({
             ]),
           ]),
           selectedRow
-            ? h(AgentDetail, { key: 'detail', t, row: selectedRow, onClose: onCloseDetail })
+            ? h(AgentDetail, { key: 'detail', t, row: selectedRow, researchStatus: summary.research, onClose: onCloseDetail })
             : null,
         ]),
         summary.lastError ? h('p', { className: 'atm-err', key: 'last-error' }, `${t('lastError')}: ${errorText(summary.lastError)}`) : null,
@@ -1939,6 +2282,10 @@ window.__ModuleLoader__.load({
         buildHoldingsRows,
         buildActivityRows,
         describeReaper,
+        mapResearchBriefing,
+        researchBadge,
+        researchStatusSummary,
+        researchModeKey,
         summarize,
         generationRows,
         obituaryRows,

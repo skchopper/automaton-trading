@@ -12,6 +12,9 @@
  * slippage/commission; resting limit orders fill when a later bar trades through the
  * limit. Cash and positions are accounted exactly, with no shorting and no negative cash.
  *
+ * Includes a deterministic synthetic news feed (`getNews`) so the isolated research
+ * sidecar can be exercised offline: same seed + same simulated hour => same headlines.
+ *
  * Contract: docs/CONTRACTS.md § "Broker interface". Owner: market teammate.
  *
  * @module broker-sim
@@ -28,6 +31,28 @@ const DEFAULT_ACCOUNT_EQUITY_USD = 100_000;
 const DEFAULT_HISTORY_BARS = 400;
 const REGIME_BARS = 48;
 const MIN_PRICE_USD = 1;
+
+/** Deterministic synthetic-news templates consumed by the research sidecar. */
+const NEWS_TEMPLATES = Object.freeze([
+  { headline: '{symbol} beats quarterly expectations', summary: 'Quarterly results for {symbol} came in above consensus, with management raising guidance.' },
+  { headline: 'Analysts lift {symbol} price target', summary: 'A sell-side note raised its target on {symbol}, citing improving end-market demand.' },
+  { headline: '{symbol} warns on margin pressure', summary: '{symbol} flagged input-cost pressure that could weigh on margins next quarter.' },
+  { headline: '{symbol} downgraded after soft guidance', summary: 'An analyst downgraded {symbol} following cautious forward guidance.' },
+  { headline: '{symbol} announces routine product update', summary: '{symbol} shipped a routine product refresh; no financial detail was disclosed.' },
+  { headline: '{symbol} schedules investor day', summary: '{symbol} will host an investor day to discuss its medium-term capital plan.' },
+  { headline: 'Regulators open review into {symbol} disclosures', summary: 'A regulatory review into {symbol} disclosures adds near-term uncertainty.' },
+  { headline: '{symbol} expands share repurchase program', summary: '{symbol} enlarged its share repurchase authorization, a modest capital-return signal.' },
+]);
+
+/** Parse a news start/end filter (epoch ms or ISO string) to epoch ms. */
+function newsFilterMs(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 1e12 ? Math.round(value * 1000) : Math.round(value);
+  }
+  const ms = Date.parse(String(value));
+  return Number.isFinite(ms) ? ms : null;
+}
 
 // ---------------------------------------------------------------------------
 // deterministic helpers
@@ -503,6 +528,54 @@ export function createBroker(config, options = {}, simOptions = {}) {
      */
     getLatestQuote(symbol) {
       return currentQuote(symbol);
+    },
+
+    /**
+     * Deterministic synthetic news for the research sidecar (offline twin of
+     * broker-alpaca.getNews). Headlines are seeded by market seed + symbol + the
+     * simulated hour, so the same seed and simulated time produce identical items.
+     *
+     * @param {{symbols?: string|string[], limit?: number, start?: string|number,
+     *          end?: string|number}} params
+     * @returns {Promise<Array<{id:string, headline:string, summary:string, source:string,
+     *           url:string|null, symbols:string[], createdAt:number}>>}
+     */
+    async getNews({ symbols: wanted, limit = 6, start, end } = {}) {
+      const requested = (Array.isArray(wanted) ? wanted : typeof wanted === 'string' ? wanted.split(',') : [])
+        .map((item) => String(item ?? '').trim().toUpperCase())
+        .filter(Boolean);
+      // Explicit empty list => no news; omitted list => the broker's configured universe.
+      const tickers = [...new Set(wanted === undefined ? symbols : requested)]
+        .filter((ticker) => market.symbolStates.has(ticker));
+      if (tickers.length === 0) return [];
+      const effectiveLimit = Math.max(1, Math.min(20, Number(limit) || 6));
+      const startMs = newsFilterMs(start);
+      const endMs = newsFilterMs(end);
+      const now = marketNow();
+      const bucket = Math.floor(now / HOUR_MS);
+      const items = [];
+      for (const ticker of tickers) {
+        // Fresh PRNG per symbol+bucket: deterministic, and independent of call order.
+        const rng = mulberry32(fnv1a(`${market.seed}:${ticker}:${bucket}`));
+        for (let index = 0; index < effectiveLimit; index += 1) {
+          const template = NEWS_TEMPLATES[Math.floor(rng() * NEWS_TEMPLATES.length) % NEWS_TEMPLATES.length];
+          const minutesAgo = 3 + index * 17 + Math.floor(rng() * 9);
+          const createdAt = now - minutesAgo * 60 * 1000;
+          if (startMs !== null && createdAt < startMs) continue;
+          if (endMs !== null && createdAt > endMs) continue;
+          items.push({
+            id: `sim-news-${ticker}-${bucket}-${index}`,
+            headline: template.headline.replace('{symbol}', ticker),
+            summary: template.summary.replace('{symbol}', ticker),
+            source: 'Simulated Wire',
+            url: null,
+            symbols: [ticker],
+            createdAt,
+          });
+        }
+      }
+      items.sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id));
+      return items.slice(0, effectiveLimit);
     },
 
     /** Optional helper mirroring broker-alpaca. */

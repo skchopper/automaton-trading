@@ -37,6 +37,7 @@ import { createProspector } from './prospector.js';
 import { createBuilder } from './builder.js';
 import { createExecutor } from './executor.js';
 import { createReaper } from './reaper.js';
+import { createResearcher } from './research.js';
 import { nextAgentName, usedNames } from './naming.js';
 
 const log = createLogger('automaton');
@@ -185,6 +186,24 @@ export async function createAutomaton(options = {}) {
     dayStats: { dayKey: null, agents: {} },
     timer: null,
   };
+
+  // Per-agent isolated research sidecar (docs/RESEARCH.md). `generate` is injected by the
+  // Harness plugin (LLM bridge) or the CLI HTTP fallback; without it research is disabled and
+  // trading behaves exactly as before.
+  const researchGenerate = options.researchGenerate ?? options.generate ?? null;
+  const researcher = createResearcher({
+    broker,
+    registry,
+    ledger,
+    config,
+    paths,
+    clock,
+    generate: typeof researchGenerate === 'function' ? researchGenerate : undefined,
+    specFor: (agentId) => {
+      const agent = registry.get(agentId);
+      return agent?.specId ? state.specs.get(agent.specId) ?? null : null;
+    },
+  });
 
   // -------------------------------------------------------------------------
   // persistence helpers
@@ -398,6 +417,7 @@ export async function createAutomaton(options = {}) {
     await registry.load();
     await ledger.load();
     await loadDayStats(clock.now());
+    await researcher.init();
     // Reload compiled specs from disk so a restart does not silently drop strategies.
     try {
       const specFiles = (await fsp.readdir(paths.specsDir)).filter((file) => file.endsWith('.json'));
@@ -441,6 +461,7 @@ export async function createAutomaton(options = {}) {
       treasury: null,
       market: { symbols: 0, bars: 0, quotes: 0 },
       prospector: null,
+      research: null,
       builds: [],
       executions: [],
       replication: null,
@@ -585,6 +606,30 @@ export async function createAutomaton(options = {}) {
         }
       }
 
+      // 3b. RESEARCH: per-agent isolated hourly news briefing (docs/RESEARCH.md).
+      // Runs before the executor pass so a due briefing can veto/size/exit in THIS cycle.
+      // It never trades, never reads another agent's book, and each briefing is paid for by
+      // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
+      if (!treasuryView.halted) {
+        try {
+          const researchRun = await researcher.tick();
+          trace.research = {
+            enabled: researchRun.enabled,
+            configured: researchRun.configured,
+            due: researchRun.due,
+            ran: researchRun.ran.length,
+            skipped: researchRun.skipped,
+            errors: researchRun.ran.filter((entry) => entry.error).length,
+            budgetUsd: round4(researchRun.ran.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
+          };
+          if (!researchRun.enabled || !researchRun.configured) {
+            trace.research.note = !researchRun.enabled ? 'disabled by config' : 'no LLM generator configured';
+          }
+        } catch (error) {
+          trace.errors.push({ role: 'research', ...errorInfo(error) });
+        }
+      }
+
       // 4. PROSPECTOR: dated-proof hypotheses (skipped entirely while halted)
       let hypotheses = [];
       if (!treasuryView.halted) {
@@ -643,6 +688,9 @@ export async function createAutomaton(options = {}) {
             now: startedAt,
             marketOpen,
             marketClock,
+            // Fresh per-agent briefing (null when missing/stale/disabled); the executor may
+            // veto entries, scale size or force an exit — it can never place orders itself.
+            research: researcher.latest(agent.id),
           });
           trace.executions.push({
             agentId: agent.id,
@@ -821,6 +869,8 @@ export async function createAutomaton(options = {}) {
         unrealizedPlUsd: book?.unrealizedPlUsd ?? null,
         firstProfitAt: book?.firstProfitAt ?? null,
         roleCosts: view?.roleCosts ?? {},
+        // Isolated per-agent research briefing (fresh or stale, for the dashboard).
+        research: researcher.latestAny(agent.id),
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };
     });
@@ -836,6 +886,7 @@ export async function createAutomaton(options = {}) {
         lastError: state.lastError,
         killSwitch: brakes.isKillSwitchActive?.(),
         liveArmed: liveArmed(config),
+        research: researcher.schedule(),
       },
       account: account ?? null,
       treasury: treasury

@@ -14,17 +14,22 @@ profitable **reproduce**, and every death leaves a record the living read.
 ```
 docs/ARCHITECTURE.md      theory -> trading mapping, six roles + stoplines, death rules, brakes
 docs/CONTRACTS.md         module interfaces, data shapes, config defaults
+docs/RESEARCH.md          per-agent isolated hourly research sidecar (news analyst) contract
 docs/RUNBOOK.md           operating guide: phases, commands, emergency procedures
 docs/VERIFICATION.md      what was verified, how to reproduce it, what was not
 packages/automaton-trading/   the plugin bundle (zero runtime dependencies)
-  index.js                Host plugin: 10 automaton_* tools + GET /automaton/state
-  client.js               Web UI dashboard (Settings -> Plugins tab; composer strip)
+  index.js                Host plugin: 10 automaton_* tools + GET /automaton/state +
+                          POST /automaton/control + Harness LLM bridge for research
+  client.js               Web UI dashboard (sidebar panel; Settings -> Plugins tab)
   src/                    engine: treasurer, prospector, builder, executor, replicator,
-                          external reaper, ledger, registry, brakes, journal, brokers, sim
+                          external reaper, ledger, registry, brakes, journal, brokers, sim,
+                          research (per-agent isolated news analyst)
   bin/automaton.mjs       operator CLI (probe, tick, run, simulate, journal, brakes, stop)
-  test/                   node:test suites (mortality, market, plugin, integration, security)
-.env.example              Alpaca credential template
-automaton-data/           runtime state (gitignored): registry, ledger, obituaries, traces
+  test/                   node:test suites (mortality, market, plugin, integration, security,
+                          research)
+.env.example              Alpaca credential template (+ optional DEEPSEEK_API_KEY for CLI research)
+automaton-data/           runtime state (gitignored): registry, ledger, obituaries, traces,
+                          research/<agentId>.jsonl briefings
 ```
 
 ## Quick start
@@ -108,14 +113,25 @@ the operating config).
 - Paper is default. Live needs `mode=live` **and** `allowLive=true` **and** an operator
   `LIVE_ARMED` marker (`automaton arm-live --confirm "ARM LIVE"`). Keys are read only from
   `.env`; tool output and the status route are redacted.
+- **Per-agent isolated research sidecar**: each living agent gets its own hourly LLM news
+  briefing about its own book/symbols (Alpaca News API) with a private journal; the briefing
+  can veto entries, shrink size or force exits, and the agent pays for it from its own ledger
+  (`$0.001`/briefing). Shadow mode via `research.influence:false`. Contract:
+  `docs/RESEARCH.md`. In the Harness the model comes from the Host `llm` service; a headless
+  CLI run uses `DEEPSEEK_API_KEY`.
 - The engine has no control surface over the Reaper. `automaton_stop` stops the loop only;
   the Reaper keeps liquidating condemned agents.
 
 ## Status (this build)
 
-- 5 test suites: mortality 55, market 21, plugin 28, independent integration 21 and
-  security 41 — **166 tests, 166 pass, 0 fail**. Run each file directly, e.g.
+- 6 test suites: mortality 55, market 27, plugin 36, independent integration 21, security 41
+  and research 9 — **189 tests, 189 pass, 0 fail**. Run each file directly, e.g.
   `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- Research sidecar verified end-to-end: `test/research.test.js` (isolation, schema clamp,
+  malformed-reply containment, per-agent charging, hourly scheduling, stale expiry) plus
+  `scripts/research-smoke.mjs` (10/10: real `createAutomaton` composition, per-agent journals,
+  cadence, executor receives briefings). The executor side is covered by market tests
+  (veto/size/exit/stale-off). Live Harness-LLM verification happens after the next app restart.
 - Independent verification found 9 real defects across two rounds (Reaper kills not
   persisted → resurrectable zombies; dry-run brake always NO_PROOF; unreachable
   daily-loss death; generation truthiness; stale counters; sub-cent costs rounded away;

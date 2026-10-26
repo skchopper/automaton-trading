@@ -35,6 +35,20 @@
     "maxHypothesesPerCycle": 40,
     "maxProofAgeDays": 7
   },
+  "research": {
+    "enabled": true,
+    "influence": true,
+    "intervalSec": 3600,
+    "staggerSec": 120,
+    "maxNewsPerAgent": 6,
+    "newsLookbackHours": 24,
+    "costPerRunUsd": 0.001,
+    "maxAgeSec": 7200,
+    "maxConcurrent": 1,
+    "maxOutputTokens": 700,
+    "logLimit": 120,
+    "maxRunsPerCycle": 3
+  },
   "engine": {
     "autoStart": false,
     "traceLimit": 2000,

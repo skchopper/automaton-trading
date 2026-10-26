@@ -484,3 +484,30 @@ clears a stale `lastError` instead of leaving it sticky forever (one transient f
 been shown persistently). Full suite after the fixes: **166/166 pass**, `scripts/verify-fixes.mjs`
 18/18. The running Host must be restarted to load these engine fixes; the loop was stopped before
 the fix so no further unbooked fills could accumulate.
+
+### Per-agent research sidecar (2026-10-26, user-requested upgrade)
+
+The user asked whether the population members are separate Harness agents (they are not — 30
+deterministic strategy instances in one engine) and asked for **per-agent isolation plus hourly
+research of company/internet news about each agent's holdings**. Chosen design: **A2 now** (one
+isolated stateless LLM analyst per agent with a private briefing journal; designed so a bot can
+later be promoted to its own Harness agent), **live influence from day one**, light budget
+($0.001/briefing charged to the agent's ledger). Contract: `docs/RESEARCH.md`.
+
+| Check | Result |
+|---|---|
+| Research unit suite | `test/research.test.js` **9/9**: prompt isolation (no other agent id/name/book/journal), schema clamp/validation, malformed-reply containment (no briefing, no charge, error logged), per-agent ledger charge (category `research`, role `prospector`), hourly scheduling (due → skipped → due), stale expiry (`maxAgeSec`) with dashboard still showing stale briefings, empty-news neutral HOLD with no LLM call, HTTP fallback generator absent without key / mapped with key |
+| Composition smoke | `scripts/research-smoke.mjs` **10/10** on the real `createAutomaton` + sim broker: research runs for due agents, `engine.research` configured, every agent row carries its own briefing, per-agent journals on disk, each briefing charged to its own ledger, second cycle does not re-run, next hour due again |
+| Executor influence | market suite **27/27** (21 + 6 new): fresh AVOID/ALERT/sentiment/risk veto → `skip research_veto` (never a denial), size scaling can only shrink and respects caps, `research_alert` exit, stale/disabled/malformed/missing = byte-for-byte baseline |
+| Broker news | Alpaca `GET /v1beta1/news` verified live against the paper keys (HTTP 200 with headlines/summaries/urls); mapping/filters/outage in market tests; sim broker has a deterministic synthetic feed. Alpaca returns `[]` on `BROKER_ERROR` so a news outage can never break a trading cycle; auth/rate-limit/config errors still surface |
+| Plugin bridge + dashboard | plugin suite **36/36**: `createResearchBridge` provider resolution (agentDefaultModel → first provider/model, row/nested overrides), stream concatenation/usage, clean scrubbed errors, engine factory receives the bridge, GET state passes `engine.research` and per-agent `research`, client mapping helpers (badge HOLD/AVOID/ALERT/stale/none, detail catalysts/risks/sources sanitization, shadow/influence/disabled banners). Real-engine sim smoke with a fake Host llm: `configured:true`, provider/model resolved from the bridge |
+| Full suite | mortality 55 + market 27 + plugin 36 + integration 21 + security 41 + research 9 = **189/189 pass**; `scripts/verify-fixes.mjs` 18/18 |
+| Scheduling safety | `research.maxRunsPerCycle` (default 3) caps LLM work per trading cycle so an hourly batch can never stall order placement for minutes; `staggerSec` (120 for 30 agents) spreads the hourly load |
+| Cost | `$0.001` per successful briefing charged to that agent's ledger; malformed/failed replies are free. Treasury burn formula intentionally unchanged (research is an actual ledger charge, not modelled burn) |
+
+**Not yet verified:** the live Harness-LLM bridge against real model calls (needs the app restart
+that loads the new Host `index.js`) and therefore real briefings appearing in the panel; the paper
+loop is running the previous Host code until restart.
+
+**Decision recorded:** Alpaca news outages return an empty feed at the broker adapter (advisory
+data must never break a cycle); real LLM failures are logged by the researcher and never charged.

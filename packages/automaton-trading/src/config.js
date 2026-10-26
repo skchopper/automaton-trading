@@ -80,6 +80,23 @@ export function defaultConfig() {
       maxHypothesesPerCycle: 3,
       maxProofAgeDays: 7,
     },
+    research: {
+      enabled: true,
+      influence: true,
+      intervalSec: 3600,
+      staggerSec: 120,
+      maxRunsPerCycle: 3,
+      maxNewsPerAgent: 6,
+      newsLookbackHours: 24,
+      costPerRunUsd: 0.001,
+      maxAgeSec: 7200,
+      maxConcurrent: 1,
+      maxInputChars: 12000,
+      maxOutputTokens: 700,
+      logLimit: 120,
+      provider: null,
+      model: null,
+    },
     paths: {
       stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
       envFile: path.join(WORKSPACE_DEFAULT, '.env'),
@@ -319,6 +336,28 @@ export function validateConfig(config) {
   assertNumber(data.maxProofAgeDays, 'data.maxProofAgeDays', { min: 0, max: 365 });
   if (typeof data.timeframe !== 'string' || data.timeframe.length === 0) fail('CONFIG_INVALID', 'data.timeframe is required');
 
+  const research = config.research;
+  if (!research || typeof research !== 'object') fail('CONFIG_INVALID', 'research config object is required');
+  if (typeof research.enabled !== 'boolean') fail('CONFIG_INVALID', 'research.enabled must be boolean');
+  if (typeof research.influence !== 'boolean') fail('CONFIG_INVALID', 'research.influence must be boolean');
+  assertNumber(research.intervalSec, 'research.intervalSec', { min: 60, max: 86_400 });
+  assertNumber(research.staggerSec, 'research.staggerSec', { min: 0, max: 3600 });
+  assertNumber(research.maxRunsPerCycle, 'research.maxRunsPerCycle', { min: 1, max: 10 });
+  assertNumber(research.maxNewsPerAgent, 'research.maxNewsPerAgent', { min: 1, max: 20 });
+  assertNumber(research.newsLookbackHours, 'research.newsLookbackHours', { min: 1, max: 168 });
+  assertNumber(research.costPerRunUsd, 'research.costPerRunUsd', { min: 0, max: 1 });
+  assertNumber(research.maxAgeSec, 'research.maxAgeSec', { min: 300, max: 86_400 });
+  assertNumber(research.maxConcurrent, 'research.maxConcurrent', { min: 1, max: 8 });
+  assertNumber(research.maxInputChars, 'research.maxInputChars', { min: 1000, max: 60_000 });
+  assertNumber(research.maxOutputTokens, 'research.maxOutputTokens', { min: 128, max: 4000 });
+  assertNumber(research.logLimit, 'research.logLimit', { min: 20, max: 1000 });
+  if (research.provider !== null && typeof research.provider !== 'string') {
+    fail('CONFIG_INVALID', 'research.provider must be a string or null');
+  }
+  if (research.model !== null && typeof research.model !== 'string') {
+    fail('CONFIG_INVALID', 'research.model must be a string or null');
+  }
+
   if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
     fail('CONFIG_INVALID', 'paths.stateDir is required');
   }
@@ -360,6 +399,8 @@ export function statePaths(config) {
     reaperHeartbeat: path.join(stateDir, 'reaper.heartbeat.json'),
     engineLog: path.join(stateDir, 'engine.log'),
     treasuryState: path.join(stateDir, 'treasury.json'),
+    researchDir: path.join(stateDir, 'research'),
+    researchState: path.join(stateDir, 'research', 'state.json'),
   };
 }
 

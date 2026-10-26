@@ -19,6 +19,7 @@ obituary the living read.
 | Settings page | Settings → Built-in plugins → **Automaton Trading** (`settings.plugins.tab`): the same dashboard as a full page |
 | State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 3 s (auto-refresh with pause) |
 | Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop) |
+| Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
 
 Everything is dependency-free ESM with no build step; the browser module is loaded as
 plain JavaScript (`./client`). `dsh.client.inject` orders the client half after the real
@@ -97,6 +98,43 @@ instead of a stop button.
 2. **Start** — once the Reaper row shows `not running` (a fresh Reaper is spawned by
    `engine.start()` for paper/live), press `Start`.
 
+### Research sidecar — isolated hourly analyst
+
+Every living agent gets an **isolated** hourly LLM briefing about *its own* strategy and
+book (its own symbols, positions and past briefings — never another agent's data, another
+role's memory or a shared conversation). The reply is strict JSON: `sentiment` (-1..1),
+`confidence` (0..1), `verdict` (`HOLD` | `AVOID` | `ALERT`), catalysts (≤4), risks (≤4),
+a ≤400-char summary and dated sources. In **influence** mode the briefing can veto
+entries, shrink size or force an exit; in **shadow** mode it is logged but never applied.
+The agent pays ~`$0.001` per run from its own ledger (~$0.72/day for 30 hourly agents), so
+research raises its burn exactly like any other inference cost.
+
+- **Cadence**: per-agent `research.intervalSec` (default 3600 s = hourly) with
+  `staggerSec` spreading the population inside the hour; briefings older than
+  `research.maxAgeSec` are ignored by the executor.
+- **Isolation**: one private LLM call per agent — no shared conversation, no order tool,
+  no wallet access; the analyst only advises that agent's executor.
+- **Harness bridge (no extra key needed)**: the plugin implements the `ResearchProvider`
+  seam on the Host `llm` service. Provider/model resolve from
+  `agentDefaultModel.currentSelection()` (fallback: first registered provider + its first
+  model) and may be overridden by plugin-row `researchProvider` / `researchModel` (or
+  nested `config.research.provider/model`). Calls stream through
+  `llm.prepareCall(...)` + `prepared.stream(...)` at temperature 0.2 with bounded output
+  tokens; provider failures are returned as clean errors for the researcher's log and
+  never crash the plugin or engine.
+- **No LLM bridge / key**: the plugin passes no generator, `engine.research.configured`
+  becomes `false`, the dashboard shows "research disabled: no LLM bridge / key", briefings
+  go stale and are ignored, and trading continues unchanged. The headless CLI (outside the
+  Harness) instead uses `DEEPSEEK_API_KEY` against
+  `https://api.deepseek.com/chat/completions`.
+- **Dashboard display**: a compact table badge (`HOLD +0.2` / `AVOID -0.6` / `ALERT`,
+  `—` when no briefing, dimmed when stale) and a **Research — isolated hourly analyst**
+  section in the agent detail pane (briefing age, verdict, sentiment, confidence, summary,
+  catalysts, risks, clickable sources, provider/model, run/error counters) plus a
+  shadow-vs-influence line. `engine.research` (enabled/configured/influence/interval/
+  lastRun/nextDue/provider/model/runs/errors) and each agent's `research` are carried by
+  `GET /automaton/state`; no research control action or agent tool is added.
+
 ### `POST /automaton/control`
 
 Loopback-only operator surface: requests whose socket address is not loopback
@@ -151,6 +189,10 @@ so the new client module + routes load), verify:
    local `POST /automaton/control` with `{"action":"stop"}` returns `{"ok":true}`.
 6. The tool list contains the ten `automaton_*` tools (the Reaper stop is intentionally
    **not** among them).
+7. Research: the table shows research badges once the first hourly run lands (or a
+   `—`), clicking an agent shows the briefing section, and a "research disabled" note
+   appears instead when the Host has no LLM bridge. `GET /automaton/state` carries
+   `engine.research` and `agents[].research`.
 
 ## Configuration
 
@@ -173,9 +215,17 @@ Layering inside the engine is `defaults <- config file <- plugin row <- environm
 (`AUTOMATON_*`, `ALPACA_*`). Credentials are never stored in the config: they are read
 from `envFile`/environment into a short-lived credentials object at broker construction.
 
-Test seam: `config.engineFactory` may be supplied (function `(rowConfig) => engine`, sync
-or async) to replace the real `createEngine`. It exists for `node --test` and is not a
-production configuration surface.
+Test seam: `config.engineFactory` may be supplied (function `(rowConfig, research) => engine`,
+sync or async) to replace the real `createEngine`; the second argument is the Host-built
+research bridge (or `null` when no LLM bridge exists). It exists for `node --test` and is
+not a production configuration surface.
+
+Research overrides (optional, plugin-row config): `researchProvider` / `researchModel`
+take precedence over `agentDefaultModel.currentSelection()` and the first-registered
+provider/model fallback; the same values may be supplied as nested
+`config.research.provider` / `config.research.model`. The engine-side `research` config
+(`enabled`, `influence`, `intervalSec`, `staggerSec`, `costPerRunUsd`, `maxAgeSec`, …)
+stays in the engine's layered config.
 
 ## Tools
 
@@ -227,8 +277,14 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
   the panel's red indicator follows the marker file itself (not a possibly-stale engine
   snapshot). Clearing it is a deliberate operator action on the filesystem — no tool and
   no UI button can clear it.
+- **Research is advisory.** The per-agent analyst has no order tool, no wallet access and
+  no shared memory; its briefing can only veto/resize/exit through the agent's own
+  executor, and every order still passes the 14 brakes. If the LLM is unavailable
+  (`configured:false`) trading continues deterministically and stale briefings are ignored.
+  Research cost is charged to the agent's own ledger like any other inference cost.
 - **Secrets:** never returned by tools, the state route, or the dashboard. `configView`
-  exposes only the env-file path and credential source signature.
+  exposes only the env-file path and credential source signature. LLM failures are logged
+  as scrubbed, structured errors — never credentials or full provider payloads.
 
 ## Development
 

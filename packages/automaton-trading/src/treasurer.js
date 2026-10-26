@@ -38,6 +38,10 @@ export function cyclesLastHour(config) {
  * A population multiplies it (each agent pays its own inference; hosting is charged per
  * agent so the per-agent runway stays conservative).
  *
+ * Research cost is NOT amortised into this formula: the isolated analyst is charged to the
+ * agent's ledger per successful briefing (category 'research'), so it reduces equity/runway
+ * as an actual cost instead of a modelled one.
+ *
  * @returns {number} rounded to 4dp (sub-cent burns must not round to zero)
  */
 export function burnPerHour(config, population = 1) {

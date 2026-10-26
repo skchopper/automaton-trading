@@ -23,10 +23,12 @@ import {
   inject,
   name,
   CONTROL_PATH,
+  createResearchBridge,
   REAPER_HEARTBEAT_FILE,
   REAPER_PID_FILE,
   ROUTE_PATH,
   TOOL_NAMES,
+  resolveResearchOverrides,
   stopReaperOperator,
 } from '../index.js';
 
@@ -66,7 +68,7 @@ const SCHEMA_KEYWORDS = new Set([
 // fakes
 // ---------------------------------------------------------------------------
 
-function createFakeCtx() {
+function createFakeCtx(services = {}) {
   const tools = new Map();
   const routes = [];
   const effects = [];
@@ -92,6 +94,7 @@ function createFakeCtx() {
       },
     },
     get(serviceName) {
+      if (Object.hasOwn(services, serviceName)) return services[serviceName];
       return serviceName === 'webServer' ? webServer : undefined;
     },
     effect(callback, label) {
@@ -289,7 +292,48 @@ function agentFixture(index) {
     unrealizedPlUsd: Math.round(positions.reduce((total, position) => total + position.unrealizedPlUsd, 0) * 100) / 100,
     firstProfitAt: index % 6 === 0 && !dead ? '2026-01-01T16:45:00.000Z' : null,
     roleCosts: { treasurer: 0.002, prospector: 0.026, builder: 0.012, executor: 0.01 },
+    research: researchFixture(index),
   };
+}
+
+/** Deterministic per-agent research briefing: HOLD, AVOID(stale), ALERT, then none. */
+function researchFixture(index) {
+  const base = {
+    at: '2026-01-02T00:00:00.000Z',
+    ageSec: 120,
+    stale: false,
+    catalysts: ['earnings beat', 'analyst upgrade'],
+    risks: ['macro backdrop'],
+    sources: [
+      { title: 'Reuters — test headline', source: 'reuters', url: 'https://example.com/news/1', at: '2026-01-01T23:00:00.000Z' },
+      { title: 'Unsafe source', source: 'internal', url: 'javascript:alert(1)', at: null },
+    ],
+  };
+  if (index === 0) {
+    return { ...base, verdict: 'HOLD', sentiment: 0.2, confidence: 0.7, summary: 'Neutral tone; hold the inherited plan.' };
+  }
+  if (index === 1) {
+    return {
+      ...base,
+      verdict: 'AVOID',
+      sentiment: -0.6,
+      confidence: 0.4,
+      stale: true,
+      summary: 'Negative tone; avoid new entries.',
+      catalysts: [],
+      risks: ['guidance cut', 'sector rotation', 'rate pressure', 'extra risk beyond clamp'],
+    };
+  }
+  if (index === 2) {
+    return {
+      ...base,
+      verdict: 'ALERT',
+      sentiment: 0.1,
+      confidence: 0.9,
+      summary: 'Event risk; alert the executor.',
+    };
+  }
+  return null;
 }
 
 function obituaryFixture(index) {
@@ -321,7 +365,7 @@ function obituaryFixture(index) {
 }
 
 /** Full 30-agent status payload, close to what GET /automaton/state returns. */
-function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper } = {}) {
+function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research } = {}) {
   const agents = Array.from({ length: agentCount }, (_, index) => agentFixture(index));
   const alive = agents.filter((agent) => agent.status === 'alive').length;
   const dead = agents.filter((agent) => agent.status === 'dead').length;
@@ -357,6 +401,18 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
         sweeps: null,
         error: null,
         note: 'external process (no control surface)',
+      },
+      research: research ?? {
+        enabled: true,
+        configured: true,
+        influence: true,
+        intervalSec: 3600,
+        lastRunAt: '2026-01-02T00:00:00.000Z',
+        nextDueAt: '2026-01-02T01:00:00.000Z',
+        provider: 'deepseek-account',
+        model: 'deepseek-flash',
+        runs: 3,
+        errors: 0,
       },
     },
     account: {
@@ -453,21 +509,21 @@ function createFakeEngine(options = {}) {
         throw error;
       }
       engine.running = true;
-      return buildStatusPayload({ running: true, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper });
+      return buildStatusPayload({ running: true, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper, research: options.research });
     },
     async stop() {
       calls.stop += 1;
       engine.running = false;
-      return buildStatusPayload({ running: false, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper });
+      return buildStatusPayload({ running: false, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper, research: options.research });
     },
     async tick() {
       calls.tick += 1;
-      return { trace: { tickId: 'tick-1', at: '2026-01-02T00:00:00.000Z' }, status: buildStatusPayload({ running: true, reaper: options.reaper }) };
+      return { trace: { tickId: 'tick-1', at: '2026-01-02T00:00:00.000Z' }, status: buildStatusPayload({ running: true, reaper: options.reaper, research: options.research }) };
     },
     async status() {
       calls.status += 1;
       if (options.statusError) throw new Error('broker down');
-      return buildStatusPayload({ running: engine.running, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper });
+      return buildStatusPayload({ running: engine.running, mode: options.mode ?? 'paper', agentCount: options.agentCount ?? POPULATION, reaper: options.reaper, research: options.research });
     },
     async obituaries({ limit = 50 } = {}) {
       calls.obituaries += 1;
@@ -527,6 +583,56 @@ function createFakeEngine(options = {}) {
   };
   if (options.omitEmergencyStop) delete engine.emergencyStop;
   return { engine, calls };
+}
+
+/** Fake Host `llm` service: records prepareCall/stream options and yields scripted chunks. */
+function createFakeLlm({ providers = ['deepseek-account'], models = ['deepseek-flash'], chunks, prepareError, streamError } = {}) {
+  const calls = { prepare: [], stream: [] };
+  const defaultChunks = [
+    { type: 'text-delta', text: '{"verdict":' },
+    { type: 'text-delta', text: '"HOLD"}' },
+    { type: 'usage', usage: { inputTokens: 120, outputTokens: 45 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ];
+  const llm = {
+    async listProviders() {
+      calls.listProviders = (calls.listProviders ?? 0) + 1;
+      return providers.map((id) => ({ id, name: id }));
+    },
+    async listModels(provider) {
+      calls.listModels = (calls.listModels ?? 0) + 1;
+      calls.lastListModelsProvider = provider;
+      return models.map((id) => ({ provider, id, name: id }));
+    },
+    async prepareCall(config) {
+      calls.prepare.push(config);
+      if (prepareError) throw prepareError;
+      return {
+        config,
+        stream(options) {
+          calls.stream.push(options);
+          return (async function* scriptedChunks() {
+            for (const chunk of chunks ?? defaultChunks) yield chunk;
+            if (streamError) throw streamError;
+          })();
+        },
+      };
+    },
+  };
+  return { llm, calls };
+}
+
+function fakeLogger() {
+  const warnings = [];
+  return {
+    warnings,
+    warn(message) {
+      warnings.push(String(message));
+    },
+    info() {},
+    error() {},
+    debug() {},
+  };
 }
 
 function baseConfig(engine, overrides = {}) {
@@ -1188,6 +1294,186 @@ test('fallback emergency stop writes the KILL_SWITCH marker file', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// research sidecar: Harness-LLM bridge (host)
+// ---------------------------------------------------------------------------
+
+test('research bridge resolves the agent default model and concatenates the stream', async () => {
+  const { llm, calls } = createFakeLlm();
+  const ctx = createFakeCtx({
+    llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek-account', model: 'deepseek-flash' }) },
+  }).ctx;
+  const log = fakeLogger();
+  const bridge = await createResearchBridge(ctx, { stateDir: STATE_DIR }, log);
+  assert.ok(bridge, 'bridge is built when llm + selection exist');
+  assert.equal(bridge.provider, 'deepseek-account');
+  assert.equal(bridge.model, 'deepseek-flash');
+  assert.equal(log.warnings.length, 0);
+
+  const result = await bridge.generate({ system: 'SYSTEM-PROMPT', user: 'USER-PAYLOAD', maxTokens: 700 });
+  assert.equal(result.text, '{"verdict":"HOLD"}');
+  assert.deepEqual(result.usage, { inputTokens: 120, outputTokens: 45 });
+
+  assert.deepEqual(calls.prepare[0], {
+    provider: 'deepseek-account',
+    model: 'deepseek-flash',
+    maxTokens: 700,
+    temperature: 0.2,
+  });
+  assert.equal(calls.stream.length, 1);
+  const streamOptions = calls.stream[0];
+  assert.equal(streamOptions.provider, 'deepseek-account');
+  assert.equal(streamOptions.model, 'deepseek-flash');
+  assert.equal(streamOptions.system, 'SYSTEM-PROMPT');
+  assert.equal(streamOptions.maxTokens, 700);
+  assert.equal(streamOptions.temperature, 0.2);
+  assert.deepEqual(streamOptions.messages, [
+    { role: 'user', content: [{ type: 'text', text: 'USER-PAYLOAD' }] },
+  ]);
+});
+
+test('research bridge falls back to the first provider and its first model', async () => {
+  const { llm, calls } = createFakeLlm({ providers: ['provider-a', 'provider-b'], models: ['model-1', 'model-2'] });
+  const bridge = await createResearchBridge(createFakeCtx({ llm }).ctx, { stateDir: STATE_DIR }, fakeLogger());
+  assert.ok(bridge);
+  assert.equal(bridge.provider, 'provider-a');
+  assert.equal(bridge.model, 'model-1');
+  assert.equal(calls.lastListModelsProvider, 'provider-a');
+});
+
+test('research bridge honours row and nested-config provider/model overrides', async () => {
+  const { llm } = createFakeLlm();
+  const ctx = createFakeCtx({
+    llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'default-p', model: 'default-m' }) },
+  }).ctx;
+  assert.deepEqual(resolveResearchOverrides({ researchProvider: 'row-p', researchModel: 'row-m' }), { provider: 'row-p', model: 'row-m' });
+  assert.deepEqual(resolveResearchOverrides({ config: { research: { provider: 'nested-p', model: 'nested-m' } } }), { provider: 'nested-p', model: 'nested-m' });
+  assert.deepEqual(resolveResearchOverrides({}), { provider: null, model: null });
+
+  const rowBridge = await createResearchBridge(ctx, { stateDir: STATE_DIR, researchProvider: 'row-p', researchModel: 'row-m' }, fakeLogger());
+  assert.ok(rowBridge);
+  assert.equal(rowBridge.provider, 'row-p');
+  assert.equal(rowBridge.model, 'row-m');
+
+  const nestedBridge = await createResearchBridge(ctx, { stateDir: STATE_DIR, config: { research: { provider: 'nested-p', model: 'nested-m' } } }, fakeLogger());
+  assert.ok(nestedBridge);
+  assert.equal(nestedBridge.provider, 'nested-p');
+  assert.equal(nestedBridge.model, 'nested-m');
+});
+
+test('research bridge returns null (configured:false) when the LLM service or model is unavailable', async () => {
+  const noLlmLog = fakeLogger();
+  assert.equal(await createResearchBridge(createFakeCtx().ctx, { stateDir: STATE_DIR }, noLlmLog), null);
+  assert.ok(noLlmLog.warnings.some((message) => /no Harness llm service/.test(message)));
+
+  const noProviderLog = fakeLogger();
+  const emptyLlm = createFakeLlm({ providers: [] });
+  assert.equal(await createResearchBridge(createFakeCtx({ llm: emptyLlm.llm }).ctx, { stateDir: STATE_DIR }, noProviderLog), null);
+  assert.ok(noProviderLog.warnings.some((message) => /no LLM provider\/model resolved/.test(message)));
+});
+
+test('research bridge surfaces provider failures as clean errors', async () => {
+  const finishError = createFakeLlm({
+    chunks: [
+      { type: 'text-delta', text: 'partial' },
+      { type: 'finish', reason: { kind: 'error', failure: { message: 'rate limited', code: 'RATE_LIMIT' } } },
+    ],
+  });
+  const ctx = createFakeCtx({
+    llm: finishError.llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+  }).ctx;
+  const bridge = await createResearchBridge(ctx, { stateDir: STATE_DIR }, fakeLogger());
+  await assert.rejects(bridge.generate({ system: 's', user: 'u', maxTokens: 128 }), (error) => {
+    assert.match(error.message, /rate limited/);
+    assert.match(error.message, /p\/m/);
+    assert.equal(error.code, 'RATE_LIMIT');
+    return true;
+  });
+
+  const streamFailure = createFakeLlm({ streamError: Object.assign(new Error('socket closed'), { code: 'NETWORK' }) });
+  const ctx2 = createFakeCtx({
+    llm: streamFailure.llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+  }).ctx;
+  const bridge2 = await createResearchBridge(ctx2, { stateDir: STATE_DIR }, fakeLogger());
+  await assert.rejects(bridge2.generate({ system: 's', user: 'u', maxTokens: 128 }), (error) => {
+    assert.match(error.message, /socket closed/);
+    assert.equal(error.code, 'NETWORK');
+    return true;
+  });
+
+  const emptyReply = createFakeLlm({ chunks: [{ type: 'finish', reason: { kind: 'stop' } }] });
+  const ctx3 = createFakeCtx({
+    llm: emptyReply.llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+  }).ctx;
+  const bridge3 = await createResearchBridge(ctx3, { stateDir: STATE_DIR }, fakeLogger());
+  await assert.rejects(bridge3.generate({ system: 's', user: 'u', maxTokens: 128 }), /empty briefing/);
+});
+
+test('the engine factory receives the research bridge (and null without an LLM)', async () => {
+  const { llm } = createFakeLlm({ providers: ['p1'], models: ['m1'] });
+  const withLlm = createFakeCtx({
+    llm,
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p1', model: 'm1' }) },
+  });
+  const captured = {};
+  const { engine } = createFakeEngine();
+  apply(withLlm.ctx, baseConfig(engine, {
+    engineFactory: (rowConfig, research) => {
+      captured.row = rowConfig;
+      captured.research = research;
+      return engine;
+    },
+  }));
+  await withLlm.tools.get('automaton_status').execute({}, {});
+  assert.ok(captured.research, 'researchGenerate bridge is passed to the engine factory');
+  assert.equal(captured.research.provider, 'p1');
+  assert.equal(captured.research.model, 'm1');
+  assert.equal(typeof captured.research.generate, 'function');
+  withLlm.disposeAll();
+
+  const noLlm = createFakeCtx();
+  const capturedWithout = {};
+  const second = createFakeEngine();
+  apply(noLlm.ctx, baseConfig(second.engine, {
+    engineFactory: (rowConfig, research) => {
+      capturedWithout.row = rowConfig;
+      capturedWithout.research = research;
+      return second.engine;
+    },
+  }));
+  await noLlm.tools.get('automaton_status').execute({}, {});
+  assert.equal(capturedWithout.research, null, 'no llm → no generator passed (engine reports configured:false)');
+  noLlm.disposeAll();
+});
+
+test('GET /automaton/state passes research telemetry and per-agent briefings through', async () => {
+  const fake = createFakeCtx();
+  const { engine } = createFakeEngine({ agentCount: POPULATION });
+  apply(fake.ctx, baseConfig(engine));
+  const { json } = await invokeHandler(routeFor(fake.routes, ROUTE_PATH).handler, { method: 'GET' });
+  assert.equal(json.engine.research.configured, true);
+  assert.equal(json.engine.research.influence, true);
+  assert.equal(json.engine.research.provider, 'deepseek-account');
+  assert.equal(json.agents[0].research.verdict, 'HOLD');
+  assert.equal(json.agents[1].research.stale, true);
+
+  const unconfigured = createFakeCtx();
+  const { engine: engine2 } = createFakeEngine({
+    agentCount: POPULATION,
+    research: { enabled: true, configured: false, influence: true, intervalSec: 3600, lastRunAt: null, nextDueAt: null, provider: null, model: null, runs: 0, errors: 0 },
+  });
+  apply(unconfigured.ctx, baseConfig(engine2));
+  const passed = await invokeHandler(routeFor(unconfigured.routes, ROUTE_PATH).handler, { method: 'GET' });
+  assert.equal(passed.json.engine.research.configured, false);
+  unconfigured.disposeAll();
+  fake.disposeAll();
+});
+
+// ---------------------------------------------------------------------------
 // client module tests (registration + pure data mapping, no rendering)
 // ---------------------------------------------------------------------------
 
@@ -1554,6 +1840,129 @@ test('pure data mapping: Reaper telemetry states for the operator row', async ()
     const summary = helpers.summarize(status);
     assert.equal(summary.reaper.pid, 24452);
     assert.equal(helpers.describeReaper(summary.reaper).kind, 'stale');
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: research badges, briefing detail and shadow/influence state', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildStatusPayload({ running: true });
+    const rows = helpers.buildAgentRows(status);
+
+    const holdRow = rows.find((row) => row.research && row.research.verdict === 'HOLD');
+    assert.ok(holdRow);
+    assert.equal(holdRow.research.sentiment, 0.2);
+    assert.equal(holdRow.research.confidence, 0.7);
+    assert.match(holdRow.research.summary, /Neutral tone/);
+    assert.equal(holdRow.research.catalysts.length, 2);
+    assert.equal(holdRow.research.risks.length, 1);
+    assert.equal(holdRow.research.sources.length, 2);
+    assert.equal(holdRow.research.sources[0].url, 'https://example.com/news/1');
+    assert.equal(holdRow.research.sources[1].url, null, 'non-http(s) source URLs are not linkable');
+    assert.deepEqual(holdRow.researchBadge, helpers.researchBadge(holdRow.research));
+    const holdBadge = helpers.researchBadge(holdRow.research);
+    assert.equal(holdBadge.hasResearch, true);
+    assert.equal(holdBadge.label, 'HOLD +0.2');
+    assert.equal(holdBadge.tone, 'hold');
+    assert.equal(holdBadge.stale, false);
+
+    const avoidRow = rows.find((row) => row.research && row.research.verdict === 'AVOID');
+    assert.ok(avoidRow);
+    const avoidBadge = helpers.researchBadge(avoidRow.research);
+    assert.equal(avoidBadge.label, 'AVOID -0.6');
+    assert.equal(avoidBadge.tone, 'avoid');
+    assert.equal(avoidBadge.stale, true);
+    assert.equal(avoidRow.research.risks.length, 4, 'risks are clamped to 4');
+
+    const alertRow = rows.find((row) => row.research && row.research.verdict === 'ALERT');
+    assert.ok(alertRow);
+    assert.equal(helpers.researchBadge(alertRow.research).tone, 'alert');
+
+    const noResearch = rows.find((row) => row.research === null);
+    assert.ok(noResearch);
+    assert.deepEqual(helpers.researchBadge(noResearch.research), {
+      hasResearch: false,
+      label: '—',
+      tone: 'none',
+      stale: false,
+      verdict: null,
+      sentiment: null,
+      title: '',
+    });
+    assert.equal(noResearch.researchBadge.hasResearch, false);
+
+    // Normalization is defensive and clamped.
+    const malformed = helpers.mapResearchBriefing({
+      verdict: 'hold',
+      sentiment: -3,
+      confidence: 5,
+      catalysts: ['a', '', 7, 'b', 'c', 'd', 'e'],
+      risks: 'not-an-array',
+      sources: [
+        { title: 'ok', url: 'https://example.com/x' },
+        { url: 'ftp://nope', title: 'ftp' },
+        { url: 'https://example.com/y', source: 'src' },
+      ],
+      stale: true,
+    });
+    assert.equal(malformed.verdict, 'HOLD');
+    assert.equal(malformed.sentiment, -1);
+    assert.equal(malformed.confidence, 1);
+    assert.deepEqual(malformed.catalysts, ['a', 'b', 'c', 'd']);
+    assert.deepEqual(malformed.risks, []);
+    assert.equal(malformed.sources.length, 3);
+    assert.equal(malformed.sources[0].url, 'https://example.com/x');
+    assert.equal(malformed.sources[1].url, null);
+    assert.equal(malformed.stale, true);
+    assert.equal(helpers.mapResearchBriefing(null), null);
+    assert.equal(helpers.mapResearchBriefing('garbage'), null);
+    assert.equal(helpers.mapResearchBriefing({}), null);
+
+    // Engine research schedule projection: influence vs shadow vs unconfigured.
+    const influenceStatus = helpers.researchStatusSummary(status);
+    assert.equal(influenceStatus.available, true);
+    assert.equal(influenceStatus.configured, true);
+    assert.equal(influenceStatus.influence, true);
+    assert.equal(influenceStatus.shadow, false);
+    assert.equal(influenceStatus.intervalSec, 3600);
+    assert.equal(influenceStatus.runs, 3);
+    assert.equal(influenceStatus.provider, 'deepseek-account');
+    assert.equal(helpers.researchModeKey(influenceStatus), 'researchInfluence');
+
+    const shadowStatus = buildStatusPayload({
+      running: true,
+      research: { enabled: true, configured: true, influence: false, intervalSec: 3600, lastRunAt: null, nextDueAt: null, provider: 'p', model: 'm', runs: 1, errors: 0 },
+    });
+    const shadow = helpers.researchStatusSummary(shadowStatus);
+    assert.equal(shadow.shadow, true);
+    assert.equal(shadow.disabledReason, null);
+    assert.equal(helpers.researchModeKey(shadow), 'researchShadow');
+
+    const unconfiguredStatus = buildStatusPayload({
+      running: true,
+      research: { enabled: true, configured: false, influence: true, intervalSec: 3600, lastRunAt: null, nextDueAt: null, provider: null, model: null, runs: 0, errors: 0 },
+    });
+    const unconfigured = helpers.researchStatusSummary(unconfiguredStatus);
+    assert.equal(unconfigured.configured, false);
+    assert.equal(unconfigured.disabledReason, 'unconfigured');
+
+    const configDisabledStatus = buildStatusPayload({
+      running: true,
+      research: { enabled: false, configured: true, influence: true, intervalSec: 3600, lastRunAt: null, nextDueAt: null, provider: 'p', model: 'm', runs: 0, errors: 0 },
+    });
+    assert.equal(helpers.researchStatusSummary(configDisabledStatus).disabledReason, 'disabled');
+
+    const unknown = helpers.researchStatusSummary({});
+    assert.equal(unknown.available, false);
+    assert.equal(helpers.researchModeKey(unknown), 'researchUnknown');
+
+    // summarize() exposes the same projection to the dashboard header/detail.
+    const summary = helpers.summarize(status);
+    assert.equal(summary.research.configured, true);
+    assert.equal(summary.research.shadow, false);
   } finally {
     loaded.restore();
   }

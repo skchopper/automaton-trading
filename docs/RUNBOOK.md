@@ -132,6 +132,39 @@ The plugin row config is in `packages/automaton-trading/cordis.patch.yml`
 (`stateDir`, `envFile`, `mode`, `autoStart`). `autoStart` is `false`; the engine starts
 idle and never trades until the panel's Start button / `automaton_start` / CLI `run` is used.
 
+## 6a. Research sidecar (per-agent, hourly)
+
+Each living agent gets its own **isolated** hourly news briefing (`docs/RESEARCH.md`).
+
+- **How it runs**: inside the engine loop — once per cycle the researcher runs only for agents
+  whose hourly slot is due (`research.intervalSec`, staggered by `research.staggerSec`). In the
+  Harness the LLM comes from the Host `llm` service (the same DeepSeek account, no extra key);
+  a headless CLI run uses `DEEPSEEK_API_KEY` from `.env` (optional, `DEEPSEEK_MODEL` ~
+  `deepseek-chat`). Without either, `engine.research.configured=false`: trading continues
+  unchanged and the panel shows "research disabled: no LLM bridge / key".
+- **What the model sees**: only that agent's genome/spec, its own cash/positions/P&L, news for
+  its own symbols (Alpaca News API) and its own last ≤5 briefings. No other agent's data and no
+  shared conversation — this is enforced by construction and asserted in `test/research.test.js`.
+- **What it can do**: advise the Executor only. `AVOID`/`ALERT`/negative-sentiment/2+ risks veto
+  a *new entry* (`research_veto`); positive sentiment scales the order size down (never up);
+  `ALERT`/strong negative sentiment pushes an exit (`research_alert`). Every order still passes
+  the 14 brakes. Set `research.influence:false` for shadow mode (briefings logged, no effect).
+- **What it costs**: `research.costPerRunUsd` (default $0.001) is charged to **that agent's**
+  ledger per successful briefing (category `research`, role `prospector`), so research shortens
+  the agent's runway. Malformed/absent LLM answers are logged with no charge.
+- **Where to look**: panel → agent drill-down "Research — isolated hourly analyst" (verdict,
+  sentiment, confidence, summary, catalysts/risks, sources); raw data in
+  `automaton-data/research/<agentId>.jsonl` and `automaton-data/research/state.json`;
+  latest cycle summary in the tick trace (`trace.research`). `engine.status().engine.research`
+  reports `enabled/configured/influence/lastRunAt/nextDueAt/provider/model/runs/errors`.
+- **Disable / tune**: edit `research` in `automaton.config.json`
+  (`enabled`, `influence`, `intervalSec`, `staggerSec`, `costPerRunUsd`, `maxAgeSec`,
+  `maxNewsPerAgent`, `maxOutputTokens`) and restart the Host (engine modules load on boot).
+- **Failure behaviour**: news outage → no news → neutral HOLD (no LLM call, no charge);
+  LLM error → logged, no briefing/charge, trading unaffected; stale briefing (> `maxAgeSec`)
+  → ignored by the Executor but still shown (marked stale) in the panel.
+
+
 ## 7. Safety and emergency procedures
 
 | Situation | Action |

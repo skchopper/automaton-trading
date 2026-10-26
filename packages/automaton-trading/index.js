@@ -38,6 +38,11 @@ const CONTROL_ACTIONS = Object.freeze(['start', 'stop', 'emergency-stop', 'reape
 const CONTROL_BODY_LIMIT_BYTES = 8192;
 const MAX_ERROR_MESSAGE = 500;
 const SIMULATION_LIMITS = Object.freeze({ cycles: [1, 5000], population: [1, 200] });
+/** Research sidecar LLM call: low temperature, bounded output tokens. */
+const RESEARCH_TEMPERATURE = 0.2;
+const RESEARCH_TOKEN_DEFAULT = 700;
+const RESEARCH_TOKEN_MIN = 128;
+const RESEARCH_TOKEN_MAX = 4000;
 
 const WORKSPACE = process.cwd();
 
@@ -95,6 +100,178 @@ function pluginLogger(ctx) {
     }
   };
   return { info: write('info'), warn: write('warn'), error: write('error'), debug: () => {} };
+}
+
+// ---------------------------------------------------------------------------
+// Research sidecar: Harness-LLM bridge
+//
+// The per-agent research sidecar (src/research.js) expects ONE seam:
+//   generate({ system, user, maxTokens }) -> Promise<{ text, usage? }>
+// The plugin implements it on top of the Host's abstract `llm` service, resolving the
+// model from the agent-default-model selection (row overrides win). When no usable LLM
+// bridge exists the plugin passes no generator, so the engine reports
+// `engine.research.configured === false` and trading continues unchanged.
+// ---------------------------------------------------------------------------
+
+/** Row/nested-config overrides for the research provider/model. */
+function resolveResearchOverrides(row) {
+  const nested = row && row.config && typeof row.config === 'object' && row.config.research
+    ? row.config.research
+    : null;
+  const provider = typeof row?.researchProvider === 'string' && row.researchProvider.length > 0
+    ? row.researchProvider
+    : (typeof nested?.provider === 'string' && nested.provider.length > 0 ? nested.provider : null);
+  const model = typeof row?.researchModel === 'string' && row.researchModel.length > 0
+    ? row.researchModel
+    : (typeof nested?.model === 'string' && nested.model.length > 0 ? nested.model : null);
+  return { provider, model };
+}
+
+/**
+ * Resolve the provider/model the research call should use.
+ * Priority: row overrides > nested row config > `agentDefaultModel.currentSelection()` >
+ * first registered provider + its first model.
+ * @returns {Promise<{provider: string|null, model: string|null}>}
+ */
+async function resolveResearchTarget(ctx, row, llm) {
+  const overrides = resolveResearchOverrides(row);
+  let provider = overrides.provider;
+  let model = overrides.model;
+  if (!provider || !model) {
+    try {
+      const selection = typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel')?.currentSelection?.() : undefined;
+      if (selection && typeof selection === 'object') {
+        if (!provider) provider = typeof selection.provider === 'string' && selection.provider.length > 0 ? selection.provider : null;
+        if (!model) model = typeof selection.model === 'string' && selection.model.length > 0 ? selection.model : null;
+      }
+    } catch {
+      /* optional service */
+    }
+  }
+  if (!provider && typeof llm.listProviders === 'function') {
+    try {
+      const providers = await llm.listProviders();
+      const first = Array.isArray(providers)
+        ? providers.find((entry) => entry && typeof (entry.id ?? entry.provider) === 'string' && (entry.id ?? entry.provider).length > 0)
+        : null;
+      if (first) provider = String(first.id ?? first.provider);
+    } catch {
+      /* optional; research stays unconfigured */
+    }
+  }
+  if (!model && provider && typeof llm.listModels === 'function') {
+    try {
+      const models = await llm.listModels(provider);
+      const first = Array.isArray(models)
+        ? models.find((entry) => entry && typeof (entry.id ?? entry.model) === 'string' && (entry.id ?? entry.model).length > 0)
+        : null;
+      if (first) model = String(first.id ?? first.model);
+    } catch {
+      /* optional; research stays unconfigured */
+    }
+  }
+  return { provider, model };
+}
+
+/** Wrap one LLM/bridge failure into a clean, secret-free Error for the researcher's log. */
+function researchLlmError(error, provider, model) {
+  const base = error instanceof Error ? error : new Error(String(error ?? 'LLM call failed'));
+  const clean = new Error(scrubMessage(`${provider}/${model}: ${base.message}`));
+  clean.name = 'ResearchLlmError';
+  clean.code = typeof base.code === 'string' && base.code.length > 0 ? base.code : 'LLM_ERROR';
+  return clean;
+}
+
+/**
+ * Build the Harness-LLM research generator.
+ *
+ * Never throws: returns `null` when the `llm` service is absent or no provider/model can
+ * be resolved (research then reports `configured:false`). `generate` rejects with a clean
+ * Error on provider failures so the researcher logs the failure and stores no briefing.
+ *
+ * @param {object} ctx Cordis plugin context
+ * @param {object} row normalized plugin-row config
+ * @param {{warn: Function, info?: Function}} [log]
+ * @returns {Promise<{provider: string, model: string, generate: Function}|null>}
+ */
+async function createResearchBridge(ctx, row, log) {
+  const logger = log ?? { warn() {}, info() {} };
+  try {
+    const llm = typeof ctx?.get === 'function' ? ctx.get('llm') : undefined;
+    if (!llm || typeof llm.prepareCall !== 'function') {
+      logger.warn('research disabled: no Harness llm service');
+      return null;
+    }
+    const { provider, model } = await resolveResearchTarget(ctx, row, llm);
+    if (!provider || !model) {
+      logger.warn('research disabled: no LLM provider/model resolved', { provider, model });
+      return null;
+    }
+
+    async function generate({ system, user, maxTokens } = {}) {
+      const requested = Number(maxTokens);
+      const tokenBudget = Number.isFinite(requested) && requested > 0
+        ? Math.min(RESEARCH_TOKEN_MAX, Math.max(RESEARCH_TOKEN_MIN, Math.trunc(requested)))
+        : RESEARCH_TOKEN_DEFAULT;
+      const messages = [{ role: 'user', content: [{ type: 'text', text: String(user ?? '') }] }];
+
+      let prepared;
+      try {
+        prepared = await llm.prepareCall({ provider, model, maxTokens: tokenBudget, temperature: RESEARCH_TEMPERATURE });
+      } catch (error) {
+        throw researchLlmError(error, provider, model);
+      }
+
+      let text = '';
+      let usage = null;
+      try {
+        const stream = prepared.stream({
+          provider,
+          model,
+          system: String(system ?? ''),
+          messages,
+          maxTokens: tokenBudget,
+          temperature: RESEARCH_TEMPERATURE,
+        });
+        for await (const chunk of stream) {
+          if (!chunk || typeof chunk !== 'object') continue;
+          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+            text += chunk.text;
+            continue;
+          }
+          if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
+            usage = { ...chunk.usage };
+            continue;
+          }
+          if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
+            const failure = chunk.reason.failure ?? {};
+            const error = new Error(failure.message ?? 'LLM call failed');
+            if (typeof failure.code === 'string' && failure.code.length > 0) error.code = failure.code;
+            throw error;
+          }
+          if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'aborted') {
+            const error = new Error('LLM call aborted');
+            error.code = 'ABORTED';
+            throw error;
+          }
+        }
+      } catch (error) {
+        throw researchLlmError(error, provider, model);
+      }
+
+      if (text.trim().length === 0) {
+        const error = new Error(`${provider}/${model}: LLM returned an empty briefing`);
+        error.code = 'EMPTY_LLM_RESPONSE';
+        throw error;
+      }
+      return { text, usage: usage ?? undefined };
+    }
+
+    return { provider, model, generate };
+  } catch (error) {
+    logger.warn('research bridge unavailable', safeError(error));
+    return null;
+  }
 }
 
 /** Mask common credential shapes inside free-form error messages. */
@@ -218,8 +395,9 @@ const EMPTY_PARAMS = Object.freeze({ type: 'object', properties: {} });
  * Default engine factory: lazily import the Lead-owned facade so this plugin shell
  * still activates (and reports a structured error) if the engine module is broken.
  * @param {object} row normalized plugin-row config
+ * @param {{provider: string, model: string, generate: Function}|null} research Harness-LLM bridge (or null)
  */
-async function defaultEngineFactory(row) {
+async function defaultEngineFactory(row, research) {
   const module = await import('./src/engine.js');
   if (typeof module.createEngine !== 'function') {
     const error = new Error('src/engine.js does not export createEngine');
@@ -229,23 +407,41 @@ async function defaultEngineFactory(row) {
   const overrides = { ...row.overrides };
   // The row may carry a nested `config` object with deeper overrides (engine.normalizeOverrides).
   if (row.config && typeof row.config === 'object' && !Array.isArray(row.config)) overrides.config = row.config;
-  return module.createEngine({ overrides, envFile: row.envFile });
+  const options = { overrides, envFile: row.envFile };
+  if (research && typeof research.generate === 'function') {
+    options.researchGenerate = research.generate;
+    options.researchProvider = research.provider;
+    options.researchModel = research.model;
+  }
+  return module.createEngine(options);
 }
 
 /**
  * One engine handle per plugin activation. Creation is lazy and memoized; a failed
  * creation is retried on the next call instead of poisoning the plugin.
  */
-function createEngineHolder(row, log) {
+function createEngineHolder(row, log, ctx) {
   let engine = null;
   let enginePromise = null;
+  let researchPromise = null;
+
+  /** Build the research bridge once per activation (null when the LLM service is absent). */
+  function getResearch() {
+    if (!researchPromise) researchPromise = createResearchBridge(ctx, row, log);
+    return researchPromise;
+  }
 
   function getEngine() {
     if (engine) return Promise.resolve(engine);
     if (enginePromise) return enginePromise;
     const factory = typeof row.engineFactory === 'function' ? row.engineFactory : defaultEngineFactory;
     enginePromise = Promise.resolve()
-      .then(() => factory(row))
+      .then(async () => {
+        const research = await getResearch();
+        // The custom test seam receives the bridge as its second argument; the default
+        // factory forwards it to createEngine as `researchGenerate` (+ provider/model).
+        return factory(row, research);
+      })
       .then((created) => {
         if (!created || typeof created !== 'object') {
           const error = new Error('engineFactory did not return an engine object');
@@ -293,7 +489,7 @@ function createEngineHolder(row, log) {
     else if (pending) void pending.then(stop).catch(() => {});
   }
 
-  return { getEngine, call, dispose, isCreated: () => Boolean(engine) };
+  return { getEngine, getResearch, call, dispose, isCreated: () => Boolean(engine) };
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +544,26 @@ async function buildState(holder, row) {
   const effectiveConfig = configView?.config ?? null;
   const account = status?.account ?? null;
   const population = status?.population ?? null;
+  /**
+   * Research schedule display: an engine that only receives an injected generator cannot
+   * know which provider/model that generator uses, so fill missing engine.research
+   * provider/model from the Host LLM bridge (display-only; never overrides engine values).
+   */
+  let engineResearch = status?.engine?.research ?? null;
+  if (engineResearch && (engineResearch.provider == null || engineResearch.model == null)) {
+    try {
+      const bridge = typeof holder.getResearch === 'function' ? await holder.getResearch() : null;
+      if (bridge) {
+        engineResearch = {
+          ...engineResearch,
+          provider: engineResearch.provider ?? bridge.provider ?? null,
+          model: engineResearch.model ?? bridge.model ?? null,
+        };
+      }
+    } catch {
+      /* research display must never fail the panel snapshot */
+    }
+  }
   const allocationCapPctRaw = Number(effectiveConfig?.account?.allocationCapPct);
   const allocationCapPct = Number.isFinite(allocationCapPctRaw) && allocationCapPctRaw > 0 ? allocationCapPctRaw : null;
   const equityUsd = Number(account?.equityUsd);
@@ -376,6 +592,7 @@ async function buildState(holder, row) {
       running: Boolean(status?.engine?.running),
       reaper: status?.engine?.reaper ?? null,
       ...status?.engine,
+      research: engineResearch,
       killSwitch: killSwitchActive(status, row, configView),
     },
     account: status?.account ?? null,
@@ -1153,7 +1370,7 @@ function buildToolDefinitions(ctx, row, holder) {
 export function apply(ctx, config) {
   const row = normalizeRowConfig(config);
   const log = pluginLogger(ctx);
-  const holder = createEngineHolder(row, log);
+  const holder = createEngineHolder(row, log, ctx);
 
   ctx.effect(() => {
     const disposers = buildToolDefinitions(ctx, row, holder)
@@ -1256,11 +1473,15 @@ export const TOOL_NAMES = Object.freeze([
 ]);
 
 // Exported for tests: route paths, the operator-only Reaper helper (host side; never a
-// tool), and the Reaper pid/heartbeat file names used by that helper.
+// tool), the Reaper pid/heartbeat file names used by that helper, and the Harness-LLM
+// research bridge builder (the research sidecar seam; returns null when no LLM exists).
 export {
   ROUTE_PATH,
   CONTROL_PATH,
   stopReaperOperator,
+  createResearchBridge,
+  resolveResearchOverrides,
+  resolveResearchTarget,
   REAPER_PID_FILE,
   REAPER_HEARTBEAT_FILE,
 };

@@ -580,6 +580,98 @@ test('alpaca broker: getDataUrl is the real data request URL, and cancelOrder is
   assert.deepEqual(canceled, { id: 'ord-1', status: 'canceled' });
 });
 
+test('alpaca broker: getNews maps, filters empty headlines and old items, and tolerates bad rows', async () => {
+  const now = Date.now();
+  const hour = 60 * 60 * 1000;
+  const fetchImpl = stubFetch((url) => {
+    if (url.includes('/v1beta1/news')) {
+      return jsonResponse(200, {
+        news: [
+          {
+            id: 101,
+            headline: 'AAPL beats quarterly expectations',
+            summary: 'Results above consensus.',
+            source: 'Benzinga',
+            url: 'https://example.test/aapl-q',
+            symbols: ['AAPL', 'MSFT'],
+            created_at: new Date(now - hour).toISOString(),
+          },
+          // empty headline -> dropped
+          { id: 102, headline: '   ', summary: 'x', created_at: new Date(now - hour).toISOString() },
+          // older than `start` -> dropped by the start filter
+          {
+            id: 103,
+            headline: 'Stale AAPL item',
+            summary: 'old',
+            source: 'Benzinga',
+            url: null,
+            symbols: ['AAPL'],
+            created_at: new Date(now - 48 * hour).toISOString(),
+          },
+          // missing optional fields + unparseable timestamp -> tolerated/dropped
+          { id: 104, headline: 'Analysts lift AAPL price target', created_at: new Date(now - 30 * 60 * 1000).toISOString() },
+          { id: 105, headline: 'Bad timestamp', created_at: 'not-a-date' },
+          null,
+          42,
+        ],
+      });
+    }
+    return jsonResponse(404, { message: 'unexpected path' });
+  });
+  const broker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl },
+  );
+  const start = new Date(now - 24 * hour).toISOString();
+  const news = await broker.getNews({ symbols: ['AAPL', 'MSFT'], limit: 5, start });
+
+  assert.equal(news.length, 2, JSON.stringify(news));
+  // newest first (30 min ago before 1 h ago)
+  assert.equal(news[0].id, '104');
+  assert.equal(news[0].headline, 'Analysts lift AAPL price target');
+  assert.equal(news[0].summary, '');
+  assert.equal(news[0].source, '');
+  assert.equal(news[0].url, null);
+  assert.deepEqual(news[0].symbols, []);
+  assert.equal(news[1].id, '101');
+  assert.equal(news[1].url, 'https://example.test/aapl-q');
+  assert.deepEqual(news[1].symbols, ['AAPL', 'MSFT']);
+  assert.equal(news[1].createdAt, Date.parse(new Date(now - hour).toISOString()));
+  assert.ok(news.every((item) => Number.isFinite(item.createdAt) && item.headline.length > 0));
+
+  const newsCall = fetchImpl.calls.find((call) => call.url.includes('/v1beta1/news'));
+  assert.ok(newsCall.url.startsWith('https://data.alpaca.markets/v1beta1/news?'));
+  const url = new URL(newsCall.url);
+  assert.equal(url.searchParams.get('symbols'), 'AAPL,MSFT');
+  assert.equal(url.searchParams.get('limit'), '5');
+  assert.equal(url.searchParams.get('start'), start);
+  assert.equal(newsCall.init.headers['APCA-API-KEY-ID'], 'k');
+
+  // no news is a valid answer, not an error
+  const empty = stubFetch(() => jsonResponse(200, { news: [] }));
+  const emptyBroker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl: empty },
+  );
+  assert.deepEqual(await emptyBroker.getNews({ symbols: ['AAPL'] }), []);
+
+  // an advisory news outage is swallowed (research must never stop trading)...
+  const down = stubFetch(() => jsonResponse(500, 'news is down'));
+  const downBroker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl: down, sleepImpl: async () => {} },
+  );
+  assert.deepEqual(await downBroker.getNews({ symbols: ['AAPL'] }), []);
+
+  // ...but an auth failure is surfaced for the operator
+  const unauthorized = stubFetch(() => jsonResponse(401, { message: 'unauthorized' }));
+  const unauthorizedBroker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl: unauthorized },
+  );
+  await expectCode(unauthorizedBroker.getNews({ symbols: ['AAPL'] }), 'BROKER_AUTH');
+});
+
 // ===========================================================================
 // broker-sim
 // ===========================================================================
@@ -668,6 +760,48 @@ test('sim broker: no shorting, no negative cash, deterministic reset', async () 
   assert.equal(broker.getAccount().cashUsd, 500);
   assert.deepEqual(broker.getPositions(), []);
   assert.deepEqual(broker.getOrders({ status: 'all' }), []);
+});
+
+test('sim broker: deterministic synthetic news for the research path (offline)', async () => {
+  const config = testConfig({ mode: 'sim' });
+  const brokerA = createSimBroker(config, { seed: 42 });
+  const brokerB = createSimBroker(config, { seed: 42 });
+
+  const newsA = await brokerA.getNews({ symbols: ['AAPL'], limit: 4 });
+  const newsB = await brokerB.getNews({ symbols: ['AAPL'], limit: 4 });
+  assert.deepEqual(newsA, newsB, 'same seed + same sim time => identical headlines');
+  assert.ok(newsA.length > 0);
+  assert.ok(newsA.length <= 4);
+  for (const item of newsA) {
+    assert.equal(typeof item.id, 'string');
+    assert.ok(item.headline.length > 0);
+    assert.equal(typeof item.summary, 'string');
+    assert.equal(typeof item.source, 'string');
+    assert.ok(item.url === null || typeof item.url === 'string');
+    assert.ok(Array.isArray(item.symbols) && item.symbols.includes('AAPL'));
+    assert.ok(Number.isFinite(item.createdAt));
+    assert.ok(item.createdAt <= brokerA.marketNow(), 'news cannot be dated in the future');
+  }
+  // newest first
+  const createdAt = newsA.map((item) => item.createdAt);
+  assert.deepEqual(createdAt, [...createdAt].sort((a, b) => b - a));
+
+  // deterministic PRNG: the same simulated hour returns the same items, a later hour differs
+  const again = await brokerA.getNews({ symbols: ['AAPL'], limit: 4 });
+  assert.deepEqual(again, newsA);
+  brokerA.advanceBar(1);
+  const later = await brokerA.getNews({ symbols: ['AAPL'], limit: 4 });
+  assert.notDeepEqual(later.map((item) => item.id), newsA.map((item) => item.id));
+
+  // start filter and limit are honored; unknown/empty symbols return nothing
+  const start = brokerA.marketNow() - 30 * 60 * 1000;
+  const filtered = await brokerA.getNews({ symbols: ['AAPL'], limit: 6, start });
+  assert.ok(filtered.length > 0);
+  assert.ok(filtered.every((item) => item.createdAt >= start));
+  const capped = await brokerA.getNews({ symbols: ['AAPL', 'MSFT'], limit: 2 });
+  assert.ok(capped.length <= 2);
+  assert.deepEqual(await brokerA.getNews({ symbols: ['NOTREAL'] }), []);
+  assert.deepEqual(await brokerA.getNews({ symbols: [] }), []);
 });
 
 // ===========================================================================
@@ -862,8 +996,8 @@ test('builder: genome parameters start the spec and are clamped into bounds', ()
 // executor
 // ===========================================================================
 
-function executorHarness({ brakesHandler, positions = {}, mandate, quotes } = {}) {
-  const config = testConfig({ mode: 'paper' });
+function executorHarness({ brakesHandler, positions = {}, mandate, quotes, configOverrides } = {}) {
+  const config = testConfig({ mode: 'paper', ...(configOverrides ?? {}) });
   const clock = createClock({ now: () => T0 });
   const broker = makeBrokerDouble();
   const brakes = makeBrakesDouble(brakesHandler);
@@ -881,6 +1015,38 @@ function executorHarness({ brakesHandler, positions = {}, mandate, quotes } = {}
     mandate: mandate ?? baseMandate(),
     bars: { AAPL: breakoutBars() },
     quotes: quotes ?? { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+    dayStats: { dayKey: '2024-01-10', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+  };
+}
+
+/** Convenience runner: the standard one-cycle execution call with per-test extras. */
+function runHarness(harness, extra = {}) {
+  return harness.executor.run({
+    agent: harness.agent,
+    spec: harness.spec,
+    mandate: harness.mandate,
+    quotes: harness.quotes,
+    bars: harness.bars,
+    dayStats: harness.dayStats,
+    now: T0,
+    ...extra,
+  });
+}
+
+/** A valid, fresh research briefing from the isolated analyst. */
+function makeBriefing(overrides = {}) {
+  return {
+    agentId: 'atm-1',
+    at: new Date(T0 - 60_000).toISOString(), // 1 minute old: fresh
+    verdict: 'HOLD',
+    sentiment: 0.4,
+    confidence: 0.8,
+    catalysts: ['product update'],
+    risks: [],
+    summary: 'Neutral-to-positive coverage; no material risk flagged.',
+    symbols: ['AAPL'],
+    sources: [{ title: 'Sim headline', source: 'Simulated Wire', url: null, at: new Date(T0).toISOString() }],
+    ...overrides,
   };
 }
 
@@ -1094,6 +1260,171 @@ test('executor + real brakes: a dated-proof order passes the D1-D14 wall and rea
   } finally {
     removeStateDir(dir);
   }
+});
+
+// ===========================================================================
+// executor × research sidecar (advisory, fresh-only, config-gated)
+// ===========================================================================
+
+test('executor × research: a fresh AVOID vetoes an entry that would otherwise pass', async () => {
+  // baseline: no research => the breakout entry is placed
+  const baseline = await runHarness(executorHarness());
+  assert.equal(baseline.orders.length, 1, 'baseline entry must pass without research');
+
+  // fresh AVOID => advisory skip, no order, no brake denial
+  const vetoed = executorHarness();
+  const result = await runHarness(vetoed, { research: makeBriefing({ verdict: 'AVOID', sentiment: -0.6, confidence: 0.9 }) });
+  assert.equal(result.orders.length, 0);
+  assert.equal(result.denied.length, 0, 'research is advisory: it is a skip, not a brake denial');
+  assert.equal(vetoed.broker.submitted.length, 0, 'no order may reach the broker on a research veto');
+  const veto = result.actions.find((action) => action.reason === 'research_veto');
+  assert.ok(veto, 'a research_veto skip action must be recorded');
+  assert.equal(veto.type, 'skip');
+  assert.equal(veto.symbol, 'AAPL');
+  assert.equal(veto.research.verdict, 'AVOID');
+  assert.equal(veto.research.sentiment, -0.6);
+  assert.equal(veto.research.applied, 'veto');
+
+  // each veto trigger fires on its own: ALERT verdict, sentiment <= -0.35, risks >= 2
+  for (const briefing of [
+    makeBriefing({ verdict: 'ALERT', sentiment: 0 }),
+    makeBriefing({ verdict: 'HOLD', sentiment: -0.4 }),
+    makeBriefing({ verdict: 'HOLD', sentiment: 0.2, risks: ['regulatory review', 'margin warning'] }),
+  ]) {
+    const harness = executorHarness();
+    const vetoResult = await runHarness(harness, { research: briefing });
+    assert.equal(vetoResult.orders.length, 0);
+    assert.ok(vetoResult.actions.some((action) => action.reason === 'research_veto'));
+  }
+
+  // HOLD with positive sentiment does NOT veto
+  const passing = executorHarness();
+  const passResult = await runHarness(passing, { research: makeBriefing({ verdict: 'HOLD', sentiment: 0.4 }) });
+  assert.equal(passResult.orders.length, 1);
+});
+
+test('executor × research: size scaling only shrinks the notional (and existing caps still win)', async () => {
+  const baseline = await runHarness(executorHarness());
+  const baselineOrder = baseline.orders[0];
+  const baselineNotional = baselineOrder.qty * baselineOrder.avgFillPriceUsd;
+
+  // sentiment > 0: factor = clamp(0.5 + confidence*0.5, 0.4, 1.0) => 0.4*0.5+0.5 = 0.7
+  const scaled = executorHarness();
+  const scaledResult = await runHarness(scaled, {
+    research: makeBriefing({ verdict: 'HOLD', sentiment: 0.3, confidence: 0.4 }),
+  });
+  assert.equal(scaledResult.orders.length, 1);
+  const scaledOrder = scaledResult.orders[0];
+  const scaledNotional = scaledOrder.qty * scaledOrder.avgFillPriceUsd;
+  assert.ok(scaledNotional < baselineNotional, `scaled ${scaledNotional} should be below baseline ${baselineNotional}`);
+  assert.ok(Math.abs(scaledNotional - baselineNotional * 0.7) < 0.05);
+  const sizeAction = scaledResult.actions.find((action) => action.type === 'entry');
+  assert.equal(sizeAction.research.applied, 'size');
+  assert.equal(sizeAction.research.verdict, 'HOLD');
+
+  // sentiment <= 0: fixed 0.6 factor
+  const neutral = executorHarness();
+  const neutralResult = await runHarness(neutral, {
+    research: makeBriefing({ verdict: 'HOLD', sentiment: 0, confidence: 1 }),
+  });
+  const neutralNotional = neutralResult.orders[0].qty * neutralResult.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(neutralNotional - baselineNotional * 0.6) < 0.05);
+
+  // research can never widen a size: a very positive briefing still respects the mandate cap
+  const tinyMandate = executorHarness({ mandate: baseMandate({ maxOrderNotionalUsd: 120 }) });
+  const tinyResult = await runHarness(tinyMandate, {
+    research: makeBriefing({ verdict: 'HOLD', sentiment: 1, confidence: 1 }),
+  });
+  const tinyNotional = tinyResult.orders[0].qty * tinyResult.orders[0].avgFillPriceUsd;
+  assert.ok(tinyNotional <= 120 + 0.5, `mandate cap must still bind, got ${tinyNotional}`);
+});
+
+test('executor × research: ALERT forces an exit in the exit pass; entry sections do not run', async () => {
+  const openedAt = new Date(T0 - 2 * HOUR_MS).toISOString();
+  const harness = executorHarness({
+    positions: { AAPL: { qty: 10, avgPriceUsd: 110, openedAt } },
+    quotes: { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+  });
+  const result = await runHarness(harness, {
+    research: makeBriefing({ verdict: 'ALERT', sentiment: -0.8, confidence: 0.9 }),
+  });
+  assert.equal(result.orders.length, 1);
+  const exitAction = result.actions.find((action) => action.type === 'exit');
+  assert.ok(exitAction, 'an exit action must be recorded');
+  assert.equal(exitAction.reason, 'research_alert');
+  assert.equal(exitAction.side, 'sell');
+  assert.equal(exitAction.research.applied, 'exit');
+  assert.equal(exitAction.research.verdict, 'ALERT');
+  assert.equal(harness.broker.submitted[0].side, 'sell');
+  assert.equal(harness.ledger.fills.length, 1);
+
+  // a held position inside its stop/target with no alert signal is held (baseline behaviour)
+  const calm = executorHarness({
+    positions: { AAPL: { qty: 10, avgPriceUsd: 110, openedAt } },
+    quotes: { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+  });
+  const calmResult = await runHarness(calm, { research: makeBriefing({ verdict: 'HOLD', sentiment: 0.2 }) });
+  assert.equal(calmResult.orders.length, 0);
+  assert.ok(calmResult.actions.some((action) => action.type === 'hold'));
+});
+
+test('executor × research: stale, disabled, malformed and missing briefings behave exactly like today', async () => {
+  const baseline = await runHarness(executorHarness());
+  const baselineNotional = baseline.orders[0].qty * baseline.orders[0].avgFillPriceUsd;
+  assert.equal(baseline.orders.length, 1);
+
+  const cases = [
+    {
+      name: 'stale briefing',
+      research: makeBriefing({ verdict: 'AVOID', sentiment: -0.9, at: new Date(T0 - 3 * 60 * 60 * 1000).toISOString() }),
+      configOverrides: undefined,
+    },
+    {
+      name: 'missing briefing timestamp',
+      research: { verdict: 'AVOID', sentiment: -0.9, confidence: 0.9 },
+      configOverrides: undefined,
+    },
+    {
+      name: 'malformed briefing (no sentiment)',
+      research: { verdict: 'AVOID', at: new Date(T0 - 60_000).toISOString() },
+      configOverrides: undefined,
+    },
+    {
+      name: 'null briefing',
+      research: null,
+      configOverrides: undefined,
+    },
+    {
+      name: 'influence disabled (shadow mode)',
+      research: makeBriefing({ verdict: 'AVOID', sentiment: -0.9 }),
+      configOverrides: { research: { enabled: true, influence: false } },
+    },
+    {
+      name: 'research disabled',
+      research: makeBriefing({ verdict: 'AVOID', sentiment: -0.9 }),
+      configOverrides: { research: { enabled: false, influence: true } },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const harness = executorHarness({ configOverrides: testCase.configOverrides });
+    const result = await runHarness(harness, { research: testCase.research });
+    assert.equal(result.orders.length, 1, `${testCase.name}: baseline entry should still be placed`);
+    const notional = result.orders[0].qty * result.orders[0].avgFillPriceUsd;
+    assert.ok(Math.abs(notional - baselineNotional) < 0.05, `${testCase.name}: notional must be unchanged`);
+    assert.ok(
+      !result.actions.some((action) => action.reason === 'research_veto'),
+      `${testCase.name}: no veto may be applied`,
+    );
+  }
+
+  // an unknown verdict is treated as HOLD (it may still influence size, but never exits/vetoes)
+  const unknownHarness = executorHarness();
+  const unknownResult = await runHarness(unknownHarness, {
+    research: makeBriefing({ verdict: 'SELL EVERYTHING', sentiment: 0.5, confidence: 0.2 }),
+  });
+  assert.equal(unknownResult.orders.length, 1);
+  assert.ok(!unknownResult.actions.some((action) => action.reason === 'research_veto'));
 });
 
 // ===========================================================================
