@@ -509,5 +509,25 @@ later be promoted to its own Harness agent), **live influence from day one**, li
 that loads the new Host `index.js`) and therefore real briefings appearing in the panel; the paper
 loop is running the previous Host code until restart.
 
+### Live research bridge — first real dispatch defect, found and fixed (2026-10-26)
+
+After the restart that loaded the research sidecar, the engine reported
+`engine.research.configured:true, provider:deepseek-account, model:deepseek-flash, errors:1` with
+`lastError: "llm: deepseek-account/deepseek-flash: prepared LLM call config changed before adapter
+dispatch"` and zero briefings. Cause (read from the installed `@deepseek-ai/dsh-llm` bundle): the
+Host `prepareCall(config)` returns a frozen, fully resolved call config (adapter defaults such as
+`reasoningEffort` are materialised at preparation time), and `prepared.stream(options)` rejects any
+options that do not compare equal field-by-field to that config (`INVALID_PREPARED_CALL`). The
+bridge re-sent only `{provider, model, maxTokens, temperature}`, so every dispatch was rejected
+**before any provider request** (no tokens spent); trading was unaffected.
+
+Fix: the bridge spreads `prepared.config` into the stream options and adds only the `system` /
+`messages` prompt fields the equality check ignores. Regression test: the fake Host `llm` in
+`test/plugin.test.js` materialises an adapter default (`reasoningEffort: high`) and asserts the exact
+frozen config is echoed back (plugin 36/36). Research output budget raised 700 → 1200 tokens so a
+reasoning model cannot consume the whole budget and return empty content. Research 9/9, full suite
+189 green. One more Host restart loads the corrected bridge; the real provider dispatch is then
+re-verified live.
+
 **Decision recorded:** Alpaca news outages return an empty feed at the broker adapter (advisory
 data must never break a cycle); real LLM failures are logged by the researcher and never charged.

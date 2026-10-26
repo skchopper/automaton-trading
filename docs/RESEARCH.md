@@ -40,6 +40,14 @@ Scheduling: each agent's slots are phase-shifted by `index * staggerSec` (with 3
 and a cycle runs at most `maxRunsPerCycle` briefings so research can never stall one trading
 cycle for minutes; agents beyond the cap stay due and are picked up by later cycles.
 
+Harness bridge note: the Host `llm` service validates dispatch by comparing the options passed to
+`prepared.stream(...)` field-by-field against the frozen configuration returned by
+`prepareCall(config)` — including adapter defaults materialised during preparation (e.g.
+`reasoningEffort`). The bridge therefore echoes `prepared.config` back and adds only `system` and
+`messages`; sending a narrower config is rejected with `INVALID_PREPARED_CALL` before any provider
+request. Output budget defaults to 1200 tokens so reasoning models cannot spend the whole budget on
+reasoning and return empty content.
+
 ## Broker extension (market teammate)
 
 Both brokers gain:
