@@ -219,3 +219,15 @@ redacted result and resolved paths. Key knobs:
   only opens positions inside the configured window.
 - All agents `CONDEMNED` but still `alive` → the Reaper process is not running; start it
   (`node src/reaper-process.js --state-dir ..\..\automaton-data`) or restart the engine.
+
+## 10. Single-writer rule (ledger/registry)
+
+The engine is the primary writer of `registry.json`/`ledger.json`. The external Reaper reloads both
+before every sweep and now persists them **only when a sweep actually kills an agent** — an earlier
+unconditional save overwrote newer engine writes (observed live: three small research charges
+vanished). If you suspect drift after a crash or a manual experiment: **stop the loop**, then run the
+idempotent repairs `node scripts/reconcile-fills.mjs` (broker fills → virtual ledger) and
+`node scripts/reconcile-research-charges.mjs` (research charges), then Start again.
+
+Never run the CLI `tick`/`run` while the engine loop is already running: two engine writers will race
+the same state files. Use the panel/control route to start/stop the one writer.

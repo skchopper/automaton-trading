@@ -531,3 +531,34 @@ re-verified live.
 
 **Decision recorded:** Alpaca news outages return an empty feed at the broker adapter (advisory
 data must never break a cycle); real LLM failures are logged by the researcher and never charged.
+
+### Research sidecar LIVE verification + hardening (2026-10-26, after restart)
+
+After the restart that loaded the corrected bridge, the sidecar ran real LLM calls against the
+Harness `llm` service (provider `deepseek-account`, model `deepseek-flash`):
+
+- **5 briefings** in the first two cycles (max 3 per cycle), each persisted per agent with the real
+  news it read (e.g. NVDA: Meta $145B capex, Honeywell+NVIDIA launch; AAPL: iPad mini OLED, foldable
+  sold out, Jefferies note), `verdict` HOLD/AVOID, `sentiment` -0.55..0.3, `confidence`, `catalysts`,
+  `risks`, linked `sources`, real token usage (~2.1–2.4k tokens) and **$0.001 charged to the acting
+  agent** (`category: research`, `role: prospector`). `GET /automaton/state` exposed the briefings on
+  5 agent rows (age/stale/verdict/sentiment/sources) for the dashboard.
+- **LLM reply quality:** 4/5 valid JSON, 1 malformed (truncated array) → the agent stayed due and
+  would be retried next cycle. Hardened: `extractJsonObject` now repairs fences / smart quotes /
+  trailing commas / unterminated strings and containers, and the researcher retries **exactly once**
+  with a "reply with one compact valid JSON object" instruction before counting a failure (no charge
+  on failure). Research was also moved **after** the executor pass so a slow provider batch (~50 s
+  for 3 calls) can never delay entries/exits; briefings apply on the next cycle and stay fresh 2 h.
+- **Second real defect found live:** the external Reaper saved `registry.json`/`ledger.json`
+  unconditionally every 30 s even when it killed nobody. It reloads at sweep start, so a sweep could
+  overwrite the engine's newer write — observed: **3 of 5 research charges vanished from disk** (the
+  broker position was intact). Fix: the Reaper now persists **only when a sweep actually killed an
+  agent**; the engine is the primary writer. The running Reaper process predates the fix, so one more
+  app restart + `Start` (which spawns a fresh Reaper) activates it;
+  `scripts/reconcile-research-charges.mjs` (idempotent, run while the loop is stopped) re-books any
+  briefing charge missing from the ledger.
+- **Tests:** plugin 36/36 (bridge + prepared-config echo + provider/model), research **12/12**
+  (repair, retry-once, give-up-no-charge, isolation, scheduling, charge, stale), market 27/27,
+  mortality 55/55, integration 21/21, security 41/41 = **192 tests**; research smoke 10/10;
+  verify-fixes 18/18. Committed locally; full-session live verification continues after the next
+  restart.
