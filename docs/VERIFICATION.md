@@ -456,3 +456,31 @@ in a normal terminal. New Reapers cannot recur the bug (reload-before-sweep + he
 
 **Still not verified:** visual rendering of the sidebar/dashboard (slot registration is verified
 live; pixels are not), the Start button driving a full market session, and actual paper fills.
+
+### First live paper session — async-fill bug found and fixed (2026-10-26)
+
+First real paper session: the loop ran 519 ticks with the market closed (0 orders, D3
+`MARKET_CLOSED` denials by design — the session window starts 09:35 ET), the external Reaper
+v2 stayed healthy (pid/heartbeat/sweeps), 30 agents and names persisted, reconciliation `ok`.
+At **09:39 ET** the first live order was placed and filled: `MeanRev AAPL` bought
+`0.0068 AAPL @ $343.922` ($2.33 notional, `client_order_id atm:atm-72e7db49:spec-64e8f7c4:1`).
+
+**Defect found by that fill:** Alpaca returns a market order as `accepted` before it fills, with
+`filledQty = 0`; the executor used `numberOrNull(filledQty) ?? orderQty`, and since `0` is not
+nullish it attempted to book a 0-qty fill — the ledger rejected it (`fill qty must be > 0`), the
+real fill never reached the virtual ledger, and the panel showed no holding. Found by comparing
+the broker position against `ledger.json` after the order.
+
+**Fix (executor):** (a) fill delta is computed against already-booked qty per `orderId` (handles
+partials), (b) after submitting, the executor briefly polls the broker for the fill and books the
+actual `filledQty`/`avgFillPrice`, (c) every cycle reconciles recent filled broker orders for that
+agent whose `client_order_id` starts with `atm:<agentId>:` and books anything the ledger has not
+seen yet. The missed fill was backfilled with `scripts/reconcile-fills.mjs`
+(`MeanRev AAPL`: cash 17.53 + AAPL 0.0068 @ 343.922, trades 1).
+
+Also hardened in the same change: atomic JSON writes retry transient Windows `EPERM/EACCES/EBUSY`
+rename races (engine + Reaper both save `registry.json`/`ledger.json`), and a successful cycle
+clears a stale `lastError` instead of leaving it sticky forever (one transient file-lock error had
+been shown persistently). Full suite after the fixes: **166/166 pass**, `scripts/verify-fixes.mjs`
+18/18. The running Host must be restarted to load these engine fixes; the loop was stopped before
+the fix so no further unbooked fills could accumulate.

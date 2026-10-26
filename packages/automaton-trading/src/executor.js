@@ -283,6 +283,92 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         result.actions.push({ type: 'skip', symbol, reason, ...extra });
       };
 
+      // --- broker-fill reconciliation (paper/live market orders are async) ---------
+      // Alpaca returns a market order as `accepted` before it fills. Booking that response
+      // would mean a 0-qty fill (and the real fill would never reach the virtual ledger), so:
+      //   - we track how much of each order id is already booked,
+      //   - we reconcile recent broker orders for THIS agent at the start of every cycle,
+      //   - and after submitting we briefly poll for the fill before booking.
+      /** @type {Map<string, number>} orderId -> booked qty */
+      const bookedQtyByOrder = new Map();
+      if (typeof ledger.history === 'function') {
+        try {
+          for (const fill of ledger.history(agentId, { limit: 250 })) {
+            if (fill?.orderId) bookedQtyByOrder.set(fill.orderId, (bookedQtyByOrder.get(fill.orderId) ?? 0) + Number(fill.qty || 0));
+          }
+        } catch {
+          /* history is optional for reconciliation */
+        }
+      }
+
+      /** Book the not-yet-booked part of a broker order fill. */
+      async function bookFilledOrder(order) {
+        const orderId = order?.id ?? null;
+        const filledQty = numberOrNull(order?.filledQty) ?? 0;
+        const price = numberOrNull(order?.avgFillPriceUsd) ?? numberOrNull(order?.filledAvgPriceUsd) ?? 0;
+        const symbol = String(order?.symbol ?? '').toUpperCase();
+        if (!(filledQty > 0) || !(price > 0) || symbol === '') return { bookedQty: 0, reason: 'not_filled' };
+        const already = orderId ? (bookedQtyByOrder.get(orderId) ?? 0) : 0;
+        const delta = round4(filledQty - already);
+        if (!(delta > 0)) return { bookedQty: 0, reason: 'already_booked' };
+        await ledger.applyFill(agentId, {
+          symbol,
+          side: order.side,
+          qty: delta,
+          priceUsd: price,
+          at,
+          orderId,
+        });
+        if (orderId) bookedQtyByOrder.set(orderId, already + delta);
+        return { bookedQty: delta, price, side: order.side, symbol };
+      }
+
+      /** Book any filled orders the broker has for this agent that the ledger has not seen. */
+      async function reconcileBrokerFills() {
+        if (typeof broker.getOrders !== 'function' || typeof ledger.applyFill !== 'function') return;
+        try {
+          const recent = await broker.getOrders({ status: 'all', limit: 100, direction: 'desc' });
+          for (const order of Array.isArray(recent) ? recent : []) {
+            if (!String(order?.clientOrderId ?? '').startsWith(`atm:${agentId}:`)) continue;
+            if (!['filled', 'partially_filled'].includes(String(order?.status))) continue;
+            const booked = await bookFilledOrder(order);
+            if (booked.bookedQty > 0) {
+              result.actions.push({
+                type: 'reconcile_fill',
+                symbol: booked.symbol,
+                side: booked.side,
+                qty: booked.bookedQty,
+                priceUsd: round2(booked.price),
+                orderId: order.id ?? null,
+              });
+            }
+          }
+        } catch (error) {
+          result.actions.push({ type: 'reconcile_skipped', reason: String(error?.message ?? error).slice(0, 140) });
+        }
+      }
+
+      /** Poll briefly for a just-submitted order to fill; returns the freshest order record. */
+      async function waitForFill(order) {
+        if (!order || (numberOrNull(order.filledQty) ?? 0) > 0 || typeof broker.getOrders !== 'function') return order;
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          try {
+            const recent = await broker.getOrders({ status: 'all', limit: 100, direction: 'desc' });
+            const match = (Array.isArray(recent) ? recent : []).find(
+              (candidate) => candidate?.id === order.id || (order.clientOrderId && candidate?.clientOrderId === order.clientOrderId),
+            );
+            if (match) {
+              order = { ...order, ...match };
+              if ((numberOrNull(order.filledQty) ?? 0) > 0) return order;
+            }
+          } catch {
+            /* retry until the short poll window ends */
+          }
+        }
+        return order;
+      }
+
       // --- identity and life-state ------------------------------------------------
       if (!agent || !agentId) {
         deny('UNKNOWN_AGENT', 'executor.run requires an agent record');
@@ -334,6 +420,8 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         : null;
 
       // --- own position book (never broker.getAccount) ----------------------------
+      // Reconcile pending fills BEFORE reading the book so today's fills become positions.
+      await reconcileBrokerFills();
       const book = ledger.book(agentId);
       const positions = positionsToMap(book?.positions);
       const openOrders = Array.isArray(book?.openOrders) ? book.openOrders : [];
@@ -504,48 +592,44 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           return null;
         }
 
-        const fillPrice = numberOrNull(order?.avgFillPriceUsd) ?? priceUsd;
-        const filledQty = numberOrNull(order?.filledQty) ?? orderQty;
-        result.orders.push(order);
-
-        if (typeof ledger.applyFill === 'function') {
-          try {
-            await ledger.applyFill(agentId, {
-              symbol: ticker,
-              side,
-              qty: filledQty,
-              priceUsd: fillPrice,
-              at,
-              orderId: order?.id ?? null,
-            });
-          } catch (error) {
-            deny(error?.code ?? 'LEDGER_REJECTED', `fill could not be booked: ${error?.message ?? error}`, {
-              symbol: ticker,
-              orderId: order?.id ?? null,
-            });
-          }
+        const resolvedOrder = await waitForFill(order);
+        result.orders.push(resolvedOrder);
+        let booked = { bookedQty: 0 };
+        try {
+          booked = await bookFilledOrder(resolvedOrder);
+        } catch (error) {
+          deny(error?.code ?? 'LEDGER_REJECTED', `fill could not be booked: ${error?.message ?? error}`, {
+            symbol: ticker,
+            orderId: resolvedOrder?.id ?? null,
+          });
         }
+        const bookedQty = booked.bookedQty ?? 0;
         result.actions.push({
           type: kind,
           symbol: ticker,
           side,
-          qty: filledQty,
-          reason,
-          orderId: order?.id ?? null,
-          fillPriceUsd: round2(fillPrice),
+          qty: bookedQty,
+          // A market order that is still `accepted` is not a denial: the next cycle's
+          // reconciliation books the fill once the broker reports it as filled.
+          reason: bookedQty > 0 ? reason : `${reason} (awaiting fill)`,
+          orderId: resolvedOrder?.id ?? null,
+          fillPriceUsd: bookedQty > 0 ? round2(booked.price) : null,
+          pending: bookedQty === 0,
         });
         // Position book changed; keep the local map current for the rest of the cycle.
-        if (side === 'buy') {
-          const existing = positions.get(ticker);
-          positions.set(ticker, {
-            qty: round4((existing?.qty ?? 0) + filledQty),
-            avgPriceUsd: existing?.avgPriceUsd ?? fillPrice,
-            openedAt: existing?.openedAt ?? at,
-          });
-        } else {
-          positions.delete(ticker);
+        if (bookedQty > 0) {
+          if (side === 'buy') {
+            const existing = positions.get(ticker);
+            positions.set(ticker, {
+              qty: round4((existing?.qty ?? 0) + bookedQty),
+              avgPriceUsd: existing?.avgPriceUsd ?? booked.price,
+              openedAt: existing?.openedAt ?? at,
+            });
+          } else {
+            positions.delete(ticker);
+          }
         }
-        return order;
+        return resolvedOrder;
       }
 
       // =========================================================================

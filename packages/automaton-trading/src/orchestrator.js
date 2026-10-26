@@ -712,9 +712,12 @@ export async function createAutomaton(options = {}) {
 
       // 7. snapshot + trace
       // Mark completion BEFORE the snapshot: the persisted state.json (what the panel and
-      // `automaton_status` read) must show this tick, not the previous one.
+      // `automaton_status` read) must show this tick, not the previous one. A successful
+      // cycle also clears a transient lastError (e.g. a one-off Windows file-lock retry), so
+      // the panel does not keep showing a stale failure forever.
       state.lastTickAt = new Date(clock.now()).toISOString();
       state.lastTrace = trace;
+      state.lastError = null;
       const snapshot = await buildSnapshot({
         account: treasuryView.account,
         treasury: treasuryView,

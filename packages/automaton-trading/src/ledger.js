@@ -24,7 +24,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AutomatonError, fail } from './contracts.js';
-import { readJsonSync, round2, round4, round8, SYSTEM_CLOCK } from './util.js';
+import { readJsonSync, round2, round4, round8, SYSTEM_CLOCK, writeJsonAtomicSync } from './util.js';
 import { statePaths } from './config.js';
 
 /** Reserved synthetic account that holds unallocated treasury cash. */
@@ -35,13 +35,6 @@ const EPSILON = 1e-9;
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const clone = (value) => (value === undefined ? undefined : structuredClone(value));
-
-function writeJsonAtomicSync(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
-}
 
 function normalizeAt(at, clock) {
   if (typeof at === 'number' && Number.isFinite(at)) return at;

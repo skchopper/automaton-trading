@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AGENT_STATUS, AutomatonError, DEATH_CAUSES, fail } from './contracts.js';
-import { median, newId, readJsonSync, round2, round4, SYSTEM_CLOCK } from './util.js';
+import { median, newId, readJsonSync, round2, round4, SYSTEM_CLOCK, writeJsonAtomicSync } from './util.js';
 import { statePaths } from './config.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -23,14 +23,6 @@ const toIso = (value, fallbackIso) => {
   if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
   return fallbackIso;
 };
-
-/** Write JSON atomically (temp file + rename) without async. */
-function writeJsonAtomicSync(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${process.hrtime.bigint()}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
-}
 
 function emptyState(cap) {
   return { version: 1, cap, agents: {} };

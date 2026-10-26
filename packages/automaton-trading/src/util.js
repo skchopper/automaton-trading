@@ -174,12 +174,60 @@ export async function ensureDir(dir) {
   return dir;
 }
 
-/** Write JSON atomically (temp file + rename) so a crash never leaves half a file. */
+/**
+ * Write JSON atomically (temp file + rename) so a crash never leaves half a file.
+ * On Windows the rename can transiently fail with EPERM/EACCES/EBUSY while another process
+ * (e.g. the external Reaper) is reading or renaming the same path — retry briefly instead of
+ * surfacing a one-off file-lock error into the engine's error state.
+ */
 export async function writeJsonAtomic(file, value) {
   await ensureDir(path.dirname(file));
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   await fsp.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await fsp.rename(tmp, file);
+  let lastError;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await fsp.rename(tmp, file);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) break;
+      await sleep(10 + attempt * 20);
+    }
+  }
+  try {
+    await fsp.unlink(tmp);
+  } catch {
+    /* best effort cleanup */
+  }
+  throw lastError;
+}
+
+/** Same as writeJsonAtomic but synchronous; used by the sync registry/ledger saves. */
+export function writeJsonAtomicSync(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  let lastError;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) break;
+      const until = Date.now() + 10 + attempt * 20;
+      while (Date.now() < until) {
+        /* short blocking backoff: sync save path */
+      }
+    }
+  }
+  try {
+    fs.unlinkSync(tmp);
+  } catch {
+    /* best effort cleanup */
+  }
+  throw lastError;
 }
 
 /** Read JSON, returning `fallback` when missing or corrupt (corruption is logged, not fatal). */
