@@ -92,7 +92,7 @@ export function defaultConfig() {
       maxAgeSec: 7200,
       maxConcurrent: 1,
       maxInputChars: 12000,
-      maxOutputTokens: 700,
+      maxOutputTokens: 1200,
       logLimit: 120,
       provider: null,
       model: null,

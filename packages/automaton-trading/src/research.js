@@ -205,7 +205,7 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
   const maxAgeMs = Math.max(300, Number(cfg.maxAgeSec) || 7200) * 1000;
   const maxConcurrent = Math.max(1, Math.min(8, Number(cfg.maxConcurrent) || 1));
   const maxInputChars = Math.max(1000, Number(cfg.maxInputChars) || 12000);
-  const maxOutputTokens = Math.max(128, Math.min(4000, Number(cfg.maxOutputTokens) || 700));
+  const maxOutputTokens = Math.max(128, Math.min(4000, Number(cfg.maxOutputTokens) || 1200));
   const logLimit = Math.max(20, Math.min(1000, Number(cfg.logLimit) || 120));
   const provider = cfg.provider ?? null;
   const model = cfg.model ?? null;

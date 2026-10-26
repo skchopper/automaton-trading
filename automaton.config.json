@@ -45,7 +45,7 @@
     "costPerRunUsd": 0.001,
     "maxAgeSec": 7200,
     "maxConcurrent": 1,
-    "maxOutputTokens": 700,
+    "maxOutputTokens": 1200,
     "logLimit": 120,
     "maxRunsPerCycle": 3
   },

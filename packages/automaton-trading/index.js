@@ -222,16 +222,21 @@ async function createResearchBridge(ctx, row, log) {
         throw researchLlmError(error, provider, model);
       }
 
+      // `prepareCall` returns the frozen, fully resolved call config (adapter defaults such as
+      // reasoningEffort are materialised at preparation time). Dispatch must receive that exact
+      // config or the llm service rejects it with "prepared LLM call config changed". So spread
+      // the prepared config and only add the prompt fields the service ignores for equality.
+      const resolvedConfig = prepared && typeof prepared === 'object' && prepared.config && typeof prepared.config === 'object'
+        ? { ...prepared.config }
+        : { provider, model, maxTokens: tokenBudget, temperature: RESEARCH_TEMPERATURE };
+
       let text = '';
       let usage = null;
       try {
         const stream = prepared.stream({
-          provider,
-          model,
+          ...resolvedConfig,
           system: String(system ?? ''),
           messages,
-          maxTokens: tokenBudget,
-          temperature: RESEARCH_TEMPERATURE,
         });
         for await (const chunk of stream) {
           if (!chunk || typeof chunk !== 'object') continue;

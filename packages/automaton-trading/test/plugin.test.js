@@ -608,7 +608,9 @@ function createFakeLlm({ providers = ['deepseek-account'], models = ['deepseek-f
       calls.prepare.push(config);
       if (prepareError) throw prepareError;
       return {
-        config,
+        // The real llm service materialises adapter defaults (reasoningEffort, output tokens)
+        // before dispatch; the prepared config is what stream() must receive back.
+        config: { ...config, reasoningEffort: 'high' },
         stream(options) {
           calls.stream.push(options);
           return (async function* scriptedChunks() {
@@ -1327,6 +1329,9 @@ test('research bridge resolves the agent default model and concatenates the stre
   assert.equal(streamOptions.system, 'SYSTEM-PROMPT');
   assert.equal(streamOptions.maxTokens, 700);
   assert.equal(streamOptions.temperature, 0.2);
+  // The frozen prepared config (including adapter-materialised defaults) must be echoed back
+  // verbatim, or the llm service rejects dispatch with INVALID_PREPARED_CALL.
+  assert.equal(streamOptions.reasoningEffort, 'high');
   assert.deepEqual(streamOptions.messages, [
     { role: 'user', content: [{ type: 'text', text: 'USER-PAYLOAD' }] },
   ]);
