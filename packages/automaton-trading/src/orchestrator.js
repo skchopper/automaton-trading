@@ -606,30 +606,6 @@ export async function createAutomaton(options = {}) {
         }
       }
 
-      // 3b. RESEARCH: per-agent isolated hourly news briefing (docs/RESEARCH.md).
-      // Runs before the executor pass so a due briefing can veto/size/exit in THIS cycle.
-      // It never trades, never reads another agent's book, and each briefing is paid for by
-      // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
-      if (!treasuryView.halted) {
-        try {
-          const researchRun = await researcher.tick();
-          trace.research = {
-            enabled: researchRun.enabled,
-            configured: researchRun.configured,
-            due: researchRun.due,
-            ran: researchRun.ran.length,
-            skipped: researchRun.skipped,
-            errors: researchRun.ran.filter((entry) => entry.error).length,
-            budgetUsd: round4(researchRun.ran.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
-          };
-          if (!researchRun.enabled || !researchRun.configured) {
-            trace.research.note = !researchRun.enabled ? 'disabled by config' : 'no LLM generator configured';
-          }
-        } catch (error) {
-          trace.errors.push({ role: 'research', ...errorInfo(error) });
-        }
-      }
-
       // 4. PROSPECTOR: dated-proof hypotheses (skipped entirely while halted)
       let hypotheses = [];
       if (!treasuryView.halted) {
@@ -729,7 +705,35 @@ export async function createAutomaton(options = {}) {
       await registry.save();
       await ledger.save();
 
-      // 6. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
+      // 6. RESEARCH: per-agent isolated hourly news briefing (docs/RESEARCH.md).
+      // Runs AFTER entries/exits so LLM latency (up to ~1 min for a batch) can never delay an
+      // order; a due briefing becomes visible to the next cycle's executor (briefings stay
+      // fresh for maxAgeSec = 2 h, so a 5-minute lag is irrelevant for hourly news).
+      // It never trades, never reads another agent's book, and each briefing is paid for by
+      // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
+      if (!treasuryView.halted) {
+        try {
+          const researchRun = await researcher.tick();
+          trace.research = {
+            enabled: researchRun.enabled,
+            configured: researchRun.configured,
+            due: researchRun.due,
+            ran: researchRun.ran.length,
+            deferred: researchRun.deferred ?? 0,
+            skipped: researchRun.skipped,
+            errors: researchRun.ran.filter((entry) => entry.error).length,
+            budgetUsd: round4(researchRun.ran.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
+          };
+          if (!researchRun.enabled || !researchRun.configured) {
+            trace.research.note = !researchRun.enabled ? 'disabled by config' : 'no LLM generator configured';
+          }
+          if ((researchRun.ran ?? []).some((entry) => entry.costUsd > 0)) await ledger.save();
+        } catch (error) {
+          trace.errors.push({ role: 'research', ...errorInfo(error) });
+        }
+      }
+
+      // 7. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
       if (treasuryView.mayReplicate && !treasuryView.halted) {
         const candidates = registry
           .alive()

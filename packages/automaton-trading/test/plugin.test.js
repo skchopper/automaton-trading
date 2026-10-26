@@ -1315,6 +1315,9 @@ test('research bridge resolves the agent default model and concatenates the stre
   const result = await bridge.generate({ system: 'SYSTEM-PROMPT', user: 'USER-PAYLOAD', maxTokens: 700 });
   assert.equal(result.text, '{"verdict":"HOLD"}');
   assert.deepEqual(result.usage, { inputTokens: 120, outputTokens: 45 });
+  // The bridge reports the actual route so the researcher stores real provider/model values.
+  assert.equal(result.provider, 'deepseek-account');
+  assert.equal(result.model, 'deepseek-flash');
 
   assert.deepEqual(calls.prepare[0], {
     provider: 'deepseek-account',

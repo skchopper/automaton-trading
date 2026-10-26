@@ -288,6 +288,75 @@ describe('research: isolation, schema, economics, scheduling', () => {
     assert.ok(stale && stale.stale === true);
   });
 
+  it('repairs malformed/truncated model JSON before giving up', async () => {
+    // trailing comma + smart quotes + truncated tail (live failure observed: array cut mid-element)
+    const repaired = extractJsonObject(
+      '```json\n{\u201Csentiment\u201D: 0.1, \u201Cconfidence\u201D: 0.2, \u201Cverdict\u201D: \u201CHOLD\u201D, \u201Ccatalysts\u201D: [\u201Ca\u201D, \u201Cb\u201D, ], \u201Crisks\u201D: [], \u201Csummary\u201D: \u201Cok\u201D, \u201Csymbols\u201D: [\u201CAAPL\u201D\n```',
+    );
+    assert.equal(repaired.sentiment, 0.1);
+    assert.deepEqual(repaired.catalysts, ['a', 'b']);
+    const truncated = extractJsonObject('{"sentiment":0.1,"confidence":0.2,"verdict":"HOLD","catalysts":["a","b');
+    assert.deepEqual(truncated.catalysts, ['a', 'b']);
+    // genuinely broken payloads still fail with a retriable code
+    assert.throws(
+      () => extractJsonObject('I think the stock will go up!'),
+      (error) => error.code === 'BRIEFING_JSON_INVALID',
+    );
+  });
+
+  it('retries once on a malformed reply, then books and charges the good briefing', async () => {
+    advancePastInterval();
+    const calls = [];
+    const researcher = createResearcher({
+      broker,
+      registry,
+      ledger,
+      config,
+      paths,
+      clock,
+      generate: async ({ user }) => {
+        calls.push(user);
+        if (calls.length === 1) return { text: '{"sentiment":0.1,"verdict":"HOLD"', provider: 'fake', model: 'fake-model' };
+        return { text: jsonReply(), provider: 'fake', model: 'fake-model', usage: { inputTokens: 5, outputTokens: 5 } };
+      },
+    });
+    const journalFile = path.join(paths.researchDir, 'atm-aaaaaaaa.jsonl');
+    const journalBefore = fs.existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+    const costsBefore = ledger.snapshot('atm-aaaaaaaa').costsUsd;
+    const run = await researcher.tick();
+    assert.equal(run.ran.length, 2);
+    assert.equal(run.ran.every((entry) => entry.error === null), true);
+    // agent 1: bad reply -> schema failure -> one retry (2 calls); agent 2: good first try (1 call)
+    assert.equal(calls.length, 3);
+    assert.ok(calls[1].includes('previous reply was rejected as invalid JSON'));
+    const journal = fs.readFileSync(journalFile, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(journal.length, journalBefore + 1); // only agent 1 is in this journal
+    assert.notEqual(ledger.snapshot('atm-aaaaaaaa').costsUsd, costsBefore);
+  });
+
+  it('gives up after two malformed replies with no charge', async () => {
+    advancePastInterval();
+    const researcher = createResearcher({
+      broker,
+      registry,
+      ledger,
+      config,
+      paths,
+      clock,
+      generate: async () => ({ text: 'not json at all', provider: 'fake', model: 'fake-model' }),
+    });
+    const costsBefore = ledger.snapshot('atm-aaaaaaaa').costsUsd;
+    const run = await researcher.tick();
+    assert.equal(run.ran.length, 2);
+    assert.equal(run.ran.every((entry) => /llm:/.test(entry.error ?? '')), true);
+    assert.equal(ledger.snapshot('atm-aaaaaaaa').costsUsd, costsBefore);
+    const journalFile = path.join(paths.researchDir, 'atm-aaaaaaaa.jsonl');
+    const rows = fs.existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+    const after = await researcher.tick();
+    assert.equal(after.ran.length, 2); // failed agents stay due and are retried next cycle
+    assert.equal(fs.existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8').trim().split('\n').filter(Boolean).length : 0, rows);
+  });
+
   it('reports disabled/unconfigured without throwing', async () => {
     const disabled = makeResearcher({ enabled: false });
     const run = await disabled.tick();

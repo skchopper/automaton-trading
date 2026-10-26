@@ -269,7 +269,9 @@ async function createResearchBridge(ctx, row, log) {
         error.code = 'EMPTY_LLM_RESPONSE';
         throw error;
       }
-      return { text, usage: usage ?? undefined };
+      // provider/model are returned so the researcher records the ACTUAL route used for the
+      // briefing (the engine's config may not name one; the bridge resolves it from the Host).
+      return { text, usage: usage ?? undefined, provider, model };
     }
 
     return { provider, model, generate };

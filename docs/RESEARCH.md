@@ -144,9 +144,16 @@ newsCount, ...briefing }` appended to `state/research/<agentId>.jsonl`, latest c
 
 ## Orchestrator / engine (Lead)
 
-- `createAutomaton({ ..., generate })` creates the researcher and calls `await researcher.tick({prices})`
-  once per cycle **before** the executor pass; the resulting briefings are passed to per-agent
-  `executor.run` calls.
+- `createAutomaton({ ..., generate })` creates the researcher and calls `await researcher.tick()` once
+  per cycle **after** the executor pass: LLM latency (up to ~1 min for the capped batch) can never
+  delay an entry/exit, and a due briefing is applied by the **next** cycle's executor (briefings stay
+  fresh for `maxAgeSec = 2 h`, irrelevant for hourly news). Exits, entries, brakes and P&L are
+  therefore never blocked by a slow provider.
+- Resilience: a malformed/truncated model reply is first **repaired** (fence strip, smart quotes,
+  trailing commas, unterminated string/array/object closure) and, if it still fails schema
+  validation, **retried exactly once** with an explicit "reply with one compact valid JSON object"
+  instruction. A failed agent keeps its slot due, so the next cycle retries it automatically; a
+  briefing is stored/charged only on success.
 - Cost charging: on a successful briefing, `ledger.charge(agentId, costPerRunUsd, { category:'research',
   role:'prospector', ref:'research' })`. A failed charge (insufficient cash) marks the agent for the
   normal death path; research continues best-effort.
@@ -155,6 +162,8 @@ newsCount, ...briefing }` appended to `state/research/<agentId>.jsonl`, latest c
   and the panel use it.
 - The engine facade accepts `researchGenerate` / `researchProvider` / `researchModel` options (plugin
   supplies them). CLI builds the HTTP fallback from env; otherwise research is `configured:false`.
+  Briefing records store the actual `provider`/`model` reported by the generator (the Harness bridge
+  returns the resolved route), so journals/state show the real model even when config names none.
 
 ## Plugin (plugin teammate)
 

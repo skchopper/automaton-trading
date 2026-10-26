@@ -63,26 +63,95 @@ const SYSTEM_PROMPT = [
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+const BRIEFING_ATTEMPTS = 2;
+const RETRIABLE_BRIEFING_CODES = new Set(['BRIEFING_JSON_INVALID', 'BRIEFING_INVALID']);
 
 function numberOrNull(value) {
   const n = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
+function briefingError(message, code = 'BRIEFING_INVALID') {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+/**
+ * Best-effort repair for a malformed/truncated briefing: strip fences, normalise smart quotes,
+ * drop trailing commas, then close unterminated strings/arrays/objects. `JSON.parse` is tried on
+ * the repaired text by `extractJsonObject`; if it still fails the researcher retries once.
+ */
+export function repairJsonText(input) {
+  let text = String(input ?? '').replace(/^\uFEFF/, '').trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) text = fenced[1].trim();
+  const start = text.indexOf('{');
+  if (start < 0) throw briefingError('no JSON object in LLM reply', 'BRIEFING_JSON_INVALID');
+  let candidate = text.slice(start);
+  const lastClose = candidate.lastIndexOf('}');
+  // Prefer a balanced object if the model wrapped it in prose; otherwise repair the truncated tail.
+  if (lastClose >= 0 && candidate.slice(0, lastClose + 1).split('{').length === candidate.slice(0, lastClose + 1).split('}').length) {
+    candidate = candidate.slice(0, lastClose + 1);
+  }
+  candidate = candidate
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .replace(/,\s*([}\]])/g, '$1');
+  // Close an unterminated tail: strings first, then the open containers.
+  let inString = false;
+  let escaped = false;
+  const stack = [];
+  for (const character of candidate) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === '\\') {
+      if (inString) escaped = true;
+      continue;
+    }
+    if (inString) {
+      if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === '{' || character === '[') stack.push(character);
+    else if (character === '}' || character === ']') stack.pop();
+  }
+  if (inString) candidate += '"';
+  while (stack.length > 0) candidate += stack.pop() === '{' ? '}' : ']';
+  return candidate.replace(/,\s*([}\]])/g, '$1');
+}
+
 /** Strip code fences / surrounding prose and parse the first complete JSON object. */
 export function extractJsonObject(text) {
   const raw = String(text ?? '').trim();
-  if (raw === '') throw new Error('empty LLM reply');
+  if (raw === '') throw briefingError('empty LLM reply', 'BRIEFING_JSON_INVALID');
   const fenced = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
   try {
     return JSON.parse(fenced);
   } catch {
-    /* fall through to brace scan */
+    /* fall through to brace scan / repair */
   }
   const start = fenced.indexOf('{');
   const end = fenced.lastIndexOf('}');
-  if (start < 0 || end <= start) throw new Error('no JSON object in LLM reply');
-  return JSON.parse(fenced.slice(start, end + 1));
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(fenced.slice(start, end + 1));
+    } catch {
+      /* fall through to repair */
+    }
+  }
+  try {
+    return JSON.parse(repairJsonText(raw));
+  } catch (error) {
+    throw briefingError(`invalid JSON briefing: ${error.message}`, 'BRIEFING_JSON_INVALID');
+  }
 }
 
 function stringArray(value, max) {
@@ -99,6 +168,20 @@ function stringArray(value, max) {
  * fields are dropped so a crooked LLM cannot smuggle extra state into the ledger/panel.
  */
 export function normalizeBriefing(raw, { symbols = [], news = [], allowExtraSymbols = false } = {}) {
+  try {
+    return normalizeBriefingStrict(raw, { symbols, news, allowExtraSymbols });
+  } catch (error) {
+    throw briefingError(String(error?.message ?? error), 'BRIEFING_INVALID');
+  }
+}
+
+/** Parse + validate one model reply; malformed JSON or schema failures are retriable. */
+export function parseBriefingReply(text, { symbols = [], news = [], allowExtraSymbols = false } = {}) {
+  const raw = extractJsonObject(text);
+  return normalizeBriefing(raw, { symbols, news, allowExtraSymbols });
+}
+
+function normalizeBriefingStrict(raw, { symbols = [], news = [], allowExtraSymbols = false } = {}) {
   if (!isPlainObject(raw)) throw new Error('briefing is not an object');
   const sentiment = numberOrNull(raw.sentiment);
   const confidence = numberOrNull(raw.confidence);
@@ -386,19 +469,36 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
     if (news.length === 0) {
       briefing = neutralBriefing(symbols, 'No relevant news in the lookback window; neutral HOLD.', symbols);
     } else {
-      try {
-        const prior = await readOwnPrior(agent.id);
-        const user = buildUserPrompt({ agent, snapshot, spec: agent.spec ?? spec, symbols, news: compactNews(news), prior });
-        const generated = await generate({ system: SYSTEM_PROMPT, user, maxTokens: maxOutputTokens, temperature: 0.2 });
-        const text = typeof generated === 'string' ? generated : generated?.text;
-        usage = generated?.usage ?? null;
-        usedProvider = generated?.provider ?? usedProvider;
-        usedModel = generated?.model ?? usedModel;
-        const raw = extractJsonObject(text);
-        briefing = normalizeBriefing(raw, { symbols, news, allowExtraSymbols: false });
-        costUsd = costPerRunUsd;
-      } catch (error) {
-        outcome.error = `llm: ${String(error?.message ?? error).slice(0, 180)}`;
+      const prior = await readOwnPrior(agent.id);
+      const baseUser = buildUserPrompt({ agent, snapshot, spec: agent.spec ?? spec, symbols, news: compactNews(news), prior });
+      let lastFailure = null;
+      for (let attempt = 1; attempt <= BRIEFING_ATTEMPTS; attempt += 1) {
+        const user = attempt === 1
+          ? baseUser
+          : `${baseUser}\n\nIMPORTANT: the previous reply was rejected as invalid JSON (${String(lastFailure?.message ?? lastFailure).slice(0, 160)}). Reply now with ONLY ONE compact valid JSON object matching the schema: double quotes, no markdown fences, no trailing commas, summary <=400 characters.`;
+        try {
+          const generated = await generate({ system: SYSTEM_PROMPT, user, maxTokens: maxOutputTokens, temperature: 0.2 });
+          const text = typeof generated === 'string' ? generated : generated?.text;
+          usage = generated?.usage ?? usage;
+          usedProvider = generated?.provider ?? usedProvider;
+          usedModel = generated?.model ?? usedModel;
+          briefing = parseBriefingReply(text, { symbols, news, allowExtraSymbols: false });
+          costUsd = costPerRunUsd;
+          lastFailure = null;
+          break;
+        } catch (error) {
+          lastFailure = error;
+          const retriable = RETRIABLE_BRIEFING_CODES.has(error?.code) || error instanceof SyntaxError;
+          if (!retriable || attempt >= BRIEFING_ATTEMPTS) break;
+          logger.warn('research reply malformed; retrying once', {
+            agentId: agent.id,
+            attempt,
+            error: String(error?.message ?? error).slice(0, 140),
+          });
+        }
+      }
+      if (lastFailure) {
+        outcome.error = `llm: ${String(lastFailure?.message ?? lastFailure).slice(0, 180)}`;
         lastError = outcome.error;
         errors += 1;
         return outcome;

@@ -204,13 +204,19 @@ export async function main(argv = process.argv.slice(2), { env = process.env } =
         await log({ at, event: 'reload_error', error: errorInfo(reloadError) });
       }
       const result = await reaper.sweep();
-      // The engine and the operator read registry.json/ledger.json; a death that is not
-      // persisted here is not a death (the engine would keep funding a zombie).
-      try {
-        await registry.save();
-        await ledger.save();
-      } catch (saveError) {
-        await log({ at, event: 'save_error', error: errorInfo(saveError) });
+      // A sweep that killed nobody changed no durable state. Saving unconditionally here is a
+      // lost-update race against the engine, which is the primary writer: the Reaper reloads at
+      // the top of the sweep and would then overwrite anything the engine wrote in between
+      // (observed live: three $0.001 research charges vanished when the sweep saved a snapshot
+      // loaded before the engine's tick-end save). Persist only actual deaths.
+      const changed = Array.isArray(result?.killed) && result.killed.length > 0;
+      if (changed) {
+        try {
+          await registry.save();
+          await ledger.save();
+        } catch (saveError) {
+          await log({ at, event: 'save_error', error: errorInfo(saveError) });
+        }
       }
       sweeps += 1;
       lastError = null;
