@@ -479,6 +479,18 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       // --- research influence (advisory, fresh-only, config-gated) -----------------
       // `research` is research.latest(agentId). Research can only veto, shrink, or
       // exit: it never increases a size, creates an order, or bypasses a brake.
+      //
+      // Live finding (2026-10-28): the analyst schema encourages listing risks, so the
+      // average briefing carries 3.7 risks and a `risks >= 2` veto blocked 100% of entries.
+      // Vetoes now need an explicit model recommendation (AVOID/ALERT) or a strongly negative
+      // sentiment; a long risk list only shrinks the order. Thresholds are configurable.
+      const researchCfg = config && typeof config === 'object' && config.research && typeof config.research === 'object'
+        ? config.research
+        : {};
+      const researchVetoSentiment = numberOrNull(researchCfg.vetoSentiment) ?? -0.6;
+      const researchExitSentiment = numberOrNull(researchCfg.exitSentiment) ?? -0.5;
+      const researchVetoMinRisks = numberOrNull(researchCfg.vetoMinRisks) ?? 5;
+      const researchRiskPenalty = clamp(numberOrNull(researchCfg.riskPenalty) ?? 0.6, 0.2, 1);
       const researchBriefing = researchInfluenceEnabled
         ? resolveResearchBriefing({ research, config, atMs })
         : null;
@@ -489,18 +501,20 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         researchBriefing
         && (researchBriefing.verdict === 'AVOID'
           || researchBriefing.verdict === 'ALERT'
-          || researchBriefing.sentiment <= -0.35
-          || researchBriefing.risks.length >= 2),
+          || researchBriefing.sentiment <= researchVetoSentiment
+          || researchBriefing.risks.length >= researchVetoMinRisks),
       );
       const researchExitAlert = Boolean(
         researchBriefing
-        && (researchBriefing.verdict === 'ALERT' || researchBriefing.sentiment <= -0.5),
+        && (researchBriefing.verdict === 'ALERT' || researchBriefing.sentiment <= researchExitSentiment),
       );
-      const researchSizeFactor = researchBriefing
+      const researchBaseFactor = researchBriefing
         ? researchBriefing.sentiment > 0
           ? clamp(0.5 + researchBriefing.confidence * 0.5, 0.4, 1.0)
           : 0.6
         : 1;
+      const researchRiskFactor = researchBriefing && researchBriefing.risks.length >= 2 ? researchRiskPenalty : 1;
+      const researchSizeFactor = clamp(researchBaseFactor * researchRiskFactor, 0.3, 1.0);
 
       // --- own position book (never broker.getAccount) ----------------------------
       // Reconcile pending fills BEFORE reading the book so today's fills become positions.

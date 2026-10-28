@@ -25,15 +25,31 @@ research: {
   maxAgeSec: 7200,            // briefings older than this are ignored by the executor
   maxConcurrent: 1,
   maxInputChars: 12000,
-  maxOutputTokens: 700,
+  maxOutputTokens: 1200,
   logLimit: 120,              // per-agent briefing log length
+  // advisory thresholds (live-tuned 2026-10-28 after a 100%-veto incident)
+  vetoSentiment: -0.6,        // entries vetoed only on strongly negative sentiment...
+  exitSentiment: -0.5,        // ...or an explicit AVOID/ALERT verdict
+  vetoMinRisks: 5,            // risk lists never reach this (they only shrink size instead)
+  riskPenalty: 0.6,           // size multiplier when risks >= 2
+  errorCooldownSec: 900,      // pause LLM attempts after provider errors (1h for fatal ones)
   provider: null,             // optional override; Harness bridge resolves the default model
   model: null,
 }
 ```
 
 Validation in `validateConfig`: intervalSec >= 60, maxNewsPerAgent 1..20, costPerRunUsd >= 0,
-maxAgeSec >= 300, maxOutputTokens 128..4000, logLimit 20..1000, maxRunsPerCycle 1..10.
+maxAgeSec >= 300, maxOutputTokens 128..4000, logLimit 20..1000, maxRunsPerCycle 1..10,
+vetoSentiment/exitSentiment -1..0, vetoMinRisks 2..5, riskPenalty 0.2..1, errorCooldownSec 60..86400.
+
+**Live incident encoded here (2026-10-28):** the first tuning vetoed any briefing with
+`risks >= 2`. The analyst schema encourages listing risks, every briefing carried ~3.7 of them, and
+**100% of entry attempts were vetoed** (only 4 fills in two sessions). The rule is now: veto only on
+an explicit `AVOID`/`ALERT` verdict or `sentiment <= -0.6`; a long risk list multiplies the order
+size by `riskPenalty` instead. Provider failures (e.g. an exhausted API balance) pause further LLM
+attempts for `errorCooldownSec`, or one hour for fatal errors, so the engine does not hammer the API
+every cycle; stale briefings are ignored by the executor, so trading keeps baseline behaviour while
+paused.
 
 Scheduling: each agent's slots are phase-shifted by `index * staggerSec` (with 30 agents and a
 3600 s interval, `staggerSec=120` spreads the hourly load to ~2–3 briefings per 5-minute cycle),

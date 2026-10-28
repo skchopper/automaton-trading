@@ -352,9 +352,40 @@ describe('research: isolation, schema, economics, scheduling', () => {
     assert.equal(ledger.snapshot('atm-aaaaaaaa').costsUsd, costsBefore);
     const journalFile = path.join(paths.researchDir, 'atm-aaaaaaaa.jsonl');
     const rows = fs.existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+    // Repeated provider failures pause further attempts instead of hammering every cycle.
+    const paused = await researcher.tick();
+    assert.equal(paused.paused, true);
+    assert.equal(paused.ran.length, 0);
+    assert.ok(paused.pausedUntil);
+    assert.ok(researcher.schedule().pausedUntil);
+    // After the cooldown the agents are still due and are retried (and fail again, no charge).
+    clock.advance(1000 * 1000);
     const after = await researcher.tick();
-    assert.equal(after.ran.length, 2); // failed agents stay due and are retried next cycle
+    assert.equal(after.ran.length, 2);
     assert.equal(fs.existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8').trim().split('\n').filter(Boolean).length : 0, rows);
+  });
+
+  it('uses a longer cooldown for fatal provider errors such as an empty balance', async () => {
+    advancePastInterval();
+    const researcher = createResearcher({
+      broker,
+      registry,
+      ledger,
+      config,
+      paths,
+      clock,
+      generate: async () => {
+        throw Object.assign(new Error('Insufficient Balance (request_id: test)'), { code: 'INSUFFICIENT_BALANCE' });
+      },
+    });
+    const run = await researcher.tick();
+    assert.equal(run.ran.every((entry) => /llm:/.test(entry.error ?? '')), true);
+    const pausedUntil = Date.parse(researcher.schedule().pausedUntil);
+    assert.ok(pausedUntil - clock.now() >= 55 * 60 * 1000, 'fatal errors pause for at least ~1h');
+    clock.advance(61 * 60 * 1000);
+    const retried = await researcher.tick();
+    assert.equal(retried.paused, undefined);
+    assert.ok(retried.ran.length >= 1);
   });
 
   it('reports disabled/unconfigured without throwing', async () => {

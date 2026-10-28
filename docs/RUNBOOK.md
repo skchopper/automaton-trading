@@ -160,6 +160,15 @@ Each living agent gets its own **isolated** hourly news briefing (`docs/RESEARCH
 - **Disable / tune**: edit `research` in `automaton.config.json`
   (`enabled`, `influence`, `intervalSec`, `staggerSec`, `costPerRunUsd`, `maxAgeSec`,
   `maxNewsPerAgent`, `maxOutputTokens`) and restart the Host (engine modules load on boot).
+  Advisory thresholds are also configurable: `vetoSentiment` (-0.6), `exitSentiment` (-0.5),
+  `vetoMinRisks` (5, effectively off), `riskPenalty` (0.6 size multiplier when risks >= 2) and
+  `errorCooldownSec` (900 s pause after provider errors; 1 h for fatal ones such as an empty API
+  balance). Do not veto on risk count alone — a live tuning mistake did exactly that and blocked
+  ~100% of entries for two sessions (see docs/VERIFICATION.md, 2026-10-28).
+- **Provider balance**: the Harness `llm` service bills your DeepSeek account. If the balance is
+  exhausted the analyst pauses (errors + stale briefings), and **trading continues without
+  research influence** because stale briefings are ignored. Top up at platform.deepseek.com, then
+  the next hourly slot resumes automatically (or restart after changing config).
 - **Failure behaviour**: news outage → no news → neutral HOLD (no LLM call, no charge);
   LLM error → logged, no briefing/charge, trading unaffected; stale briefing (> `maxAgeSec`)
   → ignored by the Executor but still shown (marked stale) in the panel.

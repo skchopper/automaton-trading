@@ -290,6 +290,7 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
   const maxInputChars = Math.max(1000, Number(cfg.maxInputChars) || 12000);
   const maxOutputTokens = Math.max(128, Math.min(4000, Number(cfg.maxOutputTokens) || 1200));
   const logLimit = Math.max(20, Math.min(1000, Number(cfg.logLimit) || 120));
+  const errorCooldownMs = Math.max(60, Math.min(86_400, Number(cfg.errorCooldownSec) || 900)) * 1000;
   const provider = cfg.provider ?? null;
   const model = cfg.model ?? null;
 
@@ -303,6 +304,16 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
   let lastRunAt = null;
   let lastProvider = provider;
   let lastModel = model;
+  /** Provider errors pause further LLM attempts instead of hammering the API every cycle. */
+  let pausedUntilMs = 0;
+  let pauseReason = null;
+
+  function pauseAfterProviderError(message, nowMs) {
+    const fatal = /insufficient balance|insufficient_quota|invalid api key|unauthorized|401|payment|billing/i.test(String(message));
+    const cooldown = fatal ? Math.max(errorCooldownMs, 60 * 60 * 1000) : errorCooldownMs;
+    pausedUntilMs = Math.max(pausedUntilMs, nowMs + cooldown);
+    pauseReason = String(message ?? 'provider error').slice(0, 200);
+  }
 
   function logFile(agentId) {
     return path.join(researchDir, `${agentId}.jsonl`);
@@ -326,6 +337,8 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
       }
     }
     if (numberOrNull(saved?.startedAtMs) !== null) startedAtMs = numberOrNull(saved.startedAtMs);
+    pausedUntilMs = numberOrNull(saved?.pausedUntilMs) ?? 0;
+    pauseReason = typeof saved?.pauseReason === 'string' ? saved.pauseReason : null;
     initialized = true;
   }
 
@@ -339,6 +352,8 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
       runs,
       errors,
       lastError,
+      pausedUntilMs,
+      pauseReason,
       provider: lastProvider,
       model: lastModel,
       agents,
@@ -445,6 +460,7 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
       outcome.error = `news: ${String(error?.message ?? error).slice(0, 160)}`;
       lastError = outcome.error;
       errors += 1;
+      pauseAfterProviderError(outcome.error, nowMs);
       return outcome;
     }
     let snapshot = null;
@@ -501,6 +517,7 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
         outcome.error = `llm: ${String(lastFailure?.message ?? lastFailure).slice(0, 180)}`;
         lastError = outcome.error;
         errors += 1;
+        pauseAfterProviderError(outcome.error, nowMs);
         return outcome;
       }
     }
@@ -552,6 +569,8 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
     lastRunAt = nowMs;
     lastProvider = usedProvider;
     lastModel = usedModel;
+    pausedUntilMs = 0;
+    pauseReason = null;
     outcome.verdict = record.verdict;
     outcome.sentiment = record.sentiment;
     outcome.confidence = record.confidence;
@@ -589,6 +608,22 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
       };
     }
     const due = dueAgents(nowMs);
+    // Provider errors (e.g. an empty API balance) pause further LLM attempts for a cooldown
+    // instead of retrying every 5-minute cycle; the stale briefings are ignored by the executor,
+    // so trading keeps its baseline behaviour while paused.
+    if (nowMs < pausedUntilMs) {
+      return {
+        enabled,
+        configured,
+        due: due.length,
+        ran: [],
+        deferred: 0,
+        skipped: Math.max(0, registry.alive().length - due.length),
+        paused: true,
+        pausedUntil: new Date(pausedUntilMs).toISOString(),
+        note: `paused after provider error: ${pauseReason ?? 'unknown'}`,
+      };
+    }
     // Cap LLM work per engine cycle: 30 hourly briefings must not block one trading cycle for
     // minutes. Due agents beyond the cap stay due and are picked up by the next cycle.
     const batch = due.slice(0, maxRunsPerCycle);
@@ -657,6 +692,8 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
       maxRunsPerCycle,
       lastRunAt: lastRunAt === null ? null : new Date(lastRunAt).toISOString(),
       nextDueAt: nextDueAt === null ? null : new Date(nextDueAt).toISOString(),
+      pausedUntil: pausedUntilMs > currentClock.now() ? new Date(pausedUntilMs).toISOString() : null,
+      pauseReason,
       provider: lastProvider,
       model: lastModel,
       runs,

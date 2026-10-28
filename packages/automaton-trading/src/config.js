@@ -94,6 +94,13 @@ export function defaultConfig() {
       maxInputChars: 12000,
       maxOutputTokens: 1200,
       logLimit: 120,
+      // Advisory thresholds (live-tuned 2026-10-28): a veto needs an explicit AVOID/ALERT
+      // verdict or a strongly negative sentiment; a long risk list only shrinks the order.
+      vetoSentiment: -0.6,
+      exitSentiment: -0.5,
+      vetoMinRisks: 5,
+      riskPenalty: 0.6,
+      errorCooldownSec: 900,
       provider: null,
       model: null,
     },
@@ -351,6 +358,11 @@ export function validateConfig(config) {
   assertNumber(research.maxInputChars, 'research.maxInputChars', { min: 1000, max: 60_000 });
   assertNumber(research.maxOutputTokens, 'research.maxOutputTokens', { min: 128, max: 4000 });
   assertNumber(research.logLimit, 'research.logLimit', { min: 20, max: 1000 });
+  assertNumber(research.vetoSentiment, 'research.vetoSentiment', { min: -1, max: 0 });
+  assertNumber(research.exitSentiment, 'research.exitSentiment', { min: -1, max: 0 });
+  assertNumber(research.vetoMinRisks, 'research.vetoMinRisks', { min: 2, max: 5 });
+  assertNumber(research.riskPenalty, 'research.riskPenalty', { min: 0.2, max: 1 });
+  assertNumber(research.errorCooldownSec, 'research.errorCooldownSec', { min: 60, max: 86_400 });
   if (research.provider !== null && typeof research.provider !== 'string') {
     fail('CONFIG_INVALID', 'research.provider must be a string or null');
   }

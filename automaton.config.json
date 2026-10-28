@@ -47,7 +47,12 @@
     "maxConcurrent": 1,
     "maxOutputTokens": 1200,
     "logLimit": 120,
-    "maxRunsPerCycle": 3
+    "maxRunsPerCycle": 3,
+    "vetoSentiment": -0.6,
+    "exitSentiment": -0.5,
+    "vetoMinRisks": 5,
+    "riskPenalty": 0.6,
+    "errorCooldownSec": 900
   },
   "engine": {
     "autoStart": false,

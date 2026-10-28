@@ -562,3 +562,36 @@ Harness `llm` service (provider `deepseek-account`, model `deepseek-flash`):
   mortality 55/55, integration 21/21, security 41/41 = **192 tests**; research smoke 10/10;
   verify-fixes 18/18. Committed locally; full-session live verification continues after the next
   restart.
+
+### Research gate 100%-veto incident — "plugin not doing much" (2026-10-28)
+
+User asked why the population barely trades. Diagnosis from the live trace/journal dataset:
+
+- The loop was healthy (465 ticks, Reaper pid 27976 heartbeat v2, 0 engine errors, reconciliation ok)
+  but only **4 broker orders** had ever been placed, all on the first session (Monday 2026-10-26).
+- Trace aggregation over the last three days: **328 `research_veto` skips** versus 2 entries.
+- Journal analysis over **1,025 briefings**: 819 HOLD / 206 AVOID, average **3.72 risks** per
+  briefing, and **1,024/1,025 (99.9%) carried `risks >= 2`**. The executor vetoed any briefing with
+  `risks >= 2`, so research blocked essentially **every entry** whenever a fresh briefing existed.
+  Overnight cycles additionally hit the expected `MARKET_CLOSED` brake (236).
+- Secondary issue: the DeepSeek API balance ran out (last successful briefing 2026-10-28T02:45Z;
+  **206 `Insufficient Balance` errors**), so the analyst is currently paused by stale-freshness and
+  would stop vetoing — but the gate still needed fixing before a top-up.
+
+Fixes (committed, requires Host restart to activate):
+
+1. **Veto thresholds softened and made configurable:** veto only on an explicit `AVOID`/`ALERT`
+   verdict or `sentiment <= vetoSentiment` (-0.6); a long risk list no longer vetoes — it multiplies
+   the order size by `riskPenalty` (0.6) instead. `exitSentiment` (-0.5) still drives
+   `research_alert` exits; `vetoMinRisks` (5) is effectively unreachable with the 4-risk schema cap.
+2. **Provider-error backoff:** LLM/news failures pause further attempts for `errorCooldownSec`
+   (900 s; one hour for fatal errors such as an exhausted balance), so the engine stops retrying the
+   API every cycle. Successful briefings clear the pause. Stale briefings are ignored by the
+   executor, so trading keeps baseline behaviour while paused.
+3. New knobs live in `research` config (`vetoSentiment`, `exitSentiment`, `vetoMinRisks`,
+   `riskPenalty`, `errorCooldownSec`) with validation + focused tests (market 27/27, research 13/13).
+
+Remaining operator actions: top up the DeepSeek balance (or run research in shadow / disabled until
+then) and restart the Harness app (Host modules are ESM-cached), then Start. Expected effect: entries
+are no longer mass-vetoed; the first live `research_veto`/`research_alert` should now be a genuine
+signal rather than a schema artefact.

@@ -1285,11 +1285,12 @@ test('executor × research: a fresh AVOID vetoes an entry that would otherwise p
   assert.equal(veto.research.sentiment, -0.6);
   assert.equal(veto.research.applied, 'veto');
 
-  // each veto trigger fires on its own: ALERT verdict, sentiment <= -0.35, risks >= 2
+  // veto triggers: explicit AVOID/ALERT recommendations, or strongly negative sentiment.
+  // A long risk list is NOT a veto anymore (live finding: every briefing lists risks, which
+  // blocked 100% of entries); risks only shrink the order.
   for (const briefing of [
     makeBriefing({ verdict: 'ALERT', sentiment: 0 }),
-    makeBriefing({ verdict: 'HOLD', sentiment: -0.4 }),
-    makeBriefing({ verdict: 'HOLD', sentiment: 0.2, risks: ['regulatory review', 'margin warning'] }),
+    makeBriefing({ verdict: 'HOLD', sentiment: -0.7 }),
   ]) {
     const harness = executorHarness();
     const vetoResult = await runHarness(harness, { research: briefing });
@@ -1301,6 +1302,19 @@ test('executor × research: a fresh AVOID vetoes an entry that would otherwise p
   const passing = executorHarness();
   const passResult = await runHarness(passing, { research: makeBriefing({ verdict: 'HOLD', sentiment: 0.4 }) });
   assert.equal(passResult.orders.length, 1);
+
+  // mildly negative sentiment (-0.4, the old threshold) no longer blocks entries
+  const mild = executorHarness();
+  const mildResult = await runHarness(mild, { research: makeBriefing({ verdict: 'HOLD', sentiment: -0.4 }) });
+  assert.equal(mildResult.orders.length, 1, 'mildly negative sentiment must trade (smaller), not veto');
+
+  // two risks no longer veto; the order is placed at the risk-penalised size
+  const risky = executorHarness();
+  const riskyResult = await runHarness(risky, {
+    research: makeBriefing({ verdict: 'HOLD', sentiment: 0.4, confidence: 0.8, risks: ['regulatory review', 'margin warning'] }),
+  });
+  assert.equal(riskyResult.orders.length, 1, 'risks >= 2 must not veto any more');
+  assert.ok(!riskyResult.actions.some((action) => action.reason === 'research_veto'));
 });
 
 test('executor × research: size scaling only shrinks the notional (and existing caps still win)', async () => {
@@ -1329,6 +1343,14 @@ test('executor × research: size scaling only shrinks the notional (and existing
   });
   const neutralNotional = neutralResult.orders[0].qty * neutralResult.orders[0].avgFillPriceUsd;
   assert.ok(Math.abs(neutralNotional - baselineNotional * 0.6) < 0.05);
+
+  // risks >= 2 add a risk penalty on top of the sentiment factor (0.9 x 0.6 = 0.54)
+  const risky = executorHarness();
+  const riskyResult = await runHarness(risky, {
+    research: makeBriefing({ verdict: 'HOLD', sentiment: 0.4, confidence: 0.8, risks: ['risk a', 'risk b'] }),
+  });
+  const riskyNotional = riskyResult.orders[0].qty * riskyResult.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(riskyNotional - baselineNotional * 0.54) < 0.05, `risk penalty expected 0.54x, got ${riskyNotional / baselineNotional}x`);
 
   // research can never widen a size: a very positive briefing still respects the mandate cap
   const tinyMandate = executorHarness({ mandate: baseMandate({ maxOrderNotionalUsd: 120 }) });
