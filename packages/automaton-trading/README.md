@@ -1,6 +1,9 @@
-# @local/automaton-trading
+# MEAT — Mortality Engineered Auto-Trading
 
-DeepSeek Harness plugin bundle for **AUTOMATON TRADING** — a mortality-engineered
+> Package id: `@local/automaton-trading` (kept for compatibility with the installed Harness
+> profile, plugin state and tools; the product/app/plugin name is **MEAT**).
+
+DeepSeek Harness plugin bundle for **MEAT** — a mortality-engineered
 multi-agent trading system on Alpaca. The plugin owns the Harness shell only: the
 engine, roles, brakes, and journal live in `src/` (Lead-owned) and are reached through
 one facade (`src/engine.js`).
@@ -16,7 +19,7 @@ obituary the living read.
 | 10 agent tools | `automaton_status`, `automaton_start`, `automaton_stop`, `automaton_tick`, `automaton_agents`, `automaton_obituaries`, `automaton_brakes`, `automaton_simulate`, `automaton_config`, `automaton_emergency_stop` |
 | Sidebar entry | `sidebar.panellist`: one "Automaton" entry in the sidebar's global panel list (strategy/skull glyph, localized label) |
 | Control panel | `main` keyed panel `automaton-trading`: the full dashboard opened from the sidebar in the central column — header stats, operator controls, the 30-agent table, per-agent drill-down, generation rollup and obituary feed |
-| Settings page | Settings → Built-in plugins → **Automaton Trading** (`settings.plugins.tab`): the same dashboard as a full page |
+| Settings page | Settings → Built-in plugins → **MEAT — Mortality Engineered Auto-Trading** (`settings.plugins.tab`): the same dashboard as a full page |
 | State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 3 s (auto-refresh with pause) |
 | Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop and the research/reward settings actions) |
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
@@ -243,7 +246,7 @@ so the new client module + routes load), verify:
 
 1. The sidebar shows an **Automaton** entry; clicking it opens the dashboard in the
    central column (no floating window any more).
-2. Settings → Built-in plugins → Automaton Trading shows the same dashboard as a page.
+2. Settings → Built-in plugins → MEAT — Mortality Engineered Auto-Trading shows the same dashboard as a page.
 3. Clicking an agent opens its holdings / past activity / genome-vs-spec detail pane.
 4. The Reaper row is visible; if it shows a stale generation, **Stop Reaper** then **Start**.
 5. `GET http://127.0.0.1:<port>/automaton/state` returns JSON with `"ok": true`, and a

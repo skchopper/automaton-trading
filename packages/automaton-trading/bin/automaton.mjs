@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AUTOMATON TRADING — operator CLI.
+ * MEAT — operator CLI.
  *
  *   node bin/automaton.mjs <command> [options]
  *
@@ -45,7 +45,7 @@ const OPTIONS = {
   help: { type: 'boolean', short: 'h', default: false },
 };
 
-const HELP = `AUTOMATON TRADING — mortality-engineered trading population on Alpaca
+const HELP = `MEAT — mortality-engineered trading population on Alpaca
 
 Usage: node bin/automaton.mjs <command> [options]
 
@@ -227,7 +227,7 @@ function printHumanStatus(status) {
   const engine = status.engine ?? {};
   const treasury = status.treasury ?? {};
   const population = status.population ?? {};
-  console.log('AUTOMATON TRADING');
+  console.log('MEAT');
   console.log(`  mode:            ${status.mode}${engine.running ? ' (loop running)' : ''}`);
   console.log(`  kill switch:     ${engine.killSwitch ? 'ARMED' : 'clear'}   live armed: ${engine.liveArmed ? 'YES' : 'no'}`);
   if (engine.reaper) {

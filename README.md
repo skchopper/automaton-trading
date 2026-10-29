@@ -1,4 +1,4 @@
-# AUTOMATON TRADING
+# MEAT — Mortality Engineered Auto-Trading
 
 A multi-agent trading system on Alpaca built from *Mortality Engineering* — the theory in
 **"I Built an AI That Dies If It Stops Making Money"**. Delivered as an installable
@@ -71,7 +71,7 @@ In the Harness chat: `automaton_status`, `automaton_tick`, `automaton_start`,
 `automaton_agents`, `automaton_stop`, `automaton_emergency_stop`.
 Control panel: a **sidebar entry** (Automaton icon in the left sidebar) that opens the full
 dashboard in the central column — no floating window; the same dashboard is also a page in
-**Settings → Plugins → Automaton Trading**.
+**Settings → Plugins → MEAT — Mortality Engineered Auto-Trading**.
 
 Inside the dashboard: header stats, Start / Stop / Emergency controls, the operator Reaper row,
 and a clickable table of all agents. **Agents have memorable strategy names** instead of random

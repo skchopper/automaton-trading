@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Automaton Trading",
-    "description": "Mortality-engineered multi-agent trading on Alpaca: six roles, a death rule, replication with mutation, and an external Reaper. Adds the automaton_* agent tools, a live population dashboard in Settings, and a status strip under the chat composer."
+    "title": "MEAT — Mortality Engineered Auto-Trading",
+    "description": "Mortality-engineered multi-agent trading on Alpaca: six roles with stoplines, a death rule, replication with mutation and an external Reaper. In the Harness sidebar: a live population dashboard with research cadence controls, daily/weekly/monthly leaderboards, configurable winner rewards, and per-agent strategy plans, transactions and research briefings."
   }
 }

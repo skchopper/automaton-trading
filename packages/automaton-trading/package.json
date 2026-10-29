@@ -1,9 +1,10 @@
 {
   "name": "@local/automaton-trading",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Mortality-engineered multi-agent trading system for Alpaca (paper/live): six roles, a death rule, replication with mutation, and an external Reaper — agent tools plus a Web UI population dashboard.",
+  "displayName": "MEAT — Mortality Engineered Auto-Trading",
+  "description": "MEAT — Mortality Engineered Auto-Trading: mortality-engineered multi-agent trading for Alpaca (paper/live). Six roles with stoplines, a death rule, replication with mutation, an external Reaper, a per-agent isolated hourly research analyst, and an operator control panel (research cadence, leaderboards, configurable winner rewards).",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

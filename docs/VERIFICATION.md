@@ -1,4 +1,4 @@
-# VERIFICATION — INDEPENDENT review of AUTOMATON TRADING
+# VERIFICATION — INDEPENDENT review of MEAT
 
 Verifier: independent verifier teammate (`verifier`), not an author of any module under test.
 Date: 2026-10-25 (Asia/Hong_Kong). Host: Windows, Node **v22.18.0**, DSH file sandbox

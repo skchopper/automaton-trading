@@ -1,5 +1,5 @@
 /**
- * Client (browser) half of the AUTOMATON TRADING bundle.
+ * Client (browser) half of the MEAT bundle.
  *
  * ONE shared dashboard, registered in three slot surfaces:
  *  - `sidebar.panellist`  sidebar entry (glyph; label "Automaton") that selects the panel.
@@ -49,9 +49,9 @@ window.__ModuleLoader__.load({
     // -----------------------------------------------------------------------
 
     const EN = {
-      tab: 'Automaton Trading',
+      tab: 'MEAT — Mortality Engineered Auto-Trading',
       sidebarLabel: 'Automaton',
-      title: 'Automaton Trading',
+      title: 'MEAT — Mortality Engineered Auto-Trading',
       subtitle: 'Mortality-engineered strategies: the unprofitable die, the profitable reproduce, every death leaves a record.',
       loading: 'Loading automaton state…',
       connecting: 'connecting…',
@@ -295,9 +295,9 @@ window.__ModuleLoader__.load({
     };
 
     const ZH = {
-      tab: '自动交易生命体',
+      tab: 'MEAT — 死亡率工程自动交易',
       sidebarLabel: '自动交易',
-      title: '自动交易生命体',
+      title: 'MEAT — 死亡率工程自动交易',
       subtitle: '死亡机制驱动的策略种群：不赚钱的死去，赚钱的复制，每一次死亡都留下记录。',
       loading: '正在读取自动交易状态…',
       connecting: '连接中…',

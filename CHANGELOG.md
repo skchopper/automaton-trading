@@ -1,0 +1,108 @@
+# MEAT — Mortality Engineered Auto-Trading
+
+**Changelog / release notes.** Paper trading by default; live trading is triple-gated.
+Not investment advice.
+
+Machine identifiers (`@local/automaton-trading`, plugin id `automaton-trading`, the
+`automaton_*` tools, `automaton-data/`, `automaton.config.json`, `.env`, `bin/automaton.mjs`)
+are intentionally unchanged in this release so the installed plugin, the running paper loop and
+existing state migrate with **zero** data changes.
+
+---
+
+## v2.0.0 — 2026-10-29
+
+First public release after the initial code upload. Renamed the project, app and plugin to
+**MEAT — Mortality Engineered Auto-Trading**, and added the full operator control plane and the
+per-agent research analyst on top of the mortality engine.
+
+### Renamed to MEAT
+- Project/app/plugin display name is now **MEAT — Mortality Engineered Auto-Trading**
+  (Harness plugin title and locale, sidebar panel header, README, docs, CLI banner).
+- GitHub repository renamed to [`skchopper/meat`](https://github.com/skchopper/meat) (the old
+  `automaton-trading` URL redirects).
+- Internal ids stay stable for zero-downtime upgrade (see note above); the package version is
+  bumped to **2.0.0**.
+
+### New: per-agent isolated research analyst (hourly news → trading decisions)
+- Each living bot gets its **own** LLM briefing about **its own** holdings and news from the
+  Alpaca News API, with a private journal — no other bot's book, no other role's memory.
+- Briefing schema: sentiment, confidence, verdict (`HOLD`/`AVOID`/`ALERT`), catalysts, risks,
+  summary, timestamped sources; stored per agent in `automaton-data/research/<agentId>.jsonl`.
+- **Live influence (advisory only):** fresh briefings can veto a new entry (`research_veto`),
+  shrink the order size (never increase it), or force an exit (`research_alert`). Every order
+  still passes all 14 hard brakes; the analyst has no order or wallet access.
+- **Agent-paid:** `$0.001` per successful briefing is charged to that bot's ledger
+  (category `research`), so research shortens its own runway. Failed/malformed replies are free.
+- **Cadence is operator-selectable from the panel:** every 1 h / 3 h / 6 h / 24 h,
+  **before market open**, **after market close**, or both. Applies live
+  (`POST /automaton/control {action:'set-research-settings'}`) and is persisted in
+  `automaton-data/settings.json` so it survives restarts.
+- Hardened after live incidents: JSON repair + one retry for malformed model replies, provider
+  error backoff (15 min, 1 h for fatal errors such as an exhausted API balance), stale briefings
+  ignored by trading, and a corrected veto rule so risk lists shrink orders instead of blocking
+  every entry.
+
+### New: operator control panel (Harness sidebar)
+- **Research cadence** controls (above), collection/influence toggles, next-due time,
+  provider/model and pause reason.
+- **Rewards control:** enable toggle, period (daily/weekly/monthly), and 1st/2nd/3rd percentages
+  of the broker account's **cash** — defaults **+5% / +3% / +2%** — optional per-period maximum,
+  live preview against the treasury pool and allocation-cap headroom, last winners and history.
+  Payouts are **virtual treasury→agent ledger transfers** at period boundaries only, once per
+  period, floored to cents and proportionally capped by pool / allocation cap / max. No broker
+  transfer surface exists, so reconciliation is unchanged.
+- **Leaderboards:** daily, weekly and monthly rankings of all bots by period P&L %, medals for the
+  top 3, click-through to the agent detail.
+- **Richer agent detail page:** strategy explanation, exact entry rule, exit rules (stop/target/
+  time/signal), risk rule, plan + next step, trigger grid, current position plan (stop/target/bars
+  held), P&L (realized/unrealized/day/week/month), ranking badges, next research time, research
+  briefing, and a full **transactions** table (time/side/symbol/qty/price/notional/realized/order id).
+- Both settings are validated with an allow-list in the Host (500-level errors kept structured,
+  `400 INVALID_SETTINGS` on bad input), are loopback-only operator routes, and are **never**
+  exposed as agent tools.
+
+### Reliability and correctness fixes since the initial upload
+- **Async Alpaca fills:** market orders return `accepted` before filling; the executor now polls
+  briefly for the real fill and reconciles every filled broker order per agent, so a fill can no
+  longer be lost or booked as a 0-qty ledger rejection.
+- **State persistence:** atomic JSON writes retry transient Windows file-lock races; a successful
+  cycle clears a stale `lastError`; the external Reaper now persists registry/ledger **only when a
+  sweep kills an agent** (single-writer discipline), fixing lost-update races.
+- **Harness LLM bridge:** dispatch now echoes the prepared frozen call config (adapter defaults
+  included), fixing `INVALID_PREPARED_CALL`; provider/model are recorded per briefing; the research
+  output budget is 1200 tokens.
+- Research-gate tuning: veto only on explicit `AVOID`/`ALERT` or sentiment ≤ −0.6; risk lists apply
+  a size penalty instead of vetoing (a live mis-tune had vetoed 100% of entries).
+- Paper loop now runs 30 bots × $20 on the $2,000 Alpaca paper account, with an external Reaper
+  enforcing death, replication with exactly one mutation, and obituaries as inherited data.
+
+### Documentation & verification
+- New docs: `docs/RESEARCH.md` (research sidecar contract), `docs/CONTROL-PANEL.md`
+  (operator panel / rankings / rewards contract); updated `docs/ARCHITECTURE.md`,
+  `docs/CONTRACTS.md`, `docs/RUNBOOK.md`, `docs/VERIFICATION.md`.
+- **8 test suites, 220 tests, all passing:** mortality 55, market 27, plugin 40, integration 21,
+  security 41, research 13, rankings 16, control 7 — plus `scripts/research-smoke.mjs` 10/10 and
+  `scripts/verify-fixes.mjs` 18/18.
+- Safety invariants covered by the security suite: no transfer/withdraw surface, live gating
+  (`mode`+`allowLive`+`LIVE_ARMED`), kill switch, one-way death, hard population cap, and no engine
+  control over the Reaper.
+
+### Upgrade notes
+1. Restart the DeepSeek Harness app to load the new Host engine + panel (Host plugin modules are
+   ESM-cached). The sidebar panel will show the MEAT title, cadence control, rewards card,
+   leaderboards and expanded agent detail.
+2. The paper loop does not auto-start (`engine.autoStart: false`): press **Start** in the panel.
+3. Research needs LLM credit in the Harness-configured DeepSeek account (top up if it is empty);
+   without it, research pauses and trading continues without research influence.
+4. Run `node packages/automaton-trading/bin/automaton.mjs probe` after any config change to verify
+   Alpaca connectivity without placing orders.
+
+### Known limitations
+- The panel is operator-only and requires the Harness app to be running; research/trading stop when
+  the PC/app is off (no cloud deployment).
+- Reward percentages are capped by the shared treasury pool and the 80% allocation cap; on a
+  $2,000 account the default 5/3/2% daily schedule is intentionally generous and will hit those
+  caps over time — lower the percentages or choose weekly/monthly for longevity.
+- Live UI verification of the new panel happens after the Host restart (engine tests and plugin
+  mapping tests are green before it).

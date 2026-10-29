@@ -1,4 +1,4 @@
-# CONTRACTS — build interfaces (source of truth for parallel work)
+# MEAT — CONTRACTS (build interfaces, source of truth for parallel work)
 
 Package root: `D:\CounterStikers\packages\automaton-trading\`
 Stack: **ESM JavaScript (`.js`), Node ≥ 22, zero runtime dependencies** (global `fetch`).

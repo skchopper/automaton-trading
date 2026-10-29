@@ -1,4 +1,6 @@
-# AUTOMATON TRADING — Mortality Engineering for Trading Agents
+# MEAT — Mortality Engineered Auto-Trading
+
+*Mortality Engineering for trading agents.*
 
 A multi-agent trading system on Alpaca, built from the theory in
 *"I Built an AI That Dies If It Stops Making Money"* (Mortality Engineering).

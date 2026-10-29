@@ -1,4 +1,4 @@
-# CONTROL PANEL / RANKINGS / REWARDS — contract (2026-10-29)
+# MEAT — CONTROL PANEL / RANKINGS / REWARDS contract (2026-10-29)
 
 Operator features requested: configurable research cadence (1h/3h/6h/24h, before open, after close),
 richer per-agent detail (strategy explanation, plan + next step, full order/transaction records),

@@ -1,4 +1,4 @@
-# RUNBOOK — operating AUTOMATON TRADING
+# RUNBOOK — operating MEAT
 
 Everything below runs from `D:\CounterStikers\packages\automaton-trading` unless stated.
 
@@ -111,7 +111,7 @@ The same engine is available inside the DeepSeek Harness Web UI:
   `automaton_config`, `automaton_emergency_stop`.
 - **Control panel**: a **sidebar entry** (Automaton icon in the left sidebar) that opens the
   full dashboard in the central column; the same dashboard is also a page in
-  **Settings → Plugins → Automaton Trading**. The dashboard has header stats (equity, cash,
+  **Settings → Plugins → MEAT — Mortality Engineered Auto-Trading**. The dashboard has header stats (equity, cash,
   population, runway, burn, allocated-vs-cap, last tick, kill switch, obituaries), the
   operator Reaper row, **Start / Stop / Emergency Stop** buttons, and the sortable/filterable
   table of all 30 agents with **strategy names** (`Momentum AAPL`, …), genome-vs-trading-spec,

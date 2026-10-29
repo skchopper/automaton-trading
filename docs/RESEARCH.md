@@ -1,4 +1,4 @@
-# RESEARCH SIDECAR — per-agent isolated news analyst
+# MEAT — RESEARCH SIDECAR (per-agent isolated news analyst)
 
 **Goal.** Every living population agent gets an **isolated** hourly LLM research call about *its own*
 holdings/strategy. The analyst sees only that agent's data plus its own past briefings — never another

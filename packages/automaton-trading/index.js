@@ -1,5 +1,5 @@
 /**
- * Host half of the AUTOMATON TRADING bundle.
+ * Host half of the MEAT bundle.
  *
  * Wires the mortality-engineered trading population into the Harness:
  *  - owns ONE engine handle created through the Lead-owned facade `./src/engine.js`
@@ -1285,7 +1285,7 @@ function buildToolDefinitions(ctx, row, holder) {
   tools.push(defineTool({
     toolName: 'automaton_status',
     description:
-      'Read the AUTOMATON TRADING snapshot: mode (sim/paper/live), broker account equity, treasury state and runway hours, population alive/dead/cap, per-agent rows, recent obituaries, kill-switch state, and last tick time/error. Read-only and secret-free; this is the same JSON the dashboard polls at GET /automaton/state.',
+      'Read the MEAT snapshot: mode (sim/paper/live), broker account equity, treasury state and runway hours, population alive/dead/cap, per-agent rows, recent obituaries, kill-switch state, and last tick time/error. Read-only and secret-free; this is the same JSON the dashboard polls at GET /automaton/state.',
     parameters: EMPTY_PARAMS,
     isConcurrencySafe: () => true,
     execute: async () => buildState(holder, row),
