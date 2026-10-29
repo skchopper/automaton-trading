@@ -118,6 +118,10 @@ export function defaultConfig() {
       basis: 'account-cash',
       maxPerPeriodUsd: null,
     },
+    // Per-tier execution cadence (docs/CONTROL-PANEL.md / RUNBOOK §8b). A 'day' bot is analysed
+    // on the intraday timeframe every `intervalSec`; a 'swing' bot on its slower timeframe.
+    // null = derive from cycleIntervalSec + data.timeframe (backward compatible).
+    cadence: null,
     paths: {
       stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
       envFile: path.join(WORKSPACE_DEFAULT, '.env'),
@@ -125,6 +129,10 @@ export function defaultConfig() {
     engine: {
       autoStart: false,
       traceLimit: 2000,
+      // When true the loop only runs full price/market analysis while the broker clock says the
+      // market is open; outside hours it wakes for a cheap maintenance pass (research + status).
+      tradingHoursOnly: false,
+      offHoursIntervalSec: 300,
     },
   };
 }
@@ -432,6 +440,24 @@ export function validateConfig(config) {
   if (rewards.maxPerPeriodUsd !== null) {
     assertNumber(rewards.maxPerPeriodUsd, 'rewards.maxPerPeriodUsd', { min: 0, max: 1_000_000 });
   }
+
+  // Per-tier execution cadence (optional; null keeps the single-cycle legacy behaviour).
+  if (config.cadence !== null && config.cadence !== undefined) {
+    if (typeof config.cadence !== 'object') fail('CONFIG_INVALID', 'cadence must be an object or null');
+    const DATA_TIMEFRAMES_CADENCE = ['1Min', '5Min', '15Min', '30Min', '1Hour', '2Hour', '4Hour', '1Day'];
+    for (const tier of ['day', 'swing']) {
+      const entry = config.cadence[tier];
+      if (!entry || typeof entry !== 'object') fail('CONFIG_INVALID', `cadence.${tier} is required`);
+      assertNumber(entry.intervalSec, `cadence.${tier}.intervalSec`, { min: 5, max: 86_400 });
+      if (!DATA_TIMEFRAMES_CADENCE.includes(entry.timeframe)) {
+        fail('CONFIG_INVALID', `cadence.${tier}.timeframe must be one of ${DATA_TIMEFRAMES_CADENCE.join('|')}`);
+      }
+    }
+  }
+  const engineCfg = config.engine;
+  if (!engineCfg || typeof engineCfg !== 'object') fail('CONFIG_INVALID', 'engine config object is required');
+  if (typeof engineCfg.tradingHoursOnly !== 'boolean') fail('CONFIG_INVALID', 'engine.tradingHoursOnly must be boolean');
+  assertNumber(engineCfg.offHoursIntervalSec, 'engine.offHoursIntervalSec', { min: 30, max: 3600 });
 
   if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
     fail('CONFIG_INVALID', 'paths.stateDir is required');

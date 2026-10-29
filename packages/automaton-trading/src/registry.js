@@ -32,10 +32,11 @@ function emptyState(cap) {
  * @param {{ id?: string, parentId?: string|null, generation?: number, bornAt?: string,
  *   status?: string, endowmentUsd?: number, genome?: object,
  *   mutation?: object|null, specId?: string|null, lastCycleAt?: string|null,
- *   diedAt?: string|null, cause?: string|null, notes?: string[] }} agent
+ *   tier?: string|null, diedAt?: string|null, cause?: string|null, notes?: string[] }} agent
  */
 function normalizeAgent(agent) {
   const notes = Array.isArray(agent.notes) ? agent.notes.filter((note) => typeof note === 'string') : [];
+  const tier = agent.tier === 'swing' || agent.tier === 'day' ? agent.tier : null;
   return {
     id: agent.id,
     // Operator-facing, strategy-derived label ("Momentum AAPL"). The id stays the stable key.
@@ -49,6 +50,9 @@ function normalizeAgent(agent) {
     mutation: agent.mutation ?? null,
     specId: agent.specId ?? null,
     lastCycleAt: agent.lastCycleAt ?? null,
+    // Execution tier (docs/CONTROL-PANEL.md): 'day' = short-term/day-trading cadence,
+    // 'swing' = mid/long-term cadence. Null until the orchestrator backfills it.
+    tier,
     diedAt: agent.diedAt ?? null,
     cause: agent.cause ?? null,
     notes,

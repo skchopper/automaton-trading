@@ -298,7 +298,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   const minOrderNotionalUsd = Number.isFinite(risk.minOrderNotionalUsd) ? risk.minOrderNotionalUsd : 1;
   const hardMaxNotionalUsd = Number.isFinite(risk.maxOrderNotionalUsd) ? risk.maxOrderNotionalUsd : Infinity;
   const maxOrderPctOfEquity = Number.isFinite(risk.maxOrderPctOfEquity) ? risk.maxOrderPctOfEquity : 0.25;
-  const timeframe = config.data?.timeframe ?? '1Hour';
+  const defaultTimeframe = config.data?.timeframe ?? '1Hour';
   // Research influence is opt-in and gated by config.research (shadow mode = influence:false).
   const researchConfig = config.research && typeof config.research === 'object' ? config.research : {};
   const researchInfluenceEnabled = researchConfig.enabled === true && researchConfig.influence === true;
@@ -326,10 +326,13 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      * @returns {Promise<{agentId:string, actions:Array<object>, orders:Array<object>,
      *           denied:Array<{code:string, reason:string}>, spentUsd:number}>}
      */
-    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, marketOpen, marketClock } = {}) {
+    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
       const atMs = normalizeNow(nowInput, now);
       const at = new Date(atMs).toISOString();
       const agentId = String(agent?.id ?? agent?.agentId ?? spec?.agentId ?? '');
+      // Per-tier cadence: a bot's tier timeframe overrides the global data timeframe so bar
+      // windows and hold rules are evaluated on the cadence the operator assigned to it.
+      const timeframe = runTimeframe ?? defaultTimeframe;
       /** @type {{agentId:string, actions:Array<object>, orders:Array<object>, denied:Array<object>, spentUsd:number}} */
       const result = { agentId, actions: [], orders: [], denied: [], spentUsd: 0 };
 
@@ -793,6 +796,16 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       // =========================================================================
       // 2) ENTRIES (long-only, one order per symbol per cycle)
       // =========================================================================
+      // Risk-only passes (non-due swing bots with open positions) stop here: exits above are
+      // evaluated every cycle for safety, but no new position is opened outside the bot's cadence.
+      if (riskOnly) {
+        result.actions.push({
+          type: 'risk_only',
+          symbol: String(spec.symbol ?? '').toUpperCase(),
+          reason: 'exit_pass_only',
+        });
+        return result;
+      }
       const symbol = String(spec.symbol ?? '').toUpperCase();
       if (positions.has(symbol)) {
         // Already handled by the exit pass; nothing to do without a new signal.
@@ -879,7 +892,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         minOrderNotionalUsd,
         maxOrderNotionalUsd: hardMaxNotionalUsd,
         maxOrderPctOfEquity,
-        timeframe,
+        timeframe: defaultTimeframe,
         readsAccountEquity: false,
         research: {
           enabled: researchConfig.enabled === true,

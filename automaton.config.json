@@ -37,6 +37,16 @@
     "maxHypothesesPerCycle": 40,
     "maxProofAgeDays": 7
   },
+  "cadence": {
+    "day": {
+      "intervalSec": 60,
+      "timeframe": "1Min"
+    },
+    "swing": {
+      "intervalSec": 3600,
+      "timeframe": "1Hour"
+    }
+  },
   "research": {
     "enabled": true,
     "influence": true,
@@ -59,6 +69,8 @@
   "engine": {
     "autoStart": false,
     "traceLimit": 2000,
-    "seed": 7
+    "seed": 7,
+    "tradingHoursOnly": true,
+    "offHoursIntervalSec": 300
   }
 }

@@ -391,3 +391,124 @@ describe('fast intraday profile (minute monitoring)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// tiered execution cadence + trading-hours gate
+// ---------------------------------------------------------------------------
+
+describe('tiered cadence (day every minute, swing every hour) and trading-hours gate', () => {
+  it('validates cadence overrides', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-cadencecfg-'));
+    try {
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: { cadence: { day: { intervalSec: 60, timeframe: '1Min' }, swing: { intervalSec: 3600, timeframe: '1Hour' } } },
+      }).config;
+      assert.equal(config.cadence.day.intervalSec, 60);
+      assert.throws(
+        () => loadConfig({ configFile: path.join(dir, 'missing.config.json'), envFile: path.join(dir, 'missing.env'), overrides: { cadence: { day: { intervalSec: 60, timeframe: 'nope' }, swing: { intervalSec: 3600, timeframe: '1Hour' } } } }),
+        /cadence\.day\.timeframe/,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs day bots every cycle and swing bots only when their hour is due', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-cadence-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-29T14:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 2, cap: 5 },
+          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120 },
+          cadence: { day: { intervalSec: 60, timeframe: '1Min' }, swing: { intervalSec: 3600, timeframe: '1Hour' } },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+        },
+      }).config;
+      const broker = createSimBroker(config, { seed: 5, accountEquityUsd: 100000 });
+      const automaton = await createAutomaton({ config, broker, clock });
+      await automaton.init();
+      const status0 = await automaton.status();
+      assert.equal(status0.agents.length, 2);
+      const tiers = status0.agents.map((agent) => agent.tier).sort();
+      assert.deepEqual(tiers, ['day', 'swing'], 'genesis splits agents across the two cadence tiers');
+      const dayAgent = status0.agents.find((agent) => agent.tier === 'day');
+      const swingAgent = status0.agents.find((agent) => agent.tier === 'swing');
+      assert.equal(dayAgent.cadence.intervalSec, 60);
+      assert.equal(dayAgent.cadence.timeframe, '1Min');
+      assert.equal(swingAgent.cadence.intervalSec, 3600);
+      assert.equal(swingAgent.cadence.timeframe, '1Hour');
+
+      // First cycle: both tiers due (cold start).
+      const first = await automaton.tick();
+      const firstExec = first.executions.filter((entry) => entry.tier);
+      assert.equal(firstExec.length, 2);
+      assert.equal(firstExec.some((entry) => entry.skipped === 'cadence_wait'), false);
+
+      // +60 s: the day bot is due again, the swing bot is skipped with cadence_wait.
+      clock.advance(60_000);
+      const second = await automaton.tick();
+      const daySecond = second.executions.find((entry) => entry.agentId === dayAgent.id);
+      const swingSecond = second.executions.find((entry) => entry.agentId === swingAgent.id);
+      assert.ok(daySecond && daySecond.skipped !== 'cadence_wait', 'day bot must be analysed every minute');
+      assert.equal(swingSecond?.skipped, 'cadence_wait', 'swing bot must wait between hourly decisions');
+      assert.ok(Number(swingSecond.nextInSec) > 0);
+
+      // +1 h total: the swing bot is due again.
+      clock.advance(3_540_000);
+      const third = await automaton.tick();
+      const swingThird = third.executions.find((entry) => entry.agentId === swingAgent.id);
+      assert.ok(swingThird && swingThird.skipped !== 'cadence_wait', 'swing bot must run on its hourly cadence');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips market-data/execution entirely while the market is closed when tradingHoursOnly is set', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-closed-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-29T22:00:00Z')); // 18:00 ET, closed
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 2, cap: 5 },
+          engine: { tradingHoursOnly: true, offHoursIntervalSec: 300 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+        },
+      }).config;
+      const simBroker = createSimBroker(config, { seed: 9, accountEquityUsd: 100000 });
+      const closedBroker = Object.create(simBroker);
+      closedBroker.getClock = async () => ({ isOpen: false, nextOpen: clock.now() + 3_600_000, nextClose: clock.now() + 7_200_000 });
+      const automaton = await createAutomaton({ config, broker: closedBroker, clock });
+      await automaton.init();
+      const snapshot = await automaton.status();
+      const agentId = snapshot.agents[0].id;
+      const costsBefore = automaton._internals.ledger.snapshot(agentId).costsUsd;
+      const trace = await automaton.tick();
+      assert.equal(trace.marketOpen, false);
+      assert.equal(trace.marketClosed, true);
+      assert.equal(trace.tradingSkipped, true);
+      assert.equal(trace.market.skipped, true);
+      assert.equal((trace.executions ?? []).length, 0, 'no bot is analysed while the market is closed');
+      const costsAfter = automaton._internals.ledger.snapshot(agentId).costsUsd;
+      assert.equal(costsAfter, costsBefore, 'no per-cycle charges outside trading hours');
+      const status = await automaton.status();
+      assert.equal(status.engine.tradingHoursOnly, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

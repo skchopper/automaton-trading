@@ -276,6 +276,40 @@ What this means in practice:
   reconciliation); at 60 s this is well under Alpaca's 200 requests/minute, but do not add more
   symbols/population without checking it.
 
+## 8b. Tiered cadence and trading-hours-only monitoring
+
+The running paper profile now separates **when each bot is analysed** from how often prices refresh:
+
+```json
+"cycleIntervalSec": 60,
+"cadence": {
+  "day":   { "intervalSec": 60,   "timeframe": "1Min"  },
+  "swing": { "intervalSec": 3600, "timeframe": "1Hour" }
+},
+"engine": { "tradingHoursOnly": true, "offHoursIntervalSec": 300 }
+```
+
+- **Price monitoring only during trading hours.** The engine reads the broker clock every cycle.
+  When `engine.tradingHoursOnly` is true and the market is closed, the loop runs a *cheap
+  maintenance pass*: no market-data fetch, no prospector/builder/executor, no per-cycle charges —
+  only the research sidecar (so pre-open/post-close briefings still fire) and a status snapshot.
+  It then sleeps `offHoursIntervalSec` (default 300 s) instead of the trading cycle. Orders were
+  already blocked outside the session window by brake D3; this change also stops paying for data
+  and metabolism while nothing can trade.
+- **Two execution tiers.** Genesis assigns alternating `tier: "day"` / `"swing"` to the population;
+  children inherit their parent's tier (the birth mutation never changes the cadence class).
+  Each cycle, a bot is **fully analysed** (prospector spec + entries + exits) only when its tier's
+  `intervalSec` is due: day bots every minute on the 1-minute bar lane, swing bots every hour on the
+  1-hour bar lane. Non-due swing bots **with an open position** still get an **exit-only risk pass**
+  every cycle (stop/target/max-hold/research-ALERT), so a mid/long-term position is never left
+  unwatched between hourly decisions; no new position is opened outside the bot's cadence.
+- **Dashboard**: each agent row now includes `tier` and `cadence {intervalSec, timeframe,
+  lastAnalysisAt, nextAnalysisAt}`; its plan/exits state the bar duration of its own timeframe.
+- **Tuning**: set `cadence.day/second/timeframe` as needed (validated allow-lists). To restore the
+  old single-cadence behaviour, remove the `cadence` block (both tiers then evaluate every cycle);
+  set `engine.tradingHoursOnly: false` to keep analysing 24/7 again. Restart the Host after config
+  changes (engine modules load on boot).
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

@@ -107,6 +107,31 @@ function pricesFromBars(bars) {
   return prices;
 }
 
+/**
+ * Resolve the per-tier execution cadence. With `cadence: null` (the default) both tiers fall back
+ * to the legacy single cadence (`cycleIntervalSec` + `data.timeframe`) so existing tests and CLI
+ * runs keep evaluating every agent every cycle. A configured cadence gives 'day' bots an intraday
+ * lane and 'swing' bots a slower mid/long-term lane.
+ */
+function resolveExecutionCadence(config) {
+  const legacy = {
+    intervalSec: Math.max(5, Number(config.cycleIntervalSec) || 300),
+    timeframe: config.data?.timeframe ?? '1Hour',
+  };
+  const cadence = config.cadence && typeof config.cadence === 'object' ? config.cadence : null;
+  if (!cadence) return { day: { ...legacy }, swing: { ...legacy } };
+  return {
+    day: {
+      intervalSec: Math.max(5, Number(cadence.day?.intervalSec) || legacy.intervalSec),
+      timeframe: cadence.day?.timeframe ?? legacy.timeframe,
+    },
+    swing: {
+      intervalSec: Math.max(5, Number(cadence.swing?.intervalSec) || 3600),
+      timeframe: cadence.swing?.timeframe ?? legacy.timeframe,
+    },
+  };
+}
+
 /** Quotes for the executor: real bid/ask when the broker has them, otherwise a tight synthetic spread. */
 async function readQuotes(broker, symbols, prices, feed) {
   const quotes = {};
@@ -186,6 +211,9 @@ export async function createAutomaton(options = {}) {
     specs: new Map(),
     condemned: new Set(),
     inProcessReaper: null,
+    // Per-agent last FULL analysis time (ms) for the two execution tiers. In-memory only: after a
+    // restart every bot is analysed once immediately, which is the safe behaviour.
+    lastAnalysisAt: new Map(),
     dayStats: { dayKey: null, agents: {} },
     timer: null,
   };
@@ -381,6 +409,10 @@ export async function createAutomaton(options = {}) {
         genome,
         mutation: null,
         specId: null,
+        // Split the genesis population across the two execution tiers (docs/CONTROL-PANEL.md):
+        // 'day' bots are evaluated on the intraday cadence (default 1 min), 'swing' bots on the
+        // mid/long-term cadence (default 1 h). Children inherit their parent's tier.
+        tier: i % 2 === 0 ? 'day' : 'swing',
         notes: ['genesis'],
       });
       await ledger.ensureAgent(agent.id, { endowmentUsd: config.endowmentUsd, at: clock.now() });
@@ -418,6 +450,28 @@ export async function createAutomaton(options = {}) {
     }
   }
 
+  /**
+   * Backfill the execution tier for agents created before tiers existed (e.g. a running
+   * population upgraded in place): alternate day/swing deterministically by registry order.
+   */
+  async function backfillAgentTiers() {
+    const agents = registry.alive().filter((agent) => !agent.tier);
+    if (agents.length === 0) return;
+    let changed = 0;
+    for (const [index, agent] of agents.entries()) {
+      try {
+        await registry.update(agent.id, { tier: index % 2 === 0 ? 'day' : 'swing' });
+        changed += 1;
+      } catch {
+        /* dead/immutable records keep their default tier */
+      }
+    }
+    if (changed > 0) {
+      await registry.save();
+      log.info('agent tiers backfilled', { count: changed });
+    }
+  }
+
   async function init() {
     if (state.initialized) return;
     await ensureDir(paths.stateDir);
@@ -441,6 +495,7 @@ export async function createAutomaton(options = {}) {
     const account = await broker.getAccount();
     await seedGenesis(Number(account?.equityUsd) || 0);
     await backfillAgentNames();
+    await backfillAgentTiers();
     state.initialized = true;
     const snapshot = await buildSnapshot({ account, treasury: null, halted: false, haltReasons: [] });
     await writeStateFile(snapshot);
@@ -454,6 +509,38 @@ export async function createAutomaton(options = {}) {
   // -------------------------------------------------------------------------
   // the cycle
   // -------------------------------------------------------------------------
+
+  /**
+   * Run the isolated research sidecar for one cycle (cheap; also used by the off-hours
+   * maintenance pass so pre-open/post-close briefings still fire when trading is paused).
+   */
+  async function runResearchPhase(trace, marketClock, halted = false) {
+    if (halted) return;
+    try {
+      const researchRun = await researcher.tick({ marketClock });
+      trace.research = {
+        enabled: researchRun.enabled,
+        configured: researchRun.configured,
+        due: researchRun.due,
+        ran: researchRun.ran.length,
+        deferred: researchRun.deferred ?? 0,
+        skipped: researchRun.skipped,
+        errors: researchRun.ran.filter((entry) => entry.error).length,
+        budgetUsd: round4(researchRun.ran.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
+      };
+      if (!researchRun.enabled || !researchRun.configured) {
+        trace.research.note = !researchRun.enabled ? 'disabled by config' : 'no LLM generator configured';
+      }
+      if (researchRun.paused) {
+        trace.research.paused = true;
+        trace.research.pausedUntil = researchRun.pausedUntil ?? null;
+        trace.research.note = researchRun.note ?? 'paused after provider error';
+      }
+      if ((researchRun.ran ?? []).some((entry) => entry.costUsd > 0)) await ledger.save();
+    } catch (error) {
+      trace.errors.push({ role: 'research', ...errorInfo(error) });
+    }
+  }
 
   async function tick() {
     if (state.ticking) return state.lastTrace ?? { skipped: 'tick_in_progress' };
@@ -525,23 +612,62 @@ export async function createAutomaton(options = {}) {
         // marketOpen=false and deny every order with D3.
         trace.marketClosed = true;
       }
+      const tradingHoursOnly = config.engine?.tradingHoursOnly === true;
+      if (tradingHoursOnly && marketOpen === false) {
+        // Off-hours maintenance pass (docs/RUNBOOK §8b): no market-data fetch, no per-cycle
+        // charges, no prospector/builder/executor/replication — only the research sidecar
+        // (so pre-open/post-close briefings still fire) and a status snapshot. This keeps the
+        // price-monitoring loop inside trading hours while the engine stays warm.
+        trace.tradingSkipped = true;
+        trace.market = { symbols: 0, bars: 0, quotes: 0, skipped: true };
+        await runResearchPhase(trace, marketClock, false);
+        state.lastTickAt = new Date(clock.now()).toISOString();
+        state.lastTrace = trace;
+        state.lastError = null;
+        let account = null;
+        try {
+          account = await broker.getAccount?.();
+        } catch {
+          account = null;
+        }
+        const snapshot = await buildSnapshot({
+          account,
+          treasury: state.lastTreasury,
+          halted: false,
+          haltReasons: [],
+        });
+        await writeStateFile(snapshot);
+        trace.durationMs = clock.now() - startedAt;
+        await appendTrace(trace);
+        return trace;
+      }
       // In sim mode the synthetic market only moves when advanced, so each cycle is a
       // new bar — otherwise every cycle would see identical signals and never trade.
       if (config.mode === 'sim' && typeof broker.advanceBar === 'function') {
         broker.advanceBar(1);
       }
-      const bars = await broker.getBars({
-        symbols: config.symbols,
-        timeframe: config.data.timeframe,
-        feed: config.data.feed ?? 'iex',
-        limit: Math.min(Number(config.data.lookbackBars) || 60, 500),
-      });
+      // One bars fetch per timeframe lane (day/swing); identical timeframes share one fetch.
+      const cadence = resolveExecutionCadence(config);
+      const laneTimeframes = [...new Set([cadence.day.timeframe, cadence.swing.timeframe, config.data.timeframe])];
+      const barsByTimeframe = new Map();
+      for (const laneTimeframe of laneTimeframes) {
+        // eslint-disable-next-line no-await-in-loop
+        const laneBars = await broker.getBars({
+          symbols: config.symbols,
+          timeframe: laneTimeframe,
+          feed: config.data.feed ?? 'iex',
+          limit: Math.min(Number(config.data.lookbackBars) || 60, 500),
+        });
+        barsByTimeframe.set(laneTimeframe, laneBars ?? {});
+      }
+      const bars = barsByTimeframe.get(config.data.timeframe) ?? barsByTimeframe.get(cadence.day.timeframe) ?? {};
       const prices = pricesFromBars(bars);
       const quotes = await readQuotes(broker, config.symbols, prices, config.data.feed ?? 'iex');
       trace.market = {
         symbols: Object.keys(prices).length,
         bars: Object.values(bars ?? {}).reduce((n, series) => n + (Array.isArray(series) ? series.length : 0), 0),
         quotes: Object.keys(quotes).length,
+        cadence: { day: cadence.day, swing: cadence.swing },
       };
       state.lastPrices = prices;
       state.lastQuotes = quotes;
@@ -635,9 +761,15 @@ export async function createAutomaton(options = {}) {
         }
       }
 
-      // 5. BUILDER + EXECUTOR per living agent, inside the Treasurer mandate
+      // 5. BUILDER + EXECUTOR per living agent, inside the Treasurer mandate.
+      //    Each bot belongs to an execution tier (docs/RUNBOOK §8b):
+      //      day   — full analysis on the intraday cadence (default every 60 s)
+      //      swing — full analysis on the mid/long-term cadence (default every hour)
+      //    Non-due swing bots with an open position still get an exit-only risk pass every cycle,
+      //    so stops/targets/research ALERT are honoured even between their hourly decisions.
       const agentViews = new Map((treasuryView.agentViews ?? []).map((view) => [view.agentId, view]));
       const usedPairs = new Set();
+      const cadenceNowMs = clock.now();
       for (const agent of registry.alive()) {
         if (state.condemned.has(agent.id)) continue;
         const mandate = treasuryView.mandates?.[agent.id];
@@ -645,23 +777,60 @@ export async function createAutomaton(options = {}) {
         if (!mandate || !view) continue;
         if (treasuryView.halted && !mandate.allowExitOnly) continue;
 
-        const built = await ensureSpec(agent, hypotheses, treasuryView.cycleBudgetUsd, usedPairs);
-        if (!built) {
-          trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_hypothesis' });
+        const tier = agent.tier === 'swing' ? 'swing' : 'day';
+        const tierCadence = cadence[tier];
+        // When no cadence block is configured the legacy behaviour is preserved: every agent is
+        // analysed every cycle (tests/CLI/sim compatibility). Tier scheduling activates only with
+        // an explicit `cadence` config (the running paper profile sets one).
+        const cadenceConfigured = Boolean(config.cadence);
+        const lastAnalysisMs = state.lastAnalysisAt.get(agent.id) ?? 0;
+        const due = !cadenceConfigured
+          || lastAnalysisMs === 0
+          || cadenceNowMs - lastAnalysisMs >= tierCadence.intervalSec * 1000;
+        const agentBook = ledger.snapshot(agent.id);
+        const hasPosition = Object.keys(agentBook?.positions ?? {}).length > 0;
+        if (!due && !hasPosition) {
+          trace.executions.push({
+            agentId: agent.id,
+            tier,
+            skipped: 'cadence_wait',
+            nextInSec: Math.max(1, Math.ceil((tierCadence.intervalSec * 1000 - (cadenceNowMs - lastAnalysisMs)) / 1000)),
+            detail: [{ type: 'cadence_wait' }],
+          });
           continue;
         }
-        if (built.__compileError) {
-          trace.builds.push({ agentId: agent.id, specId: null, error: built.__compileError.code, hypothesisId: built.hypothesisId });
-          continue;
+        const riskOnly = !due && hasPosition;
+
+        let spec = null;
+        let built = null;
+        if (due) {
+          built = await ensureSpec(agent, hypotheses, treasuryView.cycleBudgetUsd, usedPairs);
+          if (!built) {
+            trace.builds.push({ agentId: agent.id, specId: null, skipped: 'no_hypothesis' });
+            continue;
+          }
+          if (built.__compileError) {
+            trace.builds.push({ agentId: agent.id, specId: null, error: built.__compileError.code, hypothesisId: built.hypothesisId });
+            continue;
+          }
+          spec = built.spec;
+        } else {
+          // Risk-only pass: reuse the spec that opened the position (never mid-position rebuild).
+          spec = agent.specId ? state.specs.get(agent.specId) ?? null : null;
+          if (!spec) {
+            trace.executions.push({ agentId: agent.id, tier, skipped: 'no_spec_risk_pass', detail: [{ type: 'cadence_wait' }] });
+            continue;
+          }
         }
-        const spec = built.spec;
 
         trace.builds.push({
           agentId: agent.id,
           specId: spec.specId,
           symbol: spec.symbol,
           family: spec.family,
-          compiled: !built.cached,
+          compiled: built ? !built.cached : false,
+          tier,
+          riskOnly,
         });
         try {
           const result = await executor.run({
@@ -669,9 +838,11 @@ export async function createAutomaton(options = {}) {
             spec,
             mandate,
             quotes,
-            // One market read per cycle for the whole population: with 30 agents, letting
-            // the executor refetch per agent would multiply data calls by 30.
-            bars,
+            // One market read per cycle per timeframe lane: the whole population shares it.
+            // Each cadence tier evaluates bar-based rules on its own timeframe lane.
+            bars: barsByTimeframe.get(tierCadence.timeframe) ?? bars,
+            timeframe: tierCadence.timeframe,
+            riskOnly,
             dayStats: dayStats[agent.id],
             now: startedAt,
             marketOpen,
@@ -680,9 +851,12 @@ export async function createAutomaton(options = {}) {
             // veto entries, scale size or force an exit — it can never place orders itself.
             research: researcher.latest(agent.id),
           });
+          if (due) state.lastAnalysisAt.set(agent.id, cadenceNowMs);
           trace.executions.push({
             agentId: agent.id,
             specId: spec.specId,
+            tier,
+            riskOnly,
             actions: result?.actions?.length ?? 0,
             orders: result?.orders?.length ?? 0,
             denied: result?.denied?.length ?? 0,
@@ -785,27 +959,7 @@ export async function createAutomaton(options = {}) {
       // fresh for maxAgeSec = 2 h, so a 5-minute lag is irrelevant for hourly news).
       // It never trades, never reads another agent's book, and each briefing is paid for by
       // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
-      if (!treasuryView.halted) {
-        try {
-          const researchRun = await researcher.tick({ marketClock });
-          trace.research = {
-            enabled: researchRun.enabled,
-            configured: researchRun.configured,
-            due: researchRun.due,
-            ran: researchRun.ran.length,
-            deferred: researchRun.deferred ?? 0,
-            skipped: researchRun.skipped,
-            errors: researchRun.ran.filter((entry) => entry.error).length,
-            budgetUsd: round4(researchRun.ran.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
-          };
-          if (!researchRun.enabled || !researchRun.configured) {
-            trace.research.note = !researchRun.enabled ? 'disabled by config' : 'no LLM generator configured';
-          }
-          if ((researchRun.ran ?? []).some((entry) => entry.costUsd > 0)) await ledger.save();
-        } catch (error) {
-          trace.errors.push({ role: 'research', ...errorInfo(error) });
-        }
-      }
+      await runResearchPhase(trace, marketClock, treasuryView.halted);
 
       // 8. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
       if (treasuryView.mayReplicate && !treasuryView.halted) {
@@ -876,6 +1030,9 @@ export async function createAutomaton(options = {}) {
     const dead = registry.dead();
     const views = new Map((treasury?.agentViews ?? []).map((view) => [view.agentId, view]));
     const marks = state.lastPrices && typeof state.lastPrices === 'object' ? state.lastPrices : {};
+    // Execution cadence for the two tiers (dashboard: per-agent timeframe/cadence/next analysis).
+    const cadence = resolveExecutionCadence(config);
+    const snapshotNowMs = clock.now();
 
     // Period leaderboards + rewards view for the control panel (bookkeeping only).
     const equityByAgent = {};
@@ -1032,6 +1189,20 @@ export async function createAutomaton(options = {}) {
           weekPct: rankingMaps.weekly.get(agent.id)?.pnlPct ?? null,
           monthPct: rankingMaps.monthly.get(agent.id)?.pnlPct ?? null,
         },
+        // Execution tier + cadence (day = intraday lane, swing = mid/long-term lane).
+        tier: (agent.tier === 'swing' ? 'swing' : 'day'),
+        cadence: (() => {
+          const resolvedTier = agent.tier === 'swing' ? 'swing' : 'day';
+          const tierCadence = cadence[resolvedTier];
+          const lastMs = state.lastAnalysisAt.get(agent.id) ?? 0;
+          const nextMs = lastMs > 0 ? lastMs + tierCadence.intervalSec * 1000 : snapshotNowMs;
+          return {
+            intervalSec: tierCadence.intervalSec,
+            timeframe: tierCadence.timeframe,
+            lastAnalysisAt: lastMs > 0 ? new Date(lastMs).toISOString() : null,
+            nextAnalysisAt: new Date(nextMs).toISOString(),
+          };
+        })(),
         // Strategy explanation + current plan/next step for the detail page.
         plan: explainAgentPlan({
           agent,
@@ -1041,7 +1212,7 @@ export async function createAutomaton(options = {}) {
           nowMs: asOfMs,
           research: researcher.latestAny(agent.id),
           nextResearchAt: typeof researcher.nextFor === 'function' ? researcher.nextFor(agent.id) : null,
-          timeframe: config.data?.timeframe ?? '1Hour',
+          timeframe: (agent.tier === 'swing' ? cadence.swing : cadence.day).timeframe,
         }),
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };
@@ -1066,6 +1237,9 @@ export async function createAutomaton(options = {}) {
           },
         },
         rewards: rewardsView,
+        cadence,
+        tradingHoursOnly: config.engine?.tradingHoursOnly === true,
+        offHoursIntervalSec: Number(config.engine?.offHoursIntervalSec) || 300,
       },
       account: account ?? null,
       treasury: treasury
@@ -1145,16 +1319,22 @@ export async function createAutomaton(options = {}) {
     if (state.running) return status();
     await init();
     state.running = true;
-    const intervalMs = Math.max(1000, Number(config.cycleIntervalSec) * 1000);
+    const cycleMs = Math.max(1000, Number(config.cycleIntervalSec) * 1000);
+    const offHoursMs = Math.max(30, Number(config.engine?.offHoursIntervalSec) || 300) * 1000;
+    const tradingHoursOnly = config.engine?.tradingHoursOnly === true;
     const loop = async () => {
       if (!state.running) return;
+      let delayMs = cycleMs;
       try {
-        await tick();
+        const trace = await tick();
+        // Outside trading hours the loop only runs the cheap maintenance pass, so it can
+        // sleep longer; inside a tiered profile it still wakes every cycle for the day tier.
+        if (tradingHoursOnly && trace && trace.marketOpen === false) delayMs = offHoursMs;
       } catch (error) {
         log.error('loop tick failed', errorInfo(error));
       }
       if (state.running) {
-        state.timer = setTimeout(loop, intervalMs);
+        state.timer = setTimeout(loop, delayMs);
         if (typeof state.timer.unref === 'function') state.timer.unref();
       }
     };

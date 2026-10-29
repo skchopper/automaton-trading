@@ -10,6 +10,32 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v2.2.0 (unreleased) — trading-hours-only monitoring + two execution tiers
+
+- **Price monitoring now runs only during trading hours.** `engine.tradingHoursOnly: true` makes the
+  loop read the broker clock every cycle; outside RTH it runs a cheap maintenance pass (no market
+  data, no prospector/builder/executor, no per-cycle charges) and only the research sidecar + status
+  snapshot, then sleeps `engine.offHoursIntervalSec` (default 300 s) instead of the 60 s trading
+  tick. Orders were already blocked off-hours by brake D3; this also stops paying data/metabolism
+  costs while nothing can trade.
+- **Two per-bot execution tiers.** Genesis assigns alternating `tier: day|swing`; children inherit
+  their parent's tier (never mutated by a birth). `cadence.day` (default every 60 s on 1-minute
+  bars) fully analyses/trades day-trading bots; `cadence.swing` (default every 3600 s on 1-hour
+  bars) runs mid/long-term bots. Each tier evaluates bar-based rules on its own timeframe lane.
+- **Safety between swing decisions:** a non-due swing bot that holds a position still gets an
+  **exit-only risk pass** every cycle (stop/target/max-hold/research-ALERT), so positions are never
+  left unmanaged for an hour; it cannot open new positions outside its cadence.
+- **Config/status:** new `cadence` block + `engine.tradingHoursOnly/offHoursIntervalSec`
+  validation; status adds per-agent `tier` and `cadence {intervalSec, timeframe, lastAnalysisAt,
+  nextAnalysisAt}` plus `engine.cadence/tradingHoursOnly`. Existing agents are backfilled
+  alternating tiers on first start; removing the `cadence` block restores legacy single-cadence
+  behaviour.
+- Tests: `control` +3 (cadence config validation, day-vs-swing scheduling with cold start/hour
+  boundary, closed-market maintenance pass asserting no executions and no cycle charges) →
+  **227 tests across 8 suites**.
+- Docs: `docs/RUNBOOK.md` §8b (tiered cadence + trading-hours gate, tuning and revert), README.
+- Upgrade: restart the Harness app so the engine reloads config; press Start (auto-start off).
+
 ## v2.1.0 (unreleased) — fast intraday profile (minute monitoring)
 
 - **1-minute decision loop for the paper population:** `cycleIntervalSec: 60`, `data.timeframe: "1Min"`,

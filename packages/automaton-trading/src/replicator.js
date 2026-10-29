@@ -224,6 +224,9 @@ export function createReplicator({ treasurer, registry, ledger, journal, config,
       genome: childGenome,
       mutation,
       specId: null,
+      // The child inherits the parent's execution tier; the one mutation is always a strategy
+      // genome field — the trading cadence class never changes in a birth.
+      tier: parent.tier === 'swing' ? 'swing' : parent.tier === 'day' ? 'day' : null,
       lastCycleAt: null,
       notes: lessons.slice(0, 8),
     });
