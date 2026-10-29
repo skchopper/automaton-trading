@@ -157,6 +157,25 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Duration of one market-data bar in milliseconds for an Alpaca timeframe string
+ * ("1Min", "5Min", "1Hour", "1Day", ...). Used where strategy rules are expressed in BARS
+ * (e.g. `maxHoldBars`) so the same spec behaves correctly on any timeframe.
+ */
+export function timeframeToMs(timeframe) {
+  const match = /^(\d+)(Min|Hour|Day|Week|Month)$/.exec(String(timeframe ?? '').trim());
+  if (!match) return 60 * 60 * 1000;
+  const count = Math.max(1, Number(match[1]));
+  const unitMs = {
+    Min: 60 * 1000,
+    Hour: 60 * 60 * 1000,
+    Day: 24 * 60 * 60 * 1000,
+    Week: 7 * 24 * 60 * 60 * 1000,
+    Month: 30 * 24 * 60 * 60 * 1000,
+  };
+  return count * (unitMs[match[2]] ?? 60 * 60 * 1000);
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem: atomic writes, JSON, JSONL
 // ---------------------------------------------------------------------------

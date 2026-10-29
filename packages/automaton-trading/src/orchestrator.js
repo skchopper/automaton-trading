@@ -108,13 +108,13 @@ function pricesFromBars(bars) {
 }
 
 /** Quotes for the executor: real bid/ask when the broker has them, otherwise a tight synthetic spread. */
-async function readQuotes(broker, symbols, prices) {
+async function readQuotes(broker, symbols, prices, feed) {
   const quotes = {};
   await Promise.all(
     symbols.map(async (symbol) => {
       const last = prices[symbol];
       try {
-        const quote = await broker.getLatestQuote(symbol);
+        const quote = await broker.getLatestQuote(symbol, feed ? { feed } : undefined);
         if (quote && Number.isFinite(Number(quote.ask)) && Number.isFinite(Number(quote.bid)) && Number(quote.ask) > 0) {
           quotes[symbol] = {
             bid: round2(Number(quote.bid)),
@@ -533,10 +533,11 @@ export async function createAutomaton(options = {}) {
       const bars = await broker.getBars({
         symbols: config.symbols,
         timeframe: config.data.timeframe,
+        feed: config.data.feed ?? 'iex',
         limit: Math.min(Number(config.data.lookbackBars) || 60, 500),
       });
       const prices = pricesFromBars(bars);
-      const quotes = await readQuotes(broker, config.symbols, prices);
+      const quotes = await readQuotes(broker, config.symbols, prices, config.data.feed ?? 'iex');
       trace.market = {
         symbols: Object.keys(prices).length,
         bars: Object.values(bars ?? {}).reduce((n, series) => n + (Array.isArray(series) ? series.length : 0), 0),
@@ -1040,6 +1041,7 @@ export async function createAutomaton(options = {}) {
           nowMs: asOfMs,
           research: researcher.latestAny(agent.id),
           nextResearchAt: typeof researcher.nextFor === 'function' ? researcher.nextFor(agent.id) : null,
+          timeframe: config.data?.timeframe ?? '1Hour',
         }),
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };

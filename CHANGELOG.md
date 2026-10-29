@@ -10,6 +10,24 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v2.1.0 (unreleased) — fast intraday profile (minute monitoring)
+
+- **1-minute decision loop for the paper population:** `cycleIntervalSec: 60`, `data.timeframe: "1Min"`,
+  `data.feed: "iex"`, `lookbackBars: 120`, `risk.maxDailyOrders: 12`. The engine now re-prices the whole
+  population every minute during the session instead of every 5 minutes.
+- **Hold rules are timeframe-correct:** `maxHoldBars` is measured in bars of the configured timeframe
+  (1-minute bars = minutes), so a 12-bar time stop is 12 minutes on the fast profile. The dashboard agent
+  plan states the bar duration; the previous code always treated a bar as one hour.
+- **Data feed is configurable and validated:** `data.feed` is `iex` (real-time during RTH, free) or
+  `sip` (consolidated, 15-min delayed on the free plan); `data.timeframe` is allow-listed. Bars and
+  quotes for the orchestrator, executor and prospector all use the configured feed.
+- **Trade-offs documented in `docs/RUNBOOK.md` §8a:** IEX is a single venue and sparse outside regular
+  hours; minute bars are noisier for strategy specs originally compiled on hourly data; cycle costs
+  scale ~5x with the faster loop; the free plan cannot provide true real-time SIP reaction. Revert to
+  `1Hour` + `300` for the previous cadence.
+- Tests: `control` suite +4 (timeframe→bar math, config allow-list, timeframe-aware hold/plan, 1-minute
+  profile boot) → **224 tests across 8 suites**.
+
 ## v2.0.0 — 2026-10-29
 
 First public release after the initial code upload. Renamed the project, app and plugin to

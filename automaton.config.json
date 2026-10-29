@@ -1,5 +1,6 @@
 {
   "mode": "paper",
+  "cycleIntervalSec": 60,
   "population": {
     "initial": 30,
     "cap": 60
@@ -23,14 +24,15 @@
     "maxPositionPct": 0.5,
     "maxOpenPositions": 2,
     "maxSpreadBps": 100,
-    "maxDailyOrders": 6,
+    "maxDailyOrders": 12,
     "maxDailyLossPct": 0.2,
     "maxOrderPctOfEquity": 0.5,
     "maxOrderNotionalUsd": 20,
     "minOrderNotionalUsd": 1
   },
   "data": {
-    "timeframe": "1Hour",
+    "timeframe": "1Min",
+    "feed": "iex",
     "lookbackBars": 120,
     "maxHypothesesPerCycle": 40,
     "maxProofAgeDays": 7

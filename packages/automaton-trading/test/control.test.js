@@ -14,6 +14,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { loadConfig, statePaths } from '../src/config.js';
+import { timeframeToMs } from '../src/util.js';
+import { explainAgentPlan } from '../src/strategy-explain.js';
 import { createBroker as createSimBroker } from '../src/broker-sim.js';
 import { createAutomaton } from '../src/orchestrator.js';
 import { createResearcher } from '../src/research.js';
@@ -301,5 +303,91 @@ describe('control-panel status + leaderboards + rewards payouts', () => {
     const status = await automaton.status();
     assert.equal(status.engine.rewards.period, 'weekly');
     assert.deepEqual(status.engine.rewards.rankPercents, [0.02, 0.01, 0.005]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fast intraday profile / minute monitoring
+// ---------------------------------------------------------------------------
+
+describe('fast intraday profile (minute monitoring)', () => {
+  it('maps Alpaca timeframe strings to bar durations', () => {
+    assert.equal(timeframeToMs('1Min'), 60_000);
+    assert.equal(timeframeToMs('5Min'), 5 * 60_000);
+    assert.equal(timeframeToMs('15Min'), 15 * 60_000);
+    assert.equal(timeframeToMs('1Hour'), 60 * 60_000);
+    assert.equal(timeframeToMs('garbage'), 60 * 60_000, 'unknown timeframe falls back to 1 hour');
+  });
+
+  it('rejects unsupported data timeframe / feed values', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-fastcfg-'));
+    try {
+      assert.throws(
+        () => loadConfig({ configFile: path.join(dir, 'missing.config.json'), envFile: path.join(dir, 'missing.env'), overrides: { data: { timeframe: '3Min' } } }),
+        /data\.timeframe/,
+      );
+      assert.throws(
+        () => loadConfig({ configFile: path.join(dir, 'missing.config.json'), envFile: path.join(dir, 'missing.env'), overrides: { data: { feed: 'nasdaq' } } }),
+        /data\.feed/,
+      );
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: { cycleIntervalSec: 60, data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120 } },
+      }).config;
+      assert.equal(config.cycleIntervalSec, 60);
+      assert.equal(config.data.timeframe, '1Min');
+      assert.equal(config.data.feed, 'iex');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('measures held bars with the configured timeframe, not always hours', () => {
+    const openedAt = new Date(Date.parse('2026-10-29T13:30:00Z')).toISOString();
+    const plan = explainAgentPlan({
+      agent: { id: 'atm-fast', name: 'Fast AAPL', genome: { family: 'momentum', symbol: 'AAPL' } },
+      spec: { family: 'momentum', symbol: 'AAPL', params: { entryZ: 1.1, exitZ: 0.4, stopPct: 0.01, targetPct: 0.02, maxHoldBars: 12, sizePct: 0.2 } },
+      book: { positions: { AAPL: { qty: 0.01, avgPriceUsd: 100, openedAt } } },
+      prices: { AAPL: 100.5 },
+      nowMs: Date.parse('2026-10-29T14:00:00Z'), // 30 minutes held
+      timeframe: '5Min',
+    });
+    assert.equal(plan.position.barsHeld, 6, '30 minutes = 6 bars of 5 minutes');
+    assert.ok(plan.exitRules.some((rule) => rule.includes('~5 min each')));
+    assert.ok(plan.exitRules.every((rule) => !rule.includes('(hours)')));
+  });
+
+  it('boots a 1-minute profile and exposes minute-aware plans', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-fastrun-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-29T14:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 2, cap: 5 },
+          data: { timeframe: '1Min', feed: 'iex', lookbackBars: 120 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+        },
+      }).config;
+      const broker = createSimBroker(config, { seed: 3, accountEquityUsd: 100000 });
+      const fast = await createAutomaton({ config, broker, clock });
+      await fast.init();
+      const trace = await fast.tick();
+      assert.equal(trace.errors.filter((entry) => entry.role === 'orchestrator').length, 0);
+      const status = await fast.status();
+      assert.ok(status.agents.length >= 2);
+      for (const agent of status.agents) {
+        assert.ok(agent.plan, 'every agent has a plan in fast mode');
+        assert.ok(agent.plan.exitRules.some((rule) => rule.includes('~1 min each')), 'exit rules must state the 1-minute bar duration');
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

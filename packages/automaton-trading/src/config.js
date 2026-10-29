@@ -76,6 +76,9 @@ export function defaultConfig() {
     },
     data: {
       timeframe: '1Hour',
+      // Market-data feed: 'iex' = IEX real-time (free tier, real-time during RTH);
+      // 'sip' = consolidated SIP (15-min delayed on the free plan).
+      feed: 'iex',
       lookbackBars: 120,
       maxHypothesesPerCycle: 3,
       maxProofAgeDays: 7,
@@ -371,6 +374,14 @@ export function validateConfig(config) {
   assertNumber(data.maxHypothesesPerCycle, 'data.maxHypothesesPerCycle', { min: 1, max: 200 });
   assertNumber(data.maxProofAgeDays, 'data.maxProofAgeDays', { min: 0, max: 365 });
   if (typeof data.timeframe !== 'string' || data.timeframe.length === 0) fail('CONFIG_INVALID', 'data.timeframe is required');
+  const DATA_TIMEFRAMES = ['1Min', '5Min', '15Min', '30Min', '1Hour', '2Hour', '4Hour', '1Day'];
+  if (!DATA_TIMEFRAMES.includes(data.timeframe)) {
+    fail('CONFIG_INVALID', `data.timeframe must be one of ${DATA_TIMEFRAMES.join('|')}`);
+  }
+  const DATA_FEEDS = ['iex', 'sip'];
+  if (!DATA_FEEDS.includes(data.feed ?? 'iex')) {
+    fail('CONFIG_INVALID', `data.feed must be one of ${DATA_FEEDS.join('|')}`);
+  }
 
   const research = config.research;
   if (!research || typeof research !== 'object') fail('CONFIG_INVALID', 'research config object is required');

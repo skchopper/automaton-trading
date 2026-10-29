@@ -27,7 +27,7 @@
  */
 
 import { fail } from './contracts.js';
-import { clamp, HOUR_MS, mean, round2, round4, SYSTEM_CLOCK } from './util.js';
+import { clamp, mean, round2, round4, SYSTEM_CLOCK, timeframeToMs } from './util.js';
 
 const MAX_BARS_FETCH = 240;
 
@@ -563,6 +563,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
             const fetched = await broker.getBars({
               symbols: [ticker],
               timeframe,
+              feed: config.data?.feed ?? 'iex',
               limit: MAX_BARS_FETCH,
             });
             rows = Array.isArray(fetched) ? fetched : fetched?.[ticker];
@@ -746,7 +747,11 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         const bars = await getBars(symbol);
         const signal = computeSignal(spec.family, bars, spec.params);
         const openedAtMs = timestampOf(position.openedAt);
-        const barsHeld = openedAtMs === null ? 0 : Math.floor((atMs - openedAtMs) / HOUR_MS);
+        // `maxHoldBars` is expressed in BARS of the configured data timeframe, so the hold
+        // duration must be measured with that bar length (1Min bars = minutes, 1Hour bars = hours).
+        // Previously this always divided by an hour, which made fast timeframes hold ~60x too long.
+        const barMs = timeframeToMs(timeframe);
+        const barsHeld = openedAtMs === null ? 0 : Math.floor((atMs - openedAtMs) / barMs);
         const stopPrice = position.avgPriceUsd * (1 - (spec.params?.stopPct ?? 0.02));
         const targetPrice = position.avgPriceUsd * (1 + (spec.params?.targetPct ?? 0.04));
         const maxHoldBars = spec.params?.maxHoldBars ?? 12;

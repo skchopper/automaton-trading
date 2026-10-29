@@ -16,7 +16,7 @@
  * }
  */
 
-const HOUR_MS = 60 * 60 * 1000;
+import { timeframeToMs } from './util.js';
 
 const FAMILY_LABELS = {
   momentum: 'Momentum',
@@ -86,9 +86,18 @@ function describeExits(family, rules) {
   else if (family === 'gapfade') exits.push('Signal exit when the close recovers to the previous close.');
   exits.push(`Stop loss at ${pct(rules.stopPct)} below entry.`);
   exits.push(`Take profit at ${pct(rules.targetPct)} above entry.`);
-  exits.push(`Time stop after ${rules.maxHoldBars} bars (hours).`);
+  exits.push(`Time stop after ${rules.maxHoldBars} bars${barDurationLabel(rules.timeframe)}.`);
   exits.push('Research ALERT / very negative sentiment can force an exit before these levels.');
   return exits;
+}
+
+/** " (~5 min each)" suffix for bar-based rules. */
+function barDurationLabel(timeframe) {
+  const ms = timeframeToMs(timeframe ?? '1Hour');
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return ` (~${minutes} min each)`;
+  const hours = Math.round((minutes / 60) * 100) / 100;
+  return ` (~${hours} h each)`;
 }
 
 /**
@@ -98,9 +107,10 @@ function describeExits(family, rules) {
  *   research?: object|null, nextResearchAt?: string|null,
  * }} input
  */
-export function explainAgentPlan({ agent, spec = null, book = null, prices = {}, nowMs, research = null, nextResearchAt = null } = {}) {
+export function explainAgentPlan({ agent, spec = null, book = null, prices = {}, nowMs, research = null, nextResearchAt = null, timeframe = '1Hour' } = {}) {
   if (!agent || typeof agent !== 'object') return null;
   const rules = resolveRules(agent, spec);
+  rules.timeframe = timeframe ?? '1Hour';
   const familyLabel = FAMILY_LABELS[rules.family] ?? rules.family;
   const positions = book?.positions && typeof book.positions === 'object' ? book.positions : {};
   const heldSymbol = Object.keys(positions).find((symbol) => Number(positions[symbol]?.qty) > 0) ?? null;
@@ -117,7 +127,8 @@ export function explainAgentPlan({ agent, spec = null, book = null, prices = {},
         targetPriceUsd: round(position.avgPriceUsd * (1 + rules.targetPct), 4),
         barsHeld: (() => {
           const openedMs = typeof position.openedAt === 'string' ? Date.parse(position.openedAt) : numberOrNull(position.openedAt);
-          return Number.isFinite(openedMs) ? Math.max(0, Math.floor((nowMs - openedMs) / HOUR_MS)) : null;
+          const barMs = timeframeToMs(rules.timeframe);
+          return Number.isFinite(openedMs) ? Math.max(0, Math.floor((nowMs - openedMs) / barMs)) : null;
         })(),
         maxHoldBars: rules.maxHoldBars,
       }

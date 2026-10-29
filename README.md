@@ -130,11 +130,17 @@ the operating config).
   treasury→agent ledger transfers** — no broker transfer exists), and inspect a richer **agent
   detail page**: strategy explanation, plan + next step, triggers, position stop/target/bars-held,
   ranking badges, P&L and a full transactions table. Contract: `docs/CONTROL-PANEL.md`.
+- **Fast intraday profile:** the paper population re-prices and can trade every ~60 s using
+  **1-minute IEX bars** (`data.timeframe: "1Min"`, `data.feed: "iex"`; feed configurable to
+  `sip` = 15-min delayed on the free plan). Bar-based hold rules are measured in the configured
+  timeframe, so a 12-bar time stop = 12 minutes. Strategies compiled on hourly data are much
+  noisier on minute bars; `docs/RUNBOOK.md` §8a documents the trade-offs and how to revert to
+  `1Hour` + `300 s`.
 
 ## Status (this build)
 
 - 8 test suites: mortality 55, market 27, plugin 40, independent integration 21, security 41,
-  research 13, rankings 16 and control 7 — **220 tests, 220 pass, 0 fail**. Run each file directly,
+  research 13, rankings 16 and control 11 — **224 tests, 224 pass, 0 fail**. Run each file directly,
   e.g. `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live
   reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/

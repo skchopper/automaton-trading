@@ -237,6 +237,45 @@ redacted result and resolved paths. Key knobs:
 | `data.maxHypothesesPerCycle` | 3 | proven hypotheses per cycle (this build: **40**, so 30 agents can each trade their own strategy) |
 | `risk.*` | see `src/config.js` | max position %, order caps, daily orders, loss limits, session window, symbol whitelist |
 
+## 8a. Minute monitoring / fast intraday profile
+
+The engine evaluates the population once per `cycleIntervalSec`. This build runs a **fast intraday
+profile** (activate by restarting the Host so the engine reloads the config):
+
+```json
+"cycleIntervalSec": 60,
+"data": { "timeframe": "1Min", "feed": "iex", "lookbackBars": 120 },
+"risk": { "maxDailyOrders": 12 }
+```
+
+What this means in practice:
+
+- **Every ~60 s** the engine: fetches the shared market snapshot (1-minute IEX bars + latest IEX
+  quotes for the 10 symbols), runs the Treasurer, then the Executor evaluates each bot's signal on
+  the 1-minute bar series (momentum z-score, mean-reversion z, breakout vs prior 20-bar high, gap
+  fade), checks all 14 brakes, and places at most one order per bot per cycle. `maxDailyOrders: 12`
+  caps how often a bot may trade per day.
+- **Bar-based rules stay correct:** every rule expressed in bars (`maxHoldBars`) is now measured in
+  *1-minute bars* (e.g. a 12-bar time stop = 12 minutes). The agent plan on the dashboard states the
+  bar duration explicitly (e.g. "Time stop after 12 bars (~1 min each)").
+- **Data reality check:** `feed: "iex"` is real-time during US regular trading hours, but IEX is a
+  single venue and has sparse/no data outside RTH (pre-market/post-close). `feed: "sip"` gives
+  consolidated data but is **15 minutes delayed** on the free Alpaca plan. Truly instant reaction
+  needs an Alpaca real-time data subscription; with the free plan the bots react to IEX real-time
+  prices during the session.
+- **Costs/cadence:** burn per cycle is charged to each bot; 60 s cycles multiply cycle costs ~5× vs
+  the previous 5-minute loop (still cents/day for $20 bots). Research cadence is unaffected (hourly /
+  pre-open / post-close as configured in the panel).
+- **Signal quality:** the existing compiled specs were derived on hourly bars, so their parameters
+  are now applied to much noisier 1-minute data — expect more frequent, smaller trades and more
+  false signals. For a calmer first step use `"timeframe": "5Min"` or `"15Min"` (and
+  `cycleIntervalSec: 60` still refreshes quotes every minute); revert to `"1Hour"` + `300` for the
+  original behaviour. The engine validates the timeframe/feed allow-list (`1Min|5Min|15Min|30Min|
+  1Hour|2Hour|4Hour|1Day`, feed `iex|sip`) at startup.
+- **Rate limits:** each cycle issues roughly 10 bar requests + 10 quote requests (+ fill
+  reconciliation); at 60 s this is well under Alpaca's 200 requests/minute, but do not add more
+  symbols/population without checking it.
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

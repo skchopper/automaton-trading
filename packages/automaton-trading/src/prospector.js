@@ -317,6 +317,7 @@ export function createProspector({ broker, config, journal, clock, paths } = {})
     const barsBySymbol = await broker.getBars({
       symbols,
       timeframe: config.data?.timeframe ?? '1Hour',
+      feed: config.data?.feed ?? 'iex',
       limit: lookbackBars,
     });
     const dataCalls = 1;
