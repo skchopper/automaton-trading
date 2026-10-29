@@ -15,6 +15,7 @@ profitable **reproduce**, and every death leaves a record the living read.
 docs/ARCHITECTURE.md      theory -> trading mapping, six roles + stoplines, death rules, brakes
 docs/CONTRACTS.md         module interfaces, data shapes, config defaults
 docs/RESEARCH.md          per-agent isolated hourly research sidecar (news analyst) contract
+docs/CONTROL-PANEL.md     operator control panel: research cadence, leaderboards, rewards, plans
 docs/RUNBOOK.md           operating guide: phases, commands, emergency procedures
 docs/VERIFICATION.md      what was verified, how to reproduce it, what was not
 packages/automaton-trading/   the plugin bundle (zero runtime dependencies)
@@ -121,12 +122,26 @@ the operating config).
   CLI run uses `DEEPSEEK_API_KEY`.
 - The engine has no control surface over the Reaper. `automaton_stop` stops the loop only;
   the Reaper keeps liquidating condemned agents.
+- **Operator control panel (2026-10-29)**: the sidebar dashboard can set the **research cadence**
+  (1h/3h/6h/24h, before open, after close, or both — applied live and persisted to
+  `automaton-data/settings.json`), configure **leaderboards and winner rewards** (daily/weekly/
+  monthly ranking; 1st/2nd/3rd = 5/3/2% of the broker account cash by default, configurable, capped
+  by treasury pool / allocation cap / max per period, paid once per period as **virtual
+  treasury→agent ledger transfers** — no broker transfer exists), and inspect a richer **agent
+  detail page**: strategy explanation, plan + next step, triggers, position stop/target/bars-held,
+  ranking badges, P&L and a full transactions table. Contract: `docs/CONTROL-PANEL.md`.
 
 ## Status (this build)
 
-- 6 test suites: mortality 55, market 27, plugin 36, independent integration 21, security 41
-  and research 9 — **189 tests, 189 pass, 0 fail**. Run each file directly, e.g.
-  `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- 8 test suites: mortality 55, market 27, plugin 40, independent integration 21, security 41,
+  research 13, rankings 16 and control 7 — **220 tests, 220 pass, 0 fail**. Run each file directly,
+  e.g. `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- Control-panel engine verified in `test/control.test.js` (research cadence windows + live
+  reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/
+  monthly leaderboards; period-boundary rewards with cap scaling, once-per-period and live reward
+  reconfigure) and in `test/rankings.test.js` (16 tests). Host control actions and every dashboard
+  mapping are covered by the plugin suite (40 tests). Live UI verification follows the next Host
+  restart.
 - Research sidecar verified end-to-end: `test/research.test.js` (isolation, schema clamp,
   malformed-reply containment, per-agent charging, hourly scheduling, stale expiry) plus
   `scripts/research-smoke.mjs` (10/10: real `createAutomaton` composition, per-agent journals,

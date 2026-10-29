@@ -118,10 +118,32 @@ The same engine is available inside the DeepSeek Harness Web UI:
   equity, P&L, runway, status/cause. **Click an agent** to open its drill-down: current
   holdings (symbol/qty/avg/last/market value/unrealized/opened), past activity (newest-first
   fills), strategy parameters, role costs and death info. Auto-refresh every 3 s with pause.
+- **Operator controls (2026-10-29 feature set, docs/CONTROL-PANEL.md)**:
+  - **Research cadence** — segmented control: every 1 h / 3 h / 6 h / 24 h, **before market open**,
+    **after market close**, or both. Applies live through `POST /automaton/control`
+    `{action:'set-research-settings', settings:{mode, intervalSec?, enabled?, influence?}}`; the
+    choice is persisted to `automaton-data/settings.json` (operator overlay applied on every config
+    load) so it survives restarts. Edit the same file to change it without the panel.
+  - **Rewards** — enable toggle, period (daily/weekly/monthly), 1st/2nd/3rd percentages of the
+    broker account's **cash** (defaults 5/3/2 %), optional max per period, live preview against the
+    treasury pool and allocation-cap remaining. Persisted via `set-reward-settings`. Payouts are
+    **virtual treasury → agent ledger transfers at period boundaries only** (no broker transfer
+    exists); they are once-per-period, floored to cents, proportionally scaled if the pool/allocation
+    cap/max would be exceeded, and recorded in `automaton-data/rewards.json` (history 50). Virtual
+    `sum(agent equity) + pool` is unchanged, so reconciliation still holds.
+  - **Leaderboards** — daily / weekly / monthly tabs ranked by period P&L %; top 3 get medals and
+    can be clicked to open that agent. Period keys are UTC day, ISO week, UTC month.
+  - **Agent detail** — the drill-down now explains the bot: strategy summary, entry rule, exit rules
+    (stop/target/time/signal), risk rule, plan + next step, triggers table, current position plan
+    (stop/target/bars held), next research time, ranking badges, P&L (realized/unrealized/day/week/
+    month) and a full **Transactions** table with every fill (order id, side, qty, price, notional,
+    realized P&L, time).
 - Controls call `POST /automaton/control` (loopback only) with
-  `{action:'start'|'stop'|'emergency-stop'|'reaper-stop'}`; destructive actions need
-  `confirm:'STOP'`. Data comes from `GET /automaton/state` (redacted JSON, no secrets).
-  `reaper-stop` is operator-only (Host-side) and is never exposed as an agent tool.
+  `{action:'start'|'stop'|'emergency-stop'|'reaper-stop'|'set-research-settings'|'set-reward-settings'}`;
+  destructive actions need `confirm:'STOP'`. Data comes from `GET /automaton/state` (redacted JSON,
+  no secrets). Settings actions are operator-only and are never exposed as agent tools; invalid
+  settings are rejected with `400 INVALID_SETTINGS` (the Host also validates the same allow-list the
+  engine does). `reaper-stop` is operator-only (Host-side) and is never exposed as an agent tool.
 - A fresh Host boot can activate the plugin before the web-server service mounts; the Host
   half late-binds its routes (polls up to 60 s), so **restart the app once** after updating
   the plugin. After a restart: if the Reaper row shows a **stale generation** banner, press

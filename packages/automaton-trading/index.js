@@ -34,7 +34,23 @@ const ROUTE_PATH = '/automaton/state';
 /** Operator-only control route used by the dashboard (loopback only). */
 const CONTROL_PATH = '/automaton/control';
 /** Whitelisted control actions; anything else is a 400. */
-const CONTROL_ACTIONS = Object.freeze(['start', 'stop', 'emergency-stop', 'reaper-stop']);
+const CONTROL_ACTIONS = Object.freeze([
+  'start',
+  'stop',
+  'emergency-stop',
+  'reaper-stop',
+  'set-research-settings',
+  'set-reward-settings',
+]);
+/** Operator research schedule modes (docs/CONTROL-PANEL.md). */
+const RESEARCH_SCHEDULE_MODES = Object.freeze(['interval', 'pre-open', 'post-close', 'pre-open+post-close']);
+/** Allowed interval choices in seconds (1h, 3h, 6h, 24h). */
+const RESEARCH_INTERVAL_OPTIONS = Object.freeze([3600, 10800, 21600, 86400]);
+/** Reward period choices. */
+const REWARD_PERIODS = Object.freeze(['daily', 'weekly', 'monthly']);
+const REWARD_MAX_PER_PERIOD_USD = 1_000_000;
+const RESEARCH_SETTING_KEYS = Object.freeze(['mode', 'intervalSec', 'enabled', 'influence']);
+const REWARD_SETTING_KEYS = Object.freeze(['enabled', 'period', 'rankPercents', 'maxPerPeriodUsd']);
 const CONTROL_BODY_LIMIT_BYTES = 8192;
 const MAX_ERROR_MESSAGE = 500;
 const SIMULATION_LIMITS = Object.freeze({ cycles: [1, 5000], population: [1, 200] });
@@ -607,6 +623,8 @@ async function buildState(holder, row) {
     population: status?.population ?? null,
     limits,
     agents: Array.isArray(status?.agents) ? status.agents : [],
+    rankings: status?.rankings ?? null,
+    rewards: status?.rewards ?? (status?.engine?.rewards ? { ...status.engine.rewards, history: [] } : null),
     obituaries: {
       stats: obituaries.stats ?? status?.obituaries ?? null,
       recent: obituaries.items.slice(0, 8),
@@ -662,8 +680,9 @@ function createStateHandler(holder, row, log) {
 /**
  * POST /automaton/control — operator controls for the dashboard.
  * Loopback-only by design: this is a local operator surface, never a remote API.
- * Body: `{action: 'start'|'stop'|'emergency-stop'|'reaper-stop', confirm?}`.
- * `emergency-stop` and `reaper-stop` both require `confirm: "STOP"`.
+ * Body: `{action: 'start'|'stop'|'emergency-stop'|'reaper-stop'|'set-research-settings'|'set-reward-settings', …}`.
+ * `emergency-stop` and `reaper-stop` both require `confirm: "STOP"`; the settings actions
+ * carry a validated `settings` patch.
  */
 function createControlHandler(holder, row, log) {
   return async function controlHandler(req, res) {
@@ -743,6 +762,14 @@ function createControlHandler(holder, row, log) {
           note: 'operator surface: the Reaper is not reachable from the engine or any agent tool',
         };
         log.warn('REAPER STOP via dashboard (operator control)', { stopped: result.stopped, pid: result.pid });
+      } else if (action === 'set-research-settings') {
+        const patch = validateResearchSettings(body.settings);
+        result = await updateEngineSettings(holder, 'updateResearchSettings', patch);
+        log.info('research settings updated via dashboard', result.settings ?? patch);
+      } else if (action === 'set-reward-settings') {
+        const patch = validateRewardSettings(body.settings);
+        result = await updateEngineSettings(holder, 'updateRewardSettings', patch);
+        log.info('reward settings updated via dashboard', result.settings ?? patch);
       } else {
         if (body.confirm !== 'STOP') {
           send(400, failure(httpError('CONFIRM_REQUIRED', 'emergency-stop requires body {"confirm":"STOP"}')));
@@ -1056,11 +1083,126 @@ function httpError(code, message, details) {
   return error;
 }
 
+// ---------------------------------------------------------------------------
+// operator settings validation (docs/CONTROL-PANEL.md)
+// ---------------------------------------------------------------------------
+
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+function invalidSettings(message) {
+  return httpError('INVALID_SETTINGS', message);
+}
+
+/** Reject unknown keys in a settings patch and require at least one field. */
+function assertSettingsShape(settings, allowedKeys, label) {
+  if (!isPlainObject(settings)) throw invalidSettings(`${label} settings must be an object`);
+  const keys = Object.keys(settings);
+  if (keys.length === 0) throw invalidSettings(`${label} settings must contain at least one field`);
+  for (const key of keys) {
+    if (!allowedKeys.includes(key)) throw invalidSettings(`unknown ${label} setting "${key}" (allowed: ${allowedKeys.join(', ')})`);
+  }
+}
+
+/**
+ * Validate + normalize `set-research-settings` payload.
+ * @param {object} settings {mode?, intervalSec?, enabled?, influence?}
+ * @returns {object} a detached patch containing only provided keys
+ */
+function validateResearchSettings(settings) {
+  assertSettingsShape(settings, RESEARCH_SETTING_KEYS, 'research');
+  const patch = {};
+  if (settings.mode !== undefined) {
+    if (typeof settings.mode !== 'string' || !RESEARCH_SCHEDULE_MODES.includes(settings.mode)) {
+      throw invalidSettings(`research.mode must be one of ${RESEARCH_SCHEDULE_MODES.join(', ')}`);
+    }
+    patch.mode = settings.mode;
+  }
+  if (settings.intervalSec !== undefined) {
+    const interval = Number(settings.intervalSec);
+    if (!Number.isInteger(interval) || !RESEARCH_INTERVAL_OPTIONS.includes(interval)) {
+      throw invalidSettings(`research.intervalSec must be one of ${RESEARCH_INTERVAL_OPTIONS.join(', ')}`);
+    }
+    patch.intervalSec = interval;
+  }
+  if (settings.enabled !== undefined) {
+    if (typeof settings.enabled !== 'boolean') throw invalidSettings('research.enabled must be a boolean');
+    patch.enabled = settings.enabled;
+  }
+  if (settings.influence !== undefined) {
+    if (typeof settings.influence !== 'boolean') throw invalidSettings('research.influence must be a boolean');
+    patch.influence = settings.influence;
+  }
+  return patch;
+}
+
+/**
+ * Validate + normalize `set-reward-settings` payload.
+ * @param {object} settings {enabled?, period?, rankPercents?, maxPerPeriodUsd?}
+ * @returns {object} a detached patch containing only provided keys
+ */
+function validateRewardSettings(settings) {
+  assertSettingsShape(settings, REWARD_SETTING_KEYS, 'reward');
+  const patch = {};
+  if (settings.enabled !== undefined) {
+    if (typeof settings.enabled !== 'boolean') throw invalidSettings('rewards.enabled must be a boolean');
+    patch.enabled = settings.enabled;
+  }
+  if (settings.period !== undefined) {
+    if (typeof settings.period !== 'string' || !REWARD_PERIODS.includes(settings.period)) {
+      throw invalidSettings(`rewards.period must be one of ${REWARD_PERIODS.join(', ')}`);
+    }
+    patch.period = settings.period;
+  }
+  if (settings.rankPercents !== undefined) {
+    const percents = settings.rankPercents;
+    if (!Array.isArray(percents) || percents.length !== 3) {
+      throw invalidSettings('rewards.rankPercents must be exactly 3 numbers');
+    }
+    const normalized = [];
+    for (const value of percents) {
+      const number = Number(value);
+      if (!Number.isFinite(number) || number < 0 || number > 0.5) {
+        throw invalidSettings('rewards.rankPercents entries must be numbers between 0 and 0.5');
+      }
+      normalized.push(number);
+    }
+    patch.rankPercents = normalized;
+  }
+  if (settings.maxPerPeriodUsd !== undefined) {
+    const raw = settings.maxPerPeriodUsd;
+    if (raw === null) {
+      patch.maxPerPeriodUsd = null;
+    } else {
+      const number = Number(raw);
+      if (!Number.isFinite(number) || number < 0 || number > REWARD_MAX_PER_PERIOD_USD) {
+        throw invalidSettings(`rewards.maxPerPeriodUsd must be null or a number between 0 and ${REWARD_MAX_PER_PERIOD_USD}`);
+      }
+      patch.maxPerPeriodUsd = number;
+    }
+  }
+  return patch;
+}
+
+/** Delegate a validated settings patch to the engine (defensive about older builds). */
+async function updateEngineSettings(holder, method, patch) {
+  const engine = await holder.getEngine();
+  if (typeof engine[method] !== 'function') {
+    const error = new Error(`engine.${method}() is not available in this build`);
+    error.code = 'NOT_IMPLEMENTED';
+    throw error;
+  }
+  const effective = await engine[method](patch);
+  if (isPlainObject(effective) && (Object.hasOwn(effective, 'settings') || Object.hasOwn(effective, 'effective'))) {
+    return effective;
+  }
+  return { settings: patch, effective: effective ?? null };
+}
+
 /** Map a control-route failure code onto its HTTP status. */
 function controlErrorStatus(code) {
   if (code === 'METHOD_NOT_ALLOWED') return 405;
   if (code === 'FORBIDDEN') return 403;
-  if (code === 'BAD_JSON' || code === 'BAD_ACTION' || code === 'CONFIRM_REQUIRED' || code === 'PAYLOAD_TOO_LARGE') return 400;
+  if (code === 'BAD_JSON' || code === 'BAD_ACTION' || code === 'CONFIRM_REQUIRED' || code === 'PAYLOAD_TOO_LARGE' || code === 'INVALID_SETTINGS') return 400;
   if (code === 'LIVE_NOT_ARMED' || code === 'MODE_FORBIDDEN' || code === 'KILL_SWITCH' || code === 'REAPER_UNAVAILABLE') return 409;
   if (code === 'NOT_IMPLEMENTED') return 501;
   return 500;
@@ -1489,6 +1631,11 @@ export {
   createResearchBridge,
   resolveResearchOverrides,
   resolveResearchTarget,
+  validateResearchSettings,
+  validateRewardSettings,
+  RESEARCH_SCHEDULE_MODES,
+  RESEARCH_INTERVAL_OPTIONS,
+  REWARD_PERIODS,
   REAPER_PID_FILE,
   REAPER_HEARTBEAT_FILE,
 };

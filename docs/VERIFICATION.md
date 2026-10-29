@@ -595,3 +595,30 @@ Remaining operator actions: top up the DeepSeek balance (or run research in shad
 then) and restart the Harness app (Host modules are ESM-cached), then Start. Expected effect: entries
 are no longer mass-vetoed; the first live `research_veto`/`research_alert` should now be a genuine
 signal rather than a schema artefact.
+
+### Operator control panel: research cadence, leaderboards, rewards, richer agent detail (2026-10-29)
+
+User request: set the research interval from the UI (1h/3h/6h/24h, before/after market close),
+explain each agent's strategy + plan/next step + order/transaction records in its detail page, add
+daily/weekly/monthly bot rankings, and a rewards panel where the top 3 get +5%/+3%/+2% of the
+account's cash (configurable interval and amounts). Contract: `docs/CONTROL-PANEL.md`.
+
+| Area | Implemented + verified |
+|---|---|
+| Research cadence | `research.scheduleMode` = interval / pre-open / post-close / pre-open+post-close (± configurable minute offsets); `intervalSec` options 1h/3h/6h/24h; per-agent staggering kept; event windows derive from the live broker clock (close-transition detection for post-close). Live `reconfigure()` (no restart) + persisted operator overlay `automaton-data/settings.json`. Tests: interval due-once, pre-open window, post-close window served once, live reconfigure, overlay persistence + rollback on invalid values. |
+| Settings controls | `POST /automaton/control` actions `set-research-settings` and `set-reward-settings` (loopback-only, allow-listed modes/intervals/periods/percentages, unknown keys rejected, 400 `INVALID_SETTINGS`, old engine 501). Engine validates the same allow-list and writes the overlay before applying live. No new agent tools (still 10). |
+| Leaderboards | `src/rankings.js`: UTC daily / ISO-week / UTC-month baselines (start-of-period return, previous close carried), sorted by P&L% → P&L$ → name, missing baselines last, persisted `rankings.json`; status `rankings.periods` + per-agent `rankings`/`pnl`. Tests: 16 (period keys incl. ISO edge cases, baselines/rollover, sorting/ties, missing baseline, persistence/corruption). |
+| Rewards | `src/rewards.js`: top-3 of the completed period; amounts = rankPercents × **broker account cash** (defaults 5/3/2%), proportionally scaled down by treasury pool / allocation-cap remaining / maxPerPeriodUsd, floored to cents; virtual `ledger.transfer('__treasury__'→agent)` only (no broker transfer surface), once-per-period (persisted anchor), history 50, `rewards.json`; status includes last winners/history/next boundary/cash/pool/cap. Tests: 16 (default payout, caps/scaling, once-per-period, skipped, null P&L, weekly/monthly, history reload, disabled, reconfigure). |
+| Period-boundary wiring | Boundary tick ranks the **completed** period before recording the new baseline (uses `rankings.compute({atMs: periodKeyEndMs-1, stored:true})`), pays, then records; engine refresh writes the snapshot so the panel sees live settings changes immediately. Integration test asserts payout at a simulated day boundary, cap binding, leaderboard refresh, fresh cash/equity after the mid-tick payout, and no double payout on the next tick. |
+| Agent detail | `src/strategy-explain.js` derives (from genome/spec + virtual book + last prices) a strategy summary, exact entry rule per family (momentum/meanrev/breakout/gapfade), exit rules (signal/stop/target/time/research), risk rule, plan + **next step**, trigger grid, current position plan (stop/target/bars held/max), next research time, research verdict; status adds full `orders` fill history and `pnl` per agent. Tests: plan shape for every agent, transactions array, plan/triggers/position/empty-state mappings in the plugin suite. |
+| Full suite | mortality 55 + market 27 + plugin 40 + integration 21 + security 41 + research 13 + rankings 16 + control 7 = **220/220 pass**; `research-smoke` 10/10; `verify-fixes` 18/18. |
+
+**Safety invariants preserved:** rewards are virtual bookkeeping (`sum(agent equity) + pool` constant;
+reconciliation unaffected), the broker client still has no transfer/withdraw methods, all orders
+still pass the 14 brakes, settings actions are operator-only loopback routes (never agent tools), and
+reward/settings changes are validated + persisted before applying.
+
+**Live state at delivery:** current Host process still runs the previous engine build, so the panel
+shows the new controls with empty/optional states; a Host restart loads the new engine + panel and is
+required for live cadence/rewards/leaderboards. Research LLM calls remain paused while the DeepSeek
+account balance is exhausted (a separate operator top-up; stale briefings are ignored by trading).

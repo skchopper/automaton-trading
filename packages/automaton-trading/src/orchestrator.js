@@ -36,8 +36,11 @@ import { createReplicator } from './replicator.js';
 import { createProspector } from './prospector.js';
 import { createBuilder } from './builder.js';
 import { createExecutor } from './executor.js';
+import { createRankings, periodKeyEndMs } from './rankings.js';
 import { createReaper } from './reaper.js';
 import { createResearcher } from './research.js';
+import { createRewards } from './rewards.js';
+import { explainAgentPlan } from './strategy-explain.js';
 import { nextAgentName, usedNames } from './naming.js';
 
 const log = createLogger('automaton');
@@ -204,6 +207,11 @@ export async function createAutomaton(options = {}) {
       return agent?.specId ? state.specs.get(agent.specId) ?? null : null;
     },
   });
+
+  // Period leaderboards + operator-configured virtual cash rewards (docs/CONTROL-PANEL.md).
+  const rankings = createRankings({ paths, config, clock });
+  let operatorRewardsConfig = { ...(config.rewards ?? {}) };
+  let rewards = createRewards({ paths, config: { ...config, rewards: operatorRewardsConfig }, clock });
 
   // -------------------------------------------------------------------------
   // persistence helpers
@@ -418,6 +426,8 @@ export async function createAutomaton(options = {}) {
     await ledger.load();
     await loadDayStats(clock.now());
     await researcher.init();
+    await rankings.load();
+    await rewards.load();
     // Reload compiled specs from disk so a restart does not silently drop strategies.
     try {
       const specFiles = (await fsp.readdir(paths.specsDir)).filter((file) => file.endsWith('.json'));
@@ -465,6 +475,7 @@ export async function createAutomaton(options = {}) {
       builds: [],
       executions: [],
       replication: null,
+      rewards: null,
       deaths: [],
       errors: [],
     };
@@ -705,7 +716,69 @@ export async function createAutomaton(options = {}) {
       await registry.save();
       await ledger.save();
 
-      // 6. RESEARCH: per-agent isolated hourly news briefing (docs/RESEARCH.md).
+      // 6. RANKINGS + REWARDS: period leaderboards and operator-configured payouts.
+      // Rankings are bookkeeping snapshots (no trades). Rewards move virtual cash from the
+      // treasury pool to the top-3 agents at period boundaries; no broker transfer exists.
+      let rankingsView = null;
+      try {
+        const nowMs = clock.now();
+        const equityByAgent = {};
+        for (const agent of registry.all()) {
+          const view = agentViews.get(agent.id);
+          const snapshot = ledger.snapshot ? ledger.snapshot(agent.id) : null;
+          equityByAgent[agent.id] = {
+            name: agent.name ?? agent.id,
+            equityUsd: Number(view?.equityUsd) || 0,
+            trades: Number(snapshot?.trades) || 0,
+          };
+        }
+        // Payout for a completed period must be ranked BEFORE this tick records the new
+        // period's baselines. Probe an instant inside the completed period so the stored
+        // baselines/last observations of that period are still in scope.
+        const due = operatorRewardsConfig.enabled === true ? rewards.duePeriod(nowMs) : null;
+        if (due) {
+          let payoutRankings = null;
+          try {
+            const completedEndMs = periodKeyEndMs(due.period, due.periodKey);
+            payoutRankings = rankings.compute({
+              atMs: Number.isFinite(completedEndMs) ? completedEndMs - 1 : nowMs - 1,
+              stored: true,
+            });
+          } catch {
+            payoutRankings = rankings.compute({ atMs: nowMs, equityByAgent });
+          }
+          const account = treasuryView.account ?? {};
+          const pool = typeof ledger.pool === 'function' ? ledger.pool() : { poolUsd: 0, allocatedUsd: 0 };
+          const allocationCapUsd = Number(account.equityUsd || 0) * Number(config.account?.allocationCapPct ?? 0.8);
+          const allocationCapRemainingUsd = Math.max(0, allocationCapUsd - Number(pool.allocatedUsd || 0));
+          const payout = await rewards.apply({
+            due,
+            rankings: payoutRankings,
+            accountCashUsd: Number(account.cashUsd ?? pool.poolUsd ?? 0),
+            poolUsd: Number(pool.poolUsd || 0),
+            allocationCapRemainingUsd,
+            ledger,
+            nowMs,
+          });
+          await rewards.save();
+          if (payout?.applied) await ledger.save();
+          trace.rewards = {
+            period: due.period,
+            periodKey: due.periodKey,
+            winners: payout?.winners ?? [],
+            skipped: payout?.skipped ?? false,
+          };
+        } else {
+          trace.rewards = { period: operatorRewardsConfig.period ?? null, due: false };
+        }
+        await rankings.record({ atMs: nowMs, equityByAgent });
+        rankingsView = rankings.compute({ atMs: nowMs, equityByAgent });
+        await rankings.save();
+      } catch (error) {
+        trace.errors.push({ role: 'rewards', ...errorInfo(error) });
+      }
+
+      // 7. RESEARCH: per-agent isolated hourly news briefing (docs/RESEARCH.md).
       // Runs AFTER entries/exits so LLM latency (up to ~1 min for a batch) can never delay an
       // order; a due briefing becomes visible to the next cycle's executor (briefings stay
       // fresh for maxAgeSec = 2 h, so a 5-minute lag is irrelevant for hourly news).
@@ -713,7 +786,7 @@ export async function createAutomaton(options = {}) {
       // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
       if (!treasuryView.halted) {
         try {
-          const researchRun = await researcher.tick();
+          const researchRun = await researcher.tick({ marketClock });
           trace.research = {
             enabled: researchRun.enabled,
             configured: researchRun.configured,
@@ -733,7 +806,7 @@ export async function createAutomaton(options = {}) {
         }
       }
 
-      // 7. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
+      // 8. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
       if (treasuryView.mayReplicate && !treasuryView.halted) {
         const candidates = registry
           .alive()
@@ -802,6 +875,55 @@ export async function createAutomaton(options = {}) {
     const dead = registry.dead();
     const views = new Map((treasury?.agentViews ?? []).map((view) => [view.agentId, view]));
     const marks = state.lastPrices && typeof state.lastPrices === 'object' ? state.lastPrices : {};
+
+    // Period leaderboards + rewards view for the control panel (bookkeeping only).
+    const equityByAgent = {};
+    for (const agent of registry.all()) {
+      const view = views.get(agent.id) ?? null;
+      let bookSnapshot = null;
+      try {
+        bookSnapshot = ledger.snapshot(agent.id);
+      } catch {
+        bookSnapshot = null;
+      }
+      equityByAgent[agent.id] = {
+        name: agent.name ?? agent.id,
+        equityUsd: Number(view?.equityUsd) || 0,
+        trades: Number(bookSnapshot?.trades) || 0,
+      };
+    }
+    const asOfMs = clock.now();
+    let rankingsView = null;
+    try {
+      rankingsView = await rankings.compute({ atMs: asOfMs, equityByAgent });
+    } catch {
+      rankingsView = null;
+    }
+    const rankingMaps = {};
+    for (const period of ['daily', 'weekly', 'monthly']) {
+      rankingMaps[period] = new Map((rankingsView?.periods?.[period] ?? []).map((row) => [row.agentId, row]));
+    }
+    const ledgerPool = typeof ledger.pool === 'function' ? ledger.pool() : { poolUsd: 0, allocatedUsd: 0 };
+    const allocationCapUsd = Number(account?.equityUsd || 0) * Number(config.account?.allocationCapPct ?? 0.8);
+    let rewardsStatus = null;
+    let rewardsHistory = [];
+    try {
+      rewardsStatus = rewards.status();
+      rewardsHistory = (rewards.getState()?.history ?? []).slice(-8);
+    } catch {
+      rewardsStatus = null;
+    }
+    const rewardsView = rewardsStatus
+      ? {
+          ...rewardsStatus,
+          basis: operatorRewardsConfig.basis ?? 'account-cash',
+          accountCashUsd: account?.cashUsd ?? null,
+          poolUsd: round2(ledgerPool.poolUsd ?? 0),
+          allocatedUsd: round2(ledgerPool.allocatedUsd ?? 0),
+          allocationCapRemainingUsd: round2(Math.max(0, allocationCapUsd - Number(ledgerPool.allocatedUsd || 0))),
+          history: rewardsHistory,
+        }
+      : null;
     const agents = registry.all().map((agent) => {
       const view = views.get(agent.id) ?? null;
       const isDead = agent.status === 'dead';
@@ -836,6 +958,14 @@ export async function createAutomaton(options = {}) {
         };
       });
       const spec = agent.specId ? state.specs.get(agent.specId) ?? null : null;
+      // Rewards payouts happen mid-tick after the treasury views were computed, so prefer a
+      // FRESH ledger mark for equity/cash here; fall back to the treasury view when unavailable.
+      let freshEquity = null;
+      try {
+        freshEquity = typeof ledger.equity === 'function' ? ledger.equity(agent.id, marks) : null;
+      } catch {
+        freshEquity = null;
+      }
       return {
         id: agent.id,
         name: agent.name ?? agent.id,
@@ -858,9 +988,9 @@ export async function createAutomaton(options = {}) {
               createdAt: spec.createdAt ?? null,
             }
           : null,
-        equityUsd: view?.equityUsd ?? null,
-        cashUsd: view?.cashUsd ?? book?.cashUsd ?? null,
-        positionsValueUsd: view?.positionsValueUsd ?? null,
+        equityUsd: freshEquity?.equityUsd ?? view?.equityUsd ?? null,
+        cashUsd: freshEquity?.cashUsd ?? book?.cashUsd ?? view?.cashUsd ?? null,
+        positionsValueUsd: freshEquity?.positionsValueUsd ?? view?.positionsValueUsd ?? null,
         runwayHours: view?.runwayHours ?? null,
         treasuryState: view?.state ?? null,
         drawdownPct: view?.drawdownPct ?? null,
@@ -875,6 +1005,42 @@ export async function createAutomaton(options = {}) {
         roleCosts: view?.roleCosts ?? {},
         // Isolated per-agent research briefing (fresh or stale, for the dashboard).
         research: researcher.latestAny(agent.id),
+        // Full fill history for the drill-down "Transactions" table.
+        orders: (() => {
+          try {
+            return typeof ledger.history === 'function' ? ledger.history(agent.id, { limit: 200 }) : [];
+          } catch {
+            return [];
+          }
+        })(),
+        pnl: {
+          realizedUsd: book?.realizedPlUsd ?? null,
+          unrealizedUsd: book?.unrealizedPlUsd ?? null,
+          netUsd: view?.equityUsd !== undefined && view?.equityUsd !== null
+            ? round2(Number(view.equityUsd) - Number(agent.endowmentUsd ?? 0))
+            : null,
+          dayPct: view?.dayPnlPct ?? null,
+          weekPct: rankingMaps.weekly.get(agent.id)?.pnlPct ?? null,
+          monthPct: rankingMaps.monthly.get(agent.id)?.pnlPct ?? null,
+        },
+        rankings: {
+          dayRank: rankingMaps.daily.get(agent.id)?.rank ?? null,
+          weekRank: rankingMaps.weekly.get(agent.id)?.rank ?? null,
+          monthRank: rankingMaps.monthly.get(agent.id)?.rank ?? null,
+          dayPct: rankingMaps.daily.get(agent.id)?.pnlPct ?? null,
+          weekPct: rankingMaps.weekly.get(agent.id)?.pnlPct ?? null,
+          monthPct: rankingMaps.monthly.get(agent.id)?.pnlPct ?? null,
+        },
+        // Strategy explanation + current plan/next step for the detail page.
+        plan: explainAgentPlan({
+          agent,
+          spec,
+          book,
+          prices: marks,
+          nowMs: asOfMs,
+          research: researcher.latestAny(agent.id),
+          nextResearchAt: typeof researcher.nextFor === 'function' ? researcher.nextFor(agent.id) : null,
+        }),
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };
     });
@@ -890,7 +1056,14 @@ export async function createAutomaton(options = {}) {
         lastError: state.lastError,
         killSwitch: brakes.isKillSwitchActive?.(),
         liveArmed: liveArmed(config),
-        research: researcher.schedule(),
+        research: {
+          ...researcher.schedule(),
+          configurable: {
+            scheduleModes: ['interval', 'pre-open', 'post-close', 'pre-open+post-close'],
+            intervalOptionsSec: [3600, 10800, 21600, 86400],
+          },
+        },
+        rewards: rewardsView,
       },
       account: account ?? null,
       treasury: treasury
@@ -915,6 +1088,8 @@ export async function createAutomaton(options = {}) {
         byGeneration: registry.generationStats ? registry.generationStats() : {},
       },
       agents,
+      rankings: rankingsView,
+      rewards: rewardsView,
       obituaries: obituaryStats,
       halted: Boolean(halted),
       haltReasons: haltReasons ?? [],
@@ -1031,6 +1206,57 @@ export async function createAutomaton(options = {}) {
     });
   }
 
+  /** Rebuild + persist the status snapshot (used after live settings changes). */
+  async function refreshSnapshot() {
+    await init();
+    const treasuryView = state.lastTreasury;
+    const snapshot = await buildSnapshot({
+      account: treasuryView?.account ?? null,
+      treasury: treasuryView,
+      halted: treasuryView?.halted ?? false,
+      haltReasons: treasuryView?.haltReasons ?? [],
+    });
+    await writeStateFile(snapshot);
+    return snapshot;
+  }
+
+  /** Operator control panel: live research schedule change (persisted by the engine overlay). */
+  async function updateResearchSettings(settings = {}) {
+    const schedule = researcher.reconfigure(settings);
+    await refreshSnapshot();
+    return {
+      settings: {
+        scheduleMode: schedule.scheduleMode,
+        intervalSec: schedule.intervalSec,
+        preMarketOffsetMin: schedule.preMarketOffsetMin,
+        postCloseOffsetMin: schedule.postCloseOffsetMin,
+      },
+      schedule,
+    };
+  }
+
+  /** Operator control panel: live rewards change (settings re-resolved; history preserved). */
+  async function updateRewardSettings(settings = {}) {
+    operatorRewardsConfig = { ...operatorRewardsConfig, ...settings };
+    if (typeof rewards.reconfigure === 'function') {
+      const status = rewards.reconfigure({ ...config, rewards: operatorRewardsConfig });
+      await rewards.save();
+      await refreshSnapshot();
+      return { settings: operatorRewardsConfig, status };
+    }
+    const previous = (() => {
+      try {
+        return rewards.getState?.() ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    rewards = createRewards({ paths, config: { ...config, rewards: operatorRewardsConfig }, clock });
+    await rewards.load();
+    if (previous && typeof rewards.hydrate === 'function') rewards.hydrate(previous);
+    return { settings: operatorRewardsConfig, status: rewards.status() };
+  }
+
   return {
     // lifecycle
     init,
@@ -1039,6 +1265,9 @@ export async function createAutomaton(options = {}) {
     stop,
     isRunning,
     status,
+    refreshSnapshot,
+    updateResearchSettings,
+    updateRewardSettings,
     // views
     obituaries: async ({ limit = 50, offset = 0 } = {}) => ({
       stats: journal.stats ? await journal.stats() : null,

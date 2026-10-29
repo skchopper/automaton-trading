@@ -293,6 +293,10 @@ function agentFixture(index) {
     firstProfitAt: index % 6 === 0 && !dead ? '2026-01-01T16:45:00.000Z' : null,
     roleCosts: { treasurer: 0.002, prospector: 0.026, builder: 0.012, executor: 0.01 },
     research: researchFixture(index),
+    orders: Array.from({ length: index % 4 === 0 ? 3 : 0 }, (_, fillIndex) => orderFixture(index, fillIndex)),
+    pnl: pnlFixture(index),
+    plan: planFixture(index),
+    rankings: rankingsFixture(index),
   };
 }
 
@@ -364,8 +368,98 @@ function obituaryFixture(index) {
   };
 }
 
+function orderFixture(index, fillIndex) {
+  const buy = fillIndex % 2 === 0;
+  const qty = Math.round((0.25 + fillIndex * 0.05) * 1000) / 1000;
+  const price = 100 + index + fillIndex * 2;
+  return {
+    symbol: symbolAt(index),
+    side: buy ? 'buy' : 'sell',
+    qty,
+    priceUsd: price,
+    notionalUsd: Math.round(qty * price * 100) / 100,
+    realizedPlUsd: buy ? 0 : Math.round((0.4 + index * 0.01) * 100) / 100,
+    at: `2026-01-01T${String(10 + fillIndex).padStart(2, '0')}:30:00.000Z`,
+    orderId: `order-${index}-${fillIndex}`,
+  };
+}
+
+function pnlFixture(index) {
+  return {
+    realizedUsd: index % 2 === 0 ? 0.2 : -0.1,
+    unrealizedUsd: index % 2 === 0 ? 0.3 : -0.3,
+    netUsd: index % 2 === 0 ? 0.5 : -0.4,
+    dayPct: 0.01 * ((index % 5) - 2),
+    weekPct: 0.02 * ((index % 4) - 2),
+    monthPct: 0.03 * ((index % 3) - 1),
+  };
+}
+
+function planFixture(index) {
+  if (index === 0) return null;
+  const genome = baseGenome(index);
+  return {
+    summary: `${familyName(genome.family)} ${genome.symbol} bot: trades the inherited genome through a compiled spec with a fixed z-entry bracket.`,
+    entryRule: `Buy ${genome.symbol} when the z-score crosses ${genome.entryZ} in the strategy direction`,
+    exitRules: [
+      `stop at ${Math.round(genome.stopPct * 10000) / 100}%`,
+      `take profit at ${Math.round(genome.targetPct * 10000) / 100}%`,
+      `exit after ${genome.maxHoldBars} bars`,
+      'exit on an opposite signal',
+    ],
+    riskRule: `size ${Math.round(genome.sizePct * 100)}% of equity · max 3 positions · daily loss cap 5%`,
+    nextStep: 'Waiting for the next market window; research cadence hourly.',
+    triggers: { ...genome },
+    position: index % 4 === 1
+      ? { symbol: genome.symbol, qty: 0.5, avgPriceUsd: 100, stopPriceUsd: 96, targetPriceUsd: 108, barsHeld: 3, maxHoldBars: genome.maxHoldBars }
+      : null,
+    nextResearchAt: '2026-01-02T01:00:00.000Z',
+  };
+}
+
+function rankingsFixture(index) {
+  if (index % 7 === 3) return null;
+  return {
+    dayRank: (index % 10) + 1,
+    weekRank: ((index + 3) % 10) + 1,
+    monthRank: ((index + 6) % 10) + 1,
+    dayPct: 0.4 * (index % 5) - 0.5,
+    weekPct: 0.8 * (index % 5) - 1,
+    monthPct: 1.2 * (index % 5) - 1.5,
+  };
+}
+
+function buildRankingsPayload(agents) {
+  const aliveAgents = agents.filter((agent) => agent.status === 'alive');
+  const buildPeriod = (offset) => {
+    const rows = aliveAgents.map((agent, index) => ({
+      agentId: agent.id,
+      name: agent.name,
+      pnlPct: ((index * 3 + offset) % 11) - 5,
+      equityUsd: agent.equityUsd,
+      baselineEquityUsd: agent.endowmentUsd,
+      trades: agent.tradesCount,
+    }));
+    rows.sort((left, right) => right.pnlPct - left.pnlPct || String(left.name).localeCompare(String(right.name)));
+    return rows.map((row, index) => ({
+      rank: index + 1,
+      agentId: row.agentId,
+      name: row.name,
+      pnlUsd: Math.round((row.equityUsd - row.baselineEquityUsd) * 100) / 100,
+      pnlPct: row.pnlPct,
+      equityUsd: row.equityUsd,
+      baselineEquityUsd: row.baselineEquityUsd,
+      trades: row.trades,
+    }));
+  };
+  return {
+    asOf: '2026-01-02T00:00:00.000Z',
+    periods: { daily: buildPeriod(0), weekly: buildPeriod(4), monthly: buildPeriod(7) },
+  };
+}
+
 /** Full 30-agent status payload, close to what GET /automaton/state returns. */
-function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research } = {}) {
+function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings } = {}) {
   const agents = Array.from({ length: agentCount }, (_, index) => agentFixture(index));
   const alive = agents.filter((agent) => agent.status === 'alive').length;
   const dead = agents.filter((agent) => agent.status === 'dead').length;
@@ -406,6 +500,7 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
         enabled: true,
         configured: true,
         influence: true,
+        scheduleMode: 'interval',
         intervalSec: 3600,
         lastRunAt: '2026-01-02T00:00:00.000Z',
         nextDueAt: '2026-01-02T01:00:00.000Z',
@@ -413,6 +508,26 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
         model: 'deepseek-flash',
         runs: 3,
         errors: 0,
+        configurable: {
+          scheduleModes: ['interval', 'pre-open', 'post-close', 'pre-open+post-close'],
+          intervalOptionsSec: [3600, 10800, 21600, 86400],
+        },
+      },
+      rewards: rewards ?? {
+        enabled: true,
+        period: 'daily',
+        rankPercents: [0.05, 0.03, 0.02],
+        basis: 'account-cash',
+        accountCashUsd: 15000,
+        poolUsd: 4000,
+        allocationCapRemainingUsd: 16000,
+        lastRunAt: '2026-01-01T00:00:00.000Z',
+        nextRunAt: '2026-01-02T00:00:00.000Z',
+        lastWinners: [
+          { rank: 1, agentId: agents[0].id, name: agents[0].name, percent: 0.05, amountUsd: 750, periodKey: '2026-01-01', at: '2026-01-01T00:00:00.000Z' },
+          { rank: 2, agentId: agents[1].id, name: agents[1].name, percent: 0.03, amountUsd: 450, periodKey: '2026-01-01', at: '2026-01-01T00:00:00.000Z' },
+          { rank: 3, agentId: agents[2].id, name: agents[2].name, percent: 0.02, amountUsd: 300, periodKey: '2026-01-01', at: '2026-01-01T00:00:00.000Z' },
+        ],
       },
     },
     account: {
@@ -470,7 +585,31 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
     halted: false,
     haltReasons: [],
     brakes: { count: 14, enforced: true, killSwitch: false },
-    control: { route: CONTROL_PATH, loopbackOnly: true, actions: ['start', 'stop', 'emergency-stop', 'reaper-stop'] },
+    control: { route: CONTROL_PATH, loopbackOnly: true, actions: ['start', 'stop', 'emergency-stop', 'reaper-stop', 'set-research-settings', 'set-reward-settings'] },
+    rankings: rankings ?? buildRankingsPayload(agents),
+    rewards: {
+      ...(rewards ?? {}),
+      history: [
+        {
+          period: 'daily',
+          periodKey: '2026-01-01',
+          at: '2026-01-01T00:00:00.000Z',
+          winners: [
+            { rank: 1, agentId: agents[0].id, name: agents[0].name, percent: 0.05, amountUsd: 750 },
+            { rank: 2, agentId: agents[1].id, name: agents[1].name, percent: 0.03, amountUsd: 450 },
+            { rank: 3, agentId: agents[2].id, name: agents[2].name, percent: 0.02, amountUsd: 300 },
+          ],
+        },
+        {
+          period: 'weekly',
+          periodKey: '2026-W01',
+          at: '2026-01-01T00:00:00.000Z',
+          winners: [
+            { rank: 1, agentId: agents[3].id, name: agents[3].name, percent: 0.05, amountUsd: 600 },
+          ],
+        },
+      ],
+    },
     config: {
       mode,
       allowLive: false,
@@ -498,6 +637,8 @@ function createFakeEngine(options = {}) {
     simulate: 0,
     configView: 0,
     emergencyStop: 0,
+    updateResearchSettings: 0,
+    updateRewardSettings: 0,
   };
   const engine = {
     running: options.running === true,
@@ -577,11 +718,42 @@ function createFakeEngine(options = {}) {
       engine.running = false;
       return { killSwitch: true, running: false, note: 'external Reaper keeps running' };
     },
+    async updateResearchSettings(patch) {
+      calls.updateResearchSettings += 1;
+      calls.lastResearchSettings = patch;
+      const effective = {
+        enabled: true,
+        influence: true,
+        scheduleMode: 'interval',
+        intervalSec: 3600,
+        provider: 'deepseek-account',
+        model: 'deepseek-flash',
+        ...patch,
+      };
+      return { settings: patch, effective };
+    },
+    async updateRewardSettings(patch) {
+      calls.updateRewardSettings += 1;
+      calls.lastRewardSettings = patch;
+      const effective = {
+        enabled: true,
+        period: 'daily',
+        rankPercents: [0.05, 0.03, 0.02],
+        maxPerPeriodUsd: null,
+        basis: 'account-cash',
+        ...patch,
+      };
+      return { settings: patch, effective };
+    },
     isRunning() {
       return engine.running;
     },
   };
   if (options.omitEmergencyStop) delete engine.emergencyStop;
+  if (options.omitSettingsMethods) {
+    delete engine.updateResearchSettings;
+    delete engine.updateRewardSettings;
+  }
   return { engine, calls };
 }
 
@@ -798,7 +970,23 @@ test('GET /automaton/state returns the redacted 30-agent snapshot', async () => 
   assert.equal(json.obituaries.recent.length, 8);
   assert.equal(json.limits.allocationCapPct, 0.8);
   assert.equal(json.control.route, CONTROL_PATH);
-  assert.deepEqual(json.control.actions, ['start', 'stop', 'emergency-stop', 'reaper-stop']);
+  assert.deepEqual(json.control.actions, [
+    'start',
+    'stop',
+    'emergency-stop',
+    'reaper-stop',
+    'set-research-settings',
+    'set-reward-settings',
+  ]);
+  // New engine additions are passed through unchanged.
+  assert.equal(json.engine.rewards.period, 'daily');
+  assert.equal(json.engine.rewards.accountCashUsd, 15000);
+  assert.equal(json.rankings.asOf, '2026-01-02T00:00:00.000Z');
+  assert.ok(json.rankings.periods.daily.length > 0);
+  assert.ok(Array.isArray(json.rewards.history));
+  assert.ok(Array.isArray(json.agents[0].orders));
+  assert.equal(typeof json.agents[1].plan.summary, 'string');
+  assert.equal(json.agents[1].rankings.dayRank >= 1, true);
   // Names + drill-down data cross the route untouched by the host.
   assert.equal(json.agents[0].name, 'Momentum AAPL');
   assert.equal(Array.isArray(json.agents[0].recentTrades), true);
@@ -1293,6 +1481,123 @@ test('fallback emergency stop writes the KILL_SWITCH marker file', async () => {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('POST /automaton/control validates and applies research settings', async () => {
+  const fake = createFakeCtx();
+  const { engine, calls } = createFakeEngine();
+  apply(fake.ctx, baseConfig(engine));
+  const control = routeFor(fake.routes, CONTROL_PATH);
+
+  const ok = await invokeHandler(control.handler, {
+    method: 'POST',
+    body: {
+      action: 'set-research-settings',
+      settings: { mode: 'interval', intervalSec: 10800, enabled: true, influence: false },
+    },
+  });
+  assert.equal(ok.res.statusCode, 200);
+  assert.equal(ok.json.ok, true);
+  assert.equal(ok.json.action, 'set-research-settings');
+  assert.equal(calls.updateResearchSettings, 1);
+  assert.deepEqual(calls.lastResearchSettings, { mode: 'interval', intervalSec: 10800, enabled: true, influence: false });
+  assert.deepEqual(ok.json.result.settings, { mode: 'interval', intervalSec: 10800, enabled: true, influence: false });
+  assert.equal(ok.json.result.effective.intervalSec, 10800);
+
+  const invalidBodies = [
+    { action: 'set-research-settings', settings: { mode: 'hourly' } },
+    { action: 'set-research-settings', settings: { mode: 'interval', intervalSec: 7200 } },
+    { action: 'set-research-settings', settings: { enabled: 'yes' } },
+    { action: 'set-research-settings', settings: { influence: 1 } },
+    { action: 'set-research-settings', settings: { mode: 'interval', unknown: true } },
+    { action: 'set-research-settings', settings: {} },
+    { action: 'set-research-settings' },
+  ];
+  for (const body of invalidBodies) {
+    const bad = await invokeHandler(control.handler, { method: 'POST', body });
+    assert.equal(bad.res.statusCode, 400, `expected 400 for ${JSON.stringify(body)}`);
+    assert.equal(bad.json.ok, false);
+    assert.equal(bad.json.error.code, 'INVALID_SETTINGS');
+  }
+  assert.equal(calls.updateResearchSettings, 1, 'invalid settings never reach the engine');
+  fake.disposeAll();
+});
+
+test('POST /automaton/control validates and applies reward settings', async () => {
+  const fake = createFakeCtx();
+  const { engine, calls } = createFakeEngine();
+  apply(fake.ctx, baseConfig(engine));
+  const control = routeFor(fake.routes, CONTROL_PATH);
+
+  const ok = await invokeHandler(control.handler, {
+    method: 'POST',
+    body: {
+      action: 'set-reward-settings',
+      settings: { enabled: true, period: 'weekly', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: 250 },
+    },
+  });
+  assert.equal(ok.res.statusCode, 200);
+  assert.equal(ok.json.ok, true);
+  assert.equal(ok.json.action, 'set-reward-settings');
+  assert.equal(calls.updateRewardSettings, 1);
+  assert.deepEqual(calls.lastRewardSettings, { enabled: true, period: 'weekly', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: 250 });
+  assert.deepEqual(ok.json.result.settings, calls.lastRewardSettings);
+  assert.equal(ok.json.result.effective.period, 'weekly');
+
+  const nullMax = await invokeHandler(control.handler, {
+    method: 'POST',
+    body: { action: 'set-reward-settings', settings: { maxPerPeriodUsd: null } },
+  });
+  assert.equal(nullMax.res.statusCode, 200);
+  assert.equal(calls.updateRewardSettings, 2);
+  assert.equal(calls.lastRewardSettings.maxPerPeriodUsd, null);
+
+  const invalidBodies = [
+    { action: 'set-reward-settings', settings: { period: 'hourly' } },
+    { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03] } },
+    { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03, 0.6] } },
+    { action: 'set-reward-settings', settings: { rankPercents: [0.05, 0.03, -0.01] } },
+    { action: 'set-reward-settings', settings: { maxPerPeriodUsd: -1 } },
+    { action: 'set-reward-settings', settings: { enabled: 'yes' } },
+    { action: 'set-reward-settings', settings: { unknown: 1 } },
+    { action: 'set-reward-settings', settings: {} },
+  ];
+  for (const body of invalidBodies) {
+    const bad = await invokeHandler(control.handler, { method: 'POST', body });
+    assert.equal(bad.res.statusCode, 400, `expected 400 for ${JSON.stringify(body)}`);
+    assert.equal(bad.json.error.code, 'INVALID_SETTINGS');
+  }
+  assert.equal(calls.updateRewardSettings, 2, 'invalid settings never reach the engine');
+  fake.disposeAll();
+});
+
+test('settings control actions are loopback-only and fail cleanly on an old engine', async () => {
+  const fake = createFakeCtx();
+  const { engine, calls } = createFakeEngine();
+  apply(fake.ctx, baseConfig(engine));
+  const control = routeFor(fake.routes, CONTROL_PATH);
+
+  const remote = await invokeHandler(control.handler, {
+    method: 'POST',
+    remoteAddress: '203.0.113.9',
+    body: { action: 'set-research-settings', settings: { enabled: true } },
+  });
+  assert.equal(remote.res.statusCode, 403);
+  assert.equal(calls.updateResearchSettings, 0);
+  fake.disposeAll();
+
+  const oldFake = createFakeCtx();
+  const old = createFakeEngine({ omitSettingsMethods: true });
+  apply(oldFake.ctx, baseConfig(old.engine));
+  const oldControl = routeFor(oldFake.routes, CONTROL_PATH);
+  const unsupported = await invokeHandler(oldControl.handler, {
+    method: 'POST',
+    body: { action: 'set-reward-settings', settings: { enabled: true } },
+  });
+  assert.equal(unsupported.res.statusCode, 501);
+  assert.equal(unsupported.json.ok, false);
+  assert.equal(unsupported.json.error.code, 'NOT_IMPLEMENTED');
+  oldFake.disposeAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -1971,6 +2276,195 @@ test('pure data mapping: research badges, briefing detail and shadow/influence s
     const summary = helpers.summarize(status);
     assert.equal(summary.research.configured, true);
     assert.equal(summary.research.shadow, false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: research cadence, rewards preview/history and leaderboards', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildStatusPayload({ running: true });
+
+    // ---- research cadence ----
+    assert.equal(helpers.RESEARCH_CADENCE_OPTIONS.length, 7);
+    assert.deepEqual(helpers.RESEARCH_CADENCE_OPTIONS.map((option) => option.key), [
+      'interval:3600',
+      'interval:10800',
+      'interval:21600',
+      'interval:86400',
+      'pre-open',
+      'post-close',
+      'pre-open+post-close',
+    ]);
+    const researchStatus = helpers.researchStatusSummary(status);
+    assert.equal(helpers.researchCadenceKey(researchStatus), 'interval:3600');
+    assert.equal(helpers.researchCadenceKey(null), null);
+
+    const preOpenStatus = helpers.researchStatusSummary(buildStatusPayload({
+      research: {
+        enabled: true,
+        configured: true,
+        influence: true,
+        scheduleMode: 'pre-open',
+        intervalSec: 3600,
+        provider: 'p',
+        model: 'm',
+        runs: 1,
+        errors: 0,
+        configurable: { scheduleModes: ['interval', 'pre-open', 'post-close', 'pre-open+post-close'], intervalOptionsSec: [3600, 10800, 21600, 86400] },
+      },
+    }));
+    assert.equal(helpers.researchCadenceKey(preOpenStatus), 'pre-open');
+    assert.deepEqual(preOpenStatus.configurable.intervalOptionsSec, [3600, 10800, 21600, 86400]);
+
+    assert.deepEqual(helpers.researchSettingsFromCadence('interval:10800', { enabled: true, influence: false }), {
+      mode: 'interval',
+      intervalSec: 10800,
+      enabled: true,
+      influence: false,
+    });
+    assert.deepEqual(helpers.researchSettingsFromCadence('pre-open', { enabled: false }), { mode: 'pre-open', enabled: false });
+    assert.equal(helpers.researchSettingsFromCadence('bogus-key', {}), null);
+
+    // ---- rewards ----
+    const rewards = status.engine.rewards;
+    const rewardsState = helpers.rewardsControlState(rewards);
+    assert.equal(rewardsState.enabled, true);
+    assert.equal(rewardsState.period, 'daily');
+    assert.deepEqual(rewardsState.rankPercents, [0.05, 0.03, 0.02]);
+    assert.equal(rewardsState.accountCashUsd, 15000);
+    assert.equal(rewardsState.poolUsd, 4000);
+    assert.equal(rewardsState.allocationCapRemainingUsd, 16000);
+    assert.equal(rewardsState.lastWinners.length, 3);
+
+    const preview = helpers.rewardsPreview(rewards, [0.05, 0.03, 0.02]);
+    assert.deepEqual(preview.rawAmounts, [750, 450, 300]);
+    assert.equal(preview.totalUsd, 1500);
+    assert.equal(preview.capped, false);
+    assert.equal(preview.scale, 1);
+
+    const poolCapped = helpers.rewardsPreview({ ...rewards, poolUsd: 300 }, [0.05, 0.03, 0.02]);
+    assert.equal(poolCapped.capped, true);
+    assert.equal(poolCapped.cappedBy, 'pool');
+    assert.deepEqual(poolCapped.amounts, [150, 90, 60]);
+    assert.equal(poolCapped.totalUsd, 300);
+
+    const maxCapped = helpers.rewardsPreview({ ...rewards, maxPerPeriodUsd: 100 }, [0.05, 0.03, 0.02]);
+    assert.equal(maxCapped.cappedBy, 'max');
+    assert.deepEqual(maxCapped.amounts, [50, 30, 20]);
+    assert.equal(maxCapped.totalUsd, 100);
+
+    const history = helpers.rewardHistoryRows(status);
+    assert.equal(history.length, 2);
+    assert.equal(history[0].periodKey, '2026-01-01');
+    assert.equal(history[0].totalUsd, 1500);
+    assert.equal(history[0].winners.length, 3);
+    assert.equal(helpers.rewardHistoryRows({}).length, 0);
+
+    const lastWinners = helpers.lastWinnerRows(rewards);
+    assert.equal(lastWinners.length, 3);
+    assert.equal(lastWinners[0].rank, 1);
+    assert.equal(typeof lastWinners[0].name, 'string');
+    assert.equal(lastWinners[0].amountUsd, 750);
+
+    // ---- leaderboards ----
+    const periods = helpers.leaderboardPeriods(status);
+    assert.equal(periods.asOf, '2026-01-02T00:00:00.000Z');
+    assert.equal(periods.daily.length, 24, 'only alive agents are ranked');
+    assert.equal(periods.weekly.length, 24);
+    assert.equal(periods.monthly.length, 24);
+    assert.equal(periods.daily[0].rank, 1);
+    assert.equal(periods.daily[0].medal, '🥇');
+    assert.equal(periods.daily[1].medal, '🥈');
+    assert.equal(periods.daily[2].medal, '🥉');
+    assert.equal(periods.daily[3].medal, null);
+    assert.equal(typeof periods.daily[0].name, 'string');
+    assert.equal(typeof periods.daily[0].pnlPct, 'number');
+    for (let index = 1; index < periods.daily.length; index += 1) {
+      assert.ok((periods.daily[index - 1].pnlPct ?? -Infinity) >= (periods.daily[index].pnlPct ?? -Infinity));
+    }
+    assert.equal(helpers.leaderboardRows(status, 'weekly').length, 24);
+    assert.equal(helpers.leaderboardRows(status, 'bogus').length, 24);
+    const emptyPeriods = helpers.leaderboardPeriods({});
+    assert.deepEqual(emptyPeriods, { asOf: null, daily: [], weekly: [], monthly: [] });
+
+    // ---- agent plan / transactions / ranking badges / pnl ----
+    const rows = helpers.buildAgentRows(status);
+    const planned = rows.find((row) => row.plan);
+    assert.ok(planned);
+    assert.match(planned.plan.summary, /bot/);
+    assert.match(planned.plan.entryRule, /Buy/);
+    assert.equal(planned.plan.exitRules.length, 4);
+    assert.match(planned.plan.riskRule, /size/);
+    assert.match(planned.plan.nextStep, /Waiting/);
+    assert.ok(planned.plan.triggers.length >= 7);
+    assert.ok(planned.plan.triggers.some((trigger) => trigger.key === 'stopPct' && trigger.value.includes('%')));
+    assert.equal(planned.plan.nextResearchAt, '2026-01-02T01:00:00.000Z');
+    assert.equal(helpers.agentPlanMapping(null), null);
+    assert.equal(helpers.agentPlanMapping({}), null);
+
+    const positioned = rows.find((row) => row.plan && row.plan.position);
+    assert.ok(positioned);
+    assert.equal(typeof positioned.plan.position.symbol, 'string');
+    assert.equal(typeof positioned.plan.position.stopPriceUsd, 'number');
+    assert.equal(typeof positioned.plan.position.targetPriceUsd, 'number');
+    assert.equal(typeof positioned.plan.position.barsHeld, 'number');
+    assert.equal(typeof positioned.plan.position.maxHoldBars, 'number');
+    const noPlan = rows.find((row) => row.plan === null);
+    assert.ok(noPlan, 'some agents have no plan yet (empty state)');
+
+    const withOrders = rows.find((row) => row.transactions.length > 0);
+    assert.ok(withOrders);
+    assert.equal(withOrders.transactions.length, 3);
+    const order = withOrders.transactions[0];
+    assert.equal(typeof order.symbol, 'string');
+    assert.ok(['buy', 'sell'].includes(order.side));
+    assert.equal(typeof order.priceUsd, 'number');
+    assert.equal(typeof order.notionalUsd, 'number');
+    assert.equal(typeof order.orderId, 'string');
+    assert.deepEqual(helpers.agentTransactionRows([]), []);
+    assert.equal(helpers.agentTransactionRows(null).length, 0);
+
+    const ranked = rows.find((row) => row.rankBadges.length === 3);
+    assert.ok(ranked);
+    assert.deepEqual(ranked.rankBadges.map((badge) => badge.key), ['day', 'week', 'month']);
+    const unranked = rows.find((row) => row.rankBadges.length === 0);
+    assert.ok(unranked, 'an agent without rankings gets no badges');
+    assert.deepEqual(helpers.agentRankingBadges(null), []);
+    assert.equal(helpers.agentRankingBadges({ dayRank: 1 }).length, 1);
+
+    const withPnl = rows.find((row) => row.pnl);
+    assert.ok(withPnl);
+    assert.equal(typeof withPnl.pnl.netUsd, 'number');
+    assert.equal(typeof withPnl.pnl.weekPct, 'number');
+    assert.equal(helpers.agentPnlMapping(null), null);
+
+    const summary = helpers.summarize(status);
+    assert.equal(summary.rewards.period, 'daily');
+    assert.equal(summary.rankings.asOf, '2026-01-02T00:00:00.000Z');
+
+    // Empty-state payload: no rankings/rewards/orders/plans anywhere.
+    const bareStatus = buildStatusPayload({ running: true, rankings: null, rewards: null });
+    for (const agent of bareStatus.agents) {
+      delete agent.orders;
+      delete agent.plan;
+      delete agent.rankings;
+      delete agent.pnl;
+    }
+    delete bareStatus.engine.rewards;
+    delete bareStatus.rewards;
+    bareStatus.rankings = null;
+    bareStatus.rewards = null;
+    const bareRows = helpers.buildAgentRows(bareStatus);
+    assert.equal(bareRows.every((row) => row.plan === null), true);
+    assert.equal(bareRows.every((row) => row.transactions.length === 0), true);
+    assert.equal(bareRows.every((row) => row.rankBadges.length === 0), true);
+    assert.deepEqual(helpers.leaderboardPeriods(bareStatus), { asOf: null, daily: [], weekly: [], monthly: [] });
+    assert.equal(helpers.lastWinnerRows(null).length, 0);
+    assert.equal(helpers.rewardHistoryRows(bareStatus).length, 0);
+    assert.equal(helpers.rewardsControlState(undefined).available, false);
   } finally {
     loaded.restore();
   }

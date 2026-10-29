@@ -18,8 +18,10 @@ obituary the living read.
 | Control panel | `main` keyed panel `automaton-trading`: the full dashboard opened from the sidebar in the central column — header stats, operator controls, the 30-agent table, per-agent drill-down, generation rollup and obituary feed |
 | Settings page | Settings → Built-in plugins → **Automaton Trading** (`settings.plugins.tab`): the same dashboard as a full page |
 | State route | `GET /automaton/state` — the redacted JSON every dashboard surface polls every 3 s (auto-refresh with pause) |
-| Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop) |
+| Control route | `POST /automaton/control` — loopback-only operator controls used by the panel's buttons (including the operator-only Reaper stop and the research/reward settings actions) |
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
+| Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), winner rewards (period + 1st/2nd/3rd % of account cash + caps) and daily/weekly/monthly leaderboards, all applied through loopback-only control actions |
+| Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, day/week/month P&L |
 
 Everything is dependency-free ESM with no build step; the browser module is loaded as
 plain JavaScript (`./client`). `dsh.client.inject` orders the client half after the real
@@ -53,6 +55,8 @@ stacked below on narrow ones; `Esc` or the × closes it):
 - **Strategy parameters** for both the inherited **genome** and the compiled **spec**
   (lookback / entryZ / exitZ / stop / target / max-hold / size / session), with a warning
   when the compiled spec differs, and a note when an agent has no compiled spec yet;
+- **Strategy & plan**, **Transactions**, **ranking badges** and the research section — see
+  “Agent detail: strategy & plan, transactions, rankings” below;
 - **Role costs** per role (treasurer / prospector / builder / executor / replicator /
   reaper).
 
@@ -135,6 +139,47 @@ research raises its burn exactly like any other inference cost.
   lastRun/nextDue/provider/model/runs/errors) and each agent's `research` are carried by
   `GET /automaton/state`; no research control action or agent tool is added.
 
+### Operator controls: research cadence, rewards, leaderboards
+
+One operator section sits above the agent table (all loopback-only, applied through
+`POST /automaton/control`; no new agent tools):
+
+- **Research cadence** — segmented control `Every 1h / 3h / 6h / 24h`, `Before open`,
+  `After close`, `Before open + after close`, plus collection/influence toggles and
+  **Apply** → `set-research-settings`. Shows the current schedule, `nextDueAt`,
+  provider/model and paused reason. Cadence applies live (researcher reconfigure).
+- **Rewards** — enable toggle, period selector (daily/weekly/monthly), three percentage
+  inputs for 1st/2nd/3rd (default `5/3/2` of the broker account's **cash**), optional
+  max per period, a live preview (`5% × cash ≈ $…` with pool / allocation-cap / max
+  capping shown) and **Apply** → `set-reward-settings`. Below it: last winners and the
+  payout history (last 8 entries).
+- **Leaderboards** — Daily / Weekly / Monthly tabs from `status.rankings`
+  (rank / name / P&L% / P&L$ / equity / trades, 🥇🥈🥉 highlighted, as-of timestamp);
+  clicking a row opens that agent's detail pane.
+
+**Payout semantics:** rewards are **virtual ledger transfers** from the treasury pool
+(`__treasury__`) to agents — the Alpaca client still has no transfer/withdraw surface.
+They are paid **only at period boundaries** (no "pay now"), at most once per period key,
+as `rankPercent × account cash`, proportionally scaled down when the available pool, the
+remaining allocation cap, or `maxPerPeriodUsd` is smaller. `sum(agent equity) + pool`
+stays constant, so reconciliation is unaffected; the rewards history keeps the last 50
+entries.
+
+### Agent detail: strategy & plan, transactions, rankings
+
+Clicking an agent row keeps the existing holdings, activity and research sections and
+adds:
+
+- **Strategy & plan** (`agent.plan`): a plain-language summary, entry rule, exit rules,
+  risk rule, the human "next step", a triggers grid (family/symbol/z-scores/stop/target/
+  hold/size/session), the current position plan (symbol, qty, avg, stop, target, bars held
+  vs max) and the next research time — with an empty state when the engine has no plan yet.
+- **Transactions** (`agent.orders`): the full order/fill history table — time, side,
+  symbol, qty, price, notional, realized P&L and order id — empty state "no transactions
+  yet".
+- **Ranking badges** for day/week/month ranks (medals for the top three) when
+  `agent.rankings` is present, plus day/week/month P&L when `agent.pnl` is present.
+
 ### `POST /automaton/control`
 
 Loopback-only operator surface: requests whose socket address is not loopback
@@ -149,12 +194,28 @@ Content-Type: application/json
 {"action": "stop"}
 {"action": "emergency-stop", "confirm": "STOP"}
 {"action": "reaper-stop", "confirm": "STOP"}
+{"action": "set-research-settings", "settings": {"mode": "interval", "intervalSec": 10800, "enabled": true, "influence": true}}
+{"action": "set-reward-settings", "settings": {"enabled": true, "period": "daily", "rankPercents": [0.05, 0.03, 0.02], "maxPerPeriodUsd": null}}
 ```
+
+Settings actions are validated before they reach the engine (unknown keys and empty
+patches are rejected):
+
+| Action | `settings` fields | Validation |
+|---|---|---|
+| `set-research-settings` | `mode`, `intervalSec`, `enabled`, `influence` | `mode` ∈ `interval` / `pre-open` / `post-close` / `pre-open+post-close`; `intervalSec` ∈ `3600` / `10800` / `21600` / `86400`; booleans for `enabled`/`influence` |
+| `set-reward-settings` | `enabled`, `period`, `rankPercents`, `maxPerPeriodUsd` | `period` ∈ `daily` / `weekly` / `monthly`; `rankPercents` exactly 3 numbers in `0..0.5`; `maxPerPeriodUsd` `null` or `0..1_000_000`; boolean `enabled` |
+
+Success for both is `200 {"ok":true,"action":"…","result":{"settings":{…},"effective":{…}}}`.
+They delegate to `engine.updateResearchSettings(settings)` /
+`engine.updateRewardSettings(settings)`; an engine build without those methods returns
+`501 NOT_IMPLEMENTED` instead of crashing, and the settings are never exposed as agent
+tools.
 
 | Response | Meaning |
 |---|---|
 | `200 {"ok":true,"action":"…","result":{…}}` | action accepted (`start`/`stop` result is the redacted engine view; `reaper-stop` result is `{stopped,pid,alive,reason?,signals?,heartbeat?}`) |
-| `400` `BAD_ACTION` / `BAD_JSON` / `CONFIRM_REQUIRED` | malformed body, unknown action, or `emergency-stop`/`reaper-stop` without `confirm: "STOP"` |
+| `400` `BAD_ACTION` / `BAD_JSON` / `CONFIRM_REQUIRED` / `INVALID_SETTINGS` | malformed body, unknown action, `emergency-stop`/`reaper-stop` without `confirm: "STOP"`, or invalid settings patch |
 | `403` `FORBIDDEN` | request did not arrive over a loopback connection |
 | `405` `METHOD_NOT_ALLOWED` | not a `POST` |
 | `409` `LIVE_NOT_ARMED` | `start` in live mode before the operator armed `LIVE_ARMED` |
@@ -193,6 +254,16 @@ so the new client module + routes load), verify:
    `—`), clicking an agent shows the briefing section, and a "research disabled" note
    appears instead when the Host has no LLM bridge. `GET /automaton/state` carries
    `engine.research` and `agents[].research`.
+8. Operator controls: the research cadence segmented control applies a new schedule
+   (`nextDueAt`/mode change in the panel), the rewards card previews 1st/2nd/3rd amounts
+   and saves them, and the leaderboards tabs show daily/weekly/monthly ranks (rows open
+   the agent detail). `POST /automaton/control` with
+   `{"action":"set-research-settings","settings":{"mode":"pre-open"}}` and
+   `{"action":"set-reward-settings","settings":{"period":"weekly"}}` return
+   `{"ok":true,"result":{"settings":…,"effective":…}}`.
+9. Agent detail: the "Strategy & plan" and "Transactions" sections render from
+   `agents[].plan` / `agents[].orders`, and day/week/month ranking badges show when
+   `agents[].rankings` exists.
 
 ## Configuration
 
@@ -270,8 +341,16 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
 - **Controls are local-only.** `POST /automaton/control` is loopback-only and is the only
   write surface the UI has. `start`/`stop`/`emergency-stop` map exactly to
   `engine.start` / `engine.stop` / `engine.emergencyStop`; `emergency-stop` and the
-  operator-only `reaper-stop` require `confirm: "STOP"`. No dashboard surface can clear
-  the kill switch, place an order, or change the engine configuration.
+  operator-only `reaper-stop` require `confirm: "STOP"`. `set-research-settings` /
+  `set-reward-settings` only call the engine's validated settings updaters. No dashboard
+  surface can clear the kill switch, place an order, or change the engine configuration
+  directly.
+- **Rewards are virtual ledger transfers.** Winner payouts move cash from the treasury
+  pool (`__treasury__`) to agents; the broker client still has no transfer/withdraw
+  surface (brake D1). Payouts happen only at period boundaries, at most once per period
+  key, and are capped by the available pool, the remaining allocation cap and
+  `maxPerPeriodUsd`; `sum(agent equity) + pool` stays constant so reconciliation is
+  unaffected. The panel has no "pay now" action.
 - **Kill switch:** `automaton_emergency_stop` (tool or control panel) writes
   `<stateDir>/KILL_SWITCH`; every order and cycle is denied while the file exists, and
   the panel's red indicator follows the marker file itself (not a possibly-stale engine
@@ -300,10 +379,10 @@ network, a broker, or the Harness profile. (Under the Windows DSH sandbox the de
 `node --test <file>` runner cannot spawn its per-file worker — `spawn EPERM` — so run the
 file in-process with `node test/plugin.test.js` or disable test isolation as shown.)
 
-Layout: `index.js` (Host tools + state/control routes + engine lifecycle + the
-operator-only Reaper stop helper), `client.js` (shared dashboard: sidebar entry + keyed
-`main` panel + settings page; agent names/genome-vs-spec/holdings/activity mapping and
-Reaper telemetry are pure functions exported as `helpers` for tests),
-`locale/{en,zh}.json` (plugin metadata), `icon.svg`, `test/plugin.test.js`, `src/**`
-(engine implemented by the core project).
+Layout: `index.js` (Host tools + state/control routes + engine lifecycle + validator for
+research/reward settings + the operator-only Reaper stop helper), `client.js` (shared
+dashboard: sidebar entry + keyed `main` panel + settings page; names/genome-vs-spec/
+holdings/activity/research/cadence/rewards/leaderboards/plan/transactions mapping are pure
+functions exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata),
+`icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the core project).
 

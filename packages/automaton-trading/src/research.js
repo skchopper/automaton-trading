@@ -279,8 +279,19 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
   const enabled = cfg.enabled !== false;
   const configured = typeof generate === 'function';
   const influence = cfg.influence === true;
-  const intervalMs = Math.max(60, Number(cfg.intervalSec) || 3600) * 1000;
-  const staggerMs = Math.max(0, Number(cfg.staggerSec) || 0) * 1000;
+  let intervalMs = Math.max(60, Number(cfg.intervalSec) || 3600) * 1000;
+  let staggerMs = Math.max(0, Number(cfg.staggerSec) || 0) * 1000;
+  let scheduleMode = ['interval', 'pre-open', 'post-close', 'pre-open+post-close'].includes(cfg.scheduleMode)
+    ? cfg.scheduleMode
+    : 'interval';
+  let preMarketOffsetMs = Math.max(0, Number(cfg.preMarketOffsetMin) || 30) * 60 * 1000;
+  let postCloseOffsetMs = Math.max(0, Number(cfg.postCloseOffsetMin) || 30) * 60 * 1000;
+  let lastMarketClock = null;
+  let wasMarketOpen = null;
+  let lastCloseMs = null;
+  // Timestamp of the last cadence change: a run that happened BEFORE the operator switched to an
+  // event window must not count as having served that window.
+  let modeChangedAtMs = 0;
   const maxRunsPerCycle = Math.max(1, Math.min(10, Number(cfg.maxRunsPerCycle) || 3));
   const maxNews = Math.max(1, Math.min(20, Number(cfg.maxNewsPerAgent) || 6));
   const lookbackMs = Math.max(1, Number(cfg.newsLookbackHours) || 24) * 60 * 60 * 1000;
@@ -577,26 +588,96 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
     return outcome;
   }
 
-  /** Agents whose research is due (interval + per-agent stagger). */
+  /** Track the market clock to detect the session close (used by post-close schedules). */
+  function observeMarket(marketClock, nowMs) {
+    if (!marketClock || typeof marketClock !== 'object') return;
+    lastMarketClock = marketClock;
+    const open = marketClock.isOpen === true;
+    if (wasMarketOpen === true && open === false) lastCloseMs = nowMs;
+    wasMarketOpen = open;
+  }
+
+  /** Time windows that trigger event-based research (returns [{startMs, endMs, kind}]). */
+  function eventWindows(nowMs) {
+    const windows = [];
+    const clock = lastMarketClock ?? {};
+    const nextOpenMs = numberOrNull(clock.nextOpen) ?? (typeof clock.nextOpen === 'string' ? Date.parse(clock.nextOpen) : null);
+    const nextCloseMs = numberOrNull(clock.nextClose) ?? (typeof clock.nextClose === 'string' ? Date.parse(clock.nextClose) : null);
+    const wantsPre = scheduleMode === 'pre-open' || scheduleMode === 'pre-open+post-close';
+    const wantsPost = scheduleMode === 'post-close' || scheduleMode === 'pre-open+post-close';
+    if (wantsPre && Number.isFinite(nextOpenMs) && nextOpenMs > 0) {
+      windows.push({ kind: 'pre-open', startMs: nextOpenMs - preMarketOffsetMs, endMs: nextOpenMs });
+    }
+    if (wantsPost) {
+      // If the session is open, the close is ahead of us; once closed we rely on the observed
+      // transition so a post-close window is not skipped across an app restart mid-session.
+      const closeMs = Number.isFinite(nextCloseMs) ? nextCloseMs : null;
+      const open = clock.isOpen === true;
+      const anchor = !open && lastCloseMs !== null ? lastCloseMs : closeMs;
+      if (Number.isFinite(anchor) && anchor > 0) {
+        windows.push({ kind: 'post-close', startMs: anchor, endMs: anchor + postCloseOffsetMs });
+      }
+    }
+    return windows.filter((window) => window.endMs > window.startMs && nowMs < window.endMs);
+  }
+
+  /** Agents whose research is due (interval + per-agent stagger, or market-event windows). */
   function dueAgents(nowMs) {
     const alive = registry.alive();
     const due = [];
-    alive.forEach((agent, index) => {
+    if (scheduleMode === 'interval') {
+      alive.forEach((agent, index) => {
+        const state = ensureState(agent.id);
+        const firstDue = startedAtMs + index * staggerMs;
+        const dueAt = state.lastRunAt > 0 ? state.lastRunAt + intervalMs : firstDue;
+        if (nowMs >= dueAt) due.push(agent);
+      });
+      return due;
+    }
+    const windows = eventWindows(nowMs);
+    for (const agent of alive) {
       const state = ensureState(agent.id);
-      const firstDue = startedAtMs + index * staggerMs;
-      const dueAt = state.lastRunAt > 0 ? state.lastRunAt + intervalMs : firstDue;
-      if (nowMs >= dueAt) due.push(agent);
-    });
+      for (const window of windows) {
+        if (nowMs < window.startMs || nowMs >= window.endMs) continue;
+        // "Served" means the agent already ran INSIDE this window (e.g. an interval run that
+        // happened just before switching modes does not count, so the window is still honoured).
+        const served = state.lastRunAt >= window.startMs && state.lastRunAt < window.endMs && state.lastRunAt > modeChangedAtMs;
+        if (!served) {
+          due.push(agent);
+          break;
+        }
+      }
+    }
     return due;
   }
 
+  /** Nearest upcoming research time for the schedule mode (dashboard display). */
+  function nextDueAt(nowMs) {
+    const alive = registry.alive();
+    if (scheduleMode === 'interval') {
+      let next = null;
+      alive.forEach((agent, index) => {
+        const state = ensureState(agent.id);
+        const dueAt = state.lastRunAt > 0 ? state.lastRunAt + intervalMs : startedAtMs + index * staggerMs;
+        if (next === null || dueAt < next) next = dueAt;
+      });
+      return next;
+    }
+    const windows = eventWindows(nowMs);
+    const current = windows.find((window) => nowMs >= window.startMs && nowMs < window.endMs);
+    if (current) return current.startMs;
+    const upcoming = windows.filter((window) => window.startMs > nowMs).map((window) => window.startMs);
+    return upcoming.length > 0 ? Math.min(...upcoming) : null;
+  }
+
   /**
-   * One research pass. Called once per engine cycle; only agents whose hourly slot is due get a
+   * One research pass. Called once per engine cycle; only agents whose slot/window is due get a
    * briefing. Returns a compact trace summary.
    */
-  async function tick() {
+  async function tick({ marketClock } = {}) {
     await init();
     const nowMs = currentClock.now();
+    observeMarket(marketClock, nowMs);
     if (!enabled || !configured) {
       return {
         enabled,
@@ -674,24 +755,41 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
     };
   }
 
+  /** Live operator reconfiguration from the control panel (no restart needed). */
+  function reconfigure(patch = {}) {
+    if (!patch || typeof patch !== 'object') return schedule();
+    if (['interval', 'pre-open', 'post-close', 'pre-open+post-close'].includes(patch.scheduleMode)) {
+      scheduleMode = patch.scheduleMode;
+      modeChangedAtMs = currentClock.now();
+    }
+    const nextIntervalSec = numberOrNull(patch.intervalSec);
+    if (nextIntervalSec !== null && nextIntervalSec >= 60) intervalMs = nextIntervalSec * 1000;
+    if (Number.isFinite(Number(patch.staggerSec)) && Number(patch.staggerSec) >= 0) staggerMs = Number(patch.staggerSec) * 1000;
+    if (Number.isFinite(Number(patch.preMarketOffsetMin)) && Number(patch.preMarketOffsetMin) >= 0) {
+      preMarketOffsetMs = Number(patch.preMarketOffsetMin) * 60 * 1000;
+    }
+    if (Number.isFinite(Number(patch.postCloseOffsetMin)) && Number(patch.postCloseOffsetMin) >= 0) {
+      postCloseOffsetMs = Number(patch.postCloseOffsetMin) * 60 * 1000;
+    }
+    return schedule();
+  }
+
   function schedule() {
     const nowMs = currentClock.now();
     const alive = registry.alive();
-    let nextDueAt = null;
-    alive.forEach((agent, index) => {
-      const state = ensureState(agent.id);
-      const dueAt = state.lastRunAt > 0 ? state.lastRunAt + intervalMs : startedAtMs + index * staggerMs;
-      if (nextDueAt === null || dueAt < nextDueAt) nextDueAt = dueAt;
-    });
+    const nextAt = nextDueAt(nowMs);
     return {
       enabled,
       configured,
       influence,
+      scheduleMode,
       intervalSec: Math.round(intervalMs / 1000),
       staggerSec: Math.round(staggerMs / 1000),
+      preMarketOffsetMin: Math.round(preMarketOffsetMs / 60 / 1000),
+      postCloseOffsetMin: Math.round(postCloseOffsetMs / 60 / 1000),
       maxRunsPerCycle,
       lastRunAt: lastRunAt === null ? null : new Date(lastRunAt).toISOString(),
-      nextDueAt: nextDueAt === null ? null : new Date(nextDueAt).toISOString(),
+      nextDueAt: nextAt === null ? null : new Date(nextAt).toISOString(),
       pausedUntil: pausedUntilMs > currentClock.now() ? new Date(pausedUntilMs).toISOString() : null,
       pauseReason,
       provider: lastProvider,
@@ -703,7 +801,39 @@ export function createResearcher({ broker, registry, ledger, config, paths, cloc
     };
   }
 
-  return { tick, latest, latestAny, schedule, init, _internals: { dueAgents, runOne, symbolsFor, SYSTEM_PROMPT } };
+  /** Next research attempt time for one agent (dashboard display; ISO or null). */
+  function nextFor(agentId) {
+    const nowMs = currentClock.now();
+    const alive = registry.alive();
+    if (scheduleMode === 'interval') {
+      const index = alive.findIndex((agent) => agent.id === agentId);
+      const state = ensureState(agentId);
+      const dueAt = state.lastRunAt > 0
+        ? state.lastRunAt + intervalMs
+        : startedAtMs + Math.max(0, index) * staggerMs;
+      return new Date(Math.max(nowMs, dueAt)).toISOString();
+    }
+    const state = ensureState(agentId);
+    const windows = eventWindows(nowMs);
+    const active = windows.find((window) => {
+      if (nowMs < window.startMs || nowMs >= window.endMs) return false;
+      return !(state.lastRunAt >= window.startMs && state.lastRunAt < window.endMs && state.lastRunAt > modeChangedAtMs);
+    });
+    if (active) return new Date(nowMs).toISOString();
+    const upcoming = windows.filter((window) => window.startMs > nowMs).map((window) => window.startMs);
+    return upcoming.length > 0 ? new Date(Math.min(...upcoming)).toISOString() : null;
+  }
+
+  return {
+    tick,
+    latest,
+    latestAny,
+    schedule,
+    reconfigure,
+    nextFor,
+    init,
+    _internals: { dueAgents, runOne, symbolsFor, SYSTEM_PROMPT, eventWindows },
+  };
 }
 
 /** Default HTTP research generator for headless CLI runs (DeepSeek-compatible chat completion). */

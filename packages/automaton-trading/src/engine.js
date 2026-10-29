@@ -548,8 +548,7 @@ export function createEngine(options = {}) {
     return { liveArmed: true };
   }
 
-  function configView() {
-    const state = loaded;
+  function configView() {    const state = loaded;
     if (!state) {
       const result = configFromOptions();
       return { config: publicConfig(result.config), summary: configSummary(result.config), sources: result.sources };
@@ -560,6 +559,145 @@ export function createEngine(options = {}) {
       sources: state.sources,
       stateDir: state.paths.stateDir,
       envFile: state.paths.envFile,
+    };
+  }
+
+  /**
+   * Persist one operator-owned settings section into `stateDir/settings.json` (applied after the
+   * base config on every load, so it survives restarts), validate by re-loading the layered config,
+   * and roll back if the new values are invalid.
+   */
+  async function patchSettingsSection(section, patch) {
+    const state = await load();
+    const file = state.paths.settingsFile;
+    const previous = fileExists(file) ? await readJson(file, null) : null;
+    const base = previous && typeof previous === 'object' ? previous : {};
+    const merged = {
+      ...base,
+      [section]: {
+        ...(base[section] && typeof base[section] === 'object' ? base[section] : {}),
+        ...patch,
+      },
+    };
+    await writeJsonAtomic(file, merged);
+    try {
+      const validated = configFromOptions();
+      loaded = { ...loaded, config: validated.config, secrets: validated.secrets, sources: validated.sources };
+      return validated.config;
+    } catch (error) {
+      if (previous === null) {
+        try {
+          await removeFile(file);
+        } catch {
+          /* best effort rollback */
+        }
+      } else {
+        await writeJsonAtomic(file, previous);
+      }
+      throw error;
+    }
+  }
+
+  const RESEARCH_SCHEDULE_MODES = ['interval', 'pre-open', 'post-close', 'pre-open+post-close'];
+  const RESEARCH_INTERVAL_OPTIONS = [3600, 10800, 21600, 86400];
+  const REWARD_PERIODS = ['daily', 'weekly', 'monthly'];
+
+  function operatorError(message, code = 'CONFIG_INVALID') {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  async function updateResearchSettings(settings = {}) {
+    const patch = {};
+    if (settings.mode !== undefined) patch.scheduleMode = settings.mode;
+    if (settings.scheduleMode !== undefined) patch.scheduleMode = settings.scheduleMode;
+    if (patch.scheduleMode !== undefined && !RESEARCH_SCHEDULE_MODES.includes(patch.scheduleMode)) {
+      throw operatorError(`research scheduleMode must be one of ${RESEARCH_SCHEDULE_MODES.join('|')}`);
+    }
+    if (settings.intervalSec !== undefined) {
+      const intervalSec = Number(settings.intervalSec);
+      if (!RESEARCH_INTERVAL_OPTIONS.includes(intervalSec)) {
+        throw operatorError(`research intervalSec must be one of ${RESEARCH_INTERVAL_OPTIONS.join(',')}`);
+      }
+      patch.intervalSec = intervalSec;
+    }
+    if (settings.enabled !== undefined) patch.enabled = Boolean(settings.enabled);
+    if (settings.influence !== undefined) patch.influence = Boolean(settings.influence);
+    for (const key of ['preMarketOffsetMin', 'postCloseOffsetMin']) {
+      if (settings[key] !== undefined) {
+        const value = Number(settings[key]);
+        if (!Number.isFinite(value) || value < 0 || value > 180) {
+          throw operatorError(`research.${key} must be a number between 0 and 180`);
+        }
+        patch[key] = value;
+      }
+    }
+    const config = await patchSettingsSection('research', patch);
+    let live = null;
+    if (automaton && typeof automaton.updateResearchSettings === 'function') {
+      live = automaton.updateResearchSettings(patch);
+      if (typeof automaton.refreshSnapshot === 'function') await automaton.refreshSnapshot();
+    }
+    return {
+      settings: {
+        scheduleMode: config.research.scheduleMode,
+        intervalSec: config.research.intervalSec,
+        preMarketOffsetMin: config.research.preMarketOffsetMin,
+        postCloseOffsetMin: config.research.postCloseOffsetMin,
+        enabled: config.research.enabled,
+        influence: config.research.influence,
+      },
+      appliedLive: Boolean(live),
+      schedule: live?.schedule ?? null,
+    };
+  }
+
+  async function updateRewardSettings(settings = {}) {
+    const patch = {};
+    if (settings.enabled !== undefined) {
+      if (typeof settings.enabled !== 'boolean') throw operatorError('rewards.enabled must be a boolean');
+      patch.enabled = settings.enabled;
+    }
+    if (settings.period !== undefined) {
+      if (!REWARD_PERIODS.includes(settings.period)) {
+        throw operatorError(`rewards.period must be one of ${REWARD_PERIODS.join('|')}`);
+      }
+      patch.period = settings.period;
+    }
+    if (settings.rankPercents !== undefined) {
+      const percents = settings.rankPercents;
+      if (!Array.isArray(percents) || percents.length !== 3 || percents.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 0.5)) {
+        throw operatorError('rewards.rankPercents must be exactly 3 numbers between 0 and 0.5');
+      }
+      patch.rankPercents = percents.map((value) => Number(value));
+    }
+    if (settings.maxPerPeriodUsd !== undefined) {
+      if (settings.maxPerPeriodUsd !== null) {
+        const max = Number(settings.maxPerPeriodUsd);
+        if (!Number.isFinite(max) || max < 0 || max > 1_000_000) {
+          throw operatorError('rewards.maxPerPeriodUsd must be null or a number between 0 and 1000000');
+        }
+        patch.maxPerPeriodUsd = max;
+      } else {
+        patch.maxPerPeriodUsd = null;
+      }
+    }
+    const config = await patchSettingsSection('rewards', patch);
+    let live = null;
+    if (automaton && typeof automaton.updateRewardSettings === 'function') {
+      live = await automaton.updateRewardSettings(patch);
+      if (typeof automaton.refreshSnapshot === 'function') await automaton.refreshSnapshot();
+    }
+    return {
+      settings: {
+        enabled: config.rewards.enabled,
+        period: config.rewards.period,
+        rankPercents: config.rewards.rankPercents,
+        maxPerPeriodUsd: config.rewards.maxPerPeriodUsd,
+      },
+      appliedLive: Boolean(live),
+      status: live?.status ?? null,
     };
   }
 
@@ -577,6 +715,8 @@ export function createEngine(options = {}) {
     clearEmergencyStop,
     armsLive,
     configView,
+    updateResearchSettings,
+    updateRewardSettings,
     isRunning: () => Boolean(automaton && automaton.isRunning()),
     get config() {
       return loaded?.config ?? null;

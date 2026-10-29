@@ -107,6 +107,81 @@ window.__ModuleLoader__.load({
       researchHourly: 'hourly',
       researchBadgeHint: 'isolated hourly news analyst',
       researchNone: '—',
+      cadence: 'Research cadence',
+      cadenceMode: 'Schedule',
+      cadenceInterval: 'Interval',
+      cadence1h: 'Every 1h',
+      cadence3h: 'Every 3h',
+      cadence6h: 'Every 6h',
+      cadence24h: 'Every 24h',
+      cadencePreOpen: 'Before open',
+      cadencePostClose: 'After close',
+      cadencePreOpenPostClose: 'Before open + after close',
+      cadenceApply: 'Apply cadence',
+      cadenceCurrent: 'Current',
+      cadenceNextDue: 'Next due',
+      cadenceCustom: 'custom interval',
+      rewards: 'Rewards',
+      rewardsEnabled: 'Rewards enabled',
+      rewardsPeriod: 'Period',
+      rewardsDaily: 'Daily',
+      rewardsWeekly: 'Weekly',
+      rewardsMonthly: 'Monthly',
+      rewardsFirst: '1st',
+      rewardsSecond: '2nd',
+      rewardsThird: '3rd',
+      rewardsMax: 'Max / period',
+      rewardsNoMax: '(no cap)',
+      rewardsPreview: 'Preview',
+      rewardsCash: 'account cash',
+      rewardsPool: 'pool available',
+      rewardsCapRemaining: 'allocation cap remaining',
+      rewardsApply: 'Apply rewards',
+      rewardsLastRun: 'Last payout',
+      rewardsNextRun: 'Next boundary',
+      rewardsLastWinners: 'Last winners',
+      rewardsHistory: 'Payout history',
+      rewardsNoHistory: 'no payouts yet',
+      rewardsPayBoundary: 'payouts happen only at period boundaries — no pay-now',
+      rewardsTotal: 'total',
+      rewardsCappedBy: 'capped by',
+      rewardsPoolCap: 'pool',
+      rewardsAllocationCap: 'allocation cap',
+      rewardsMaxCap: 'max/period',
+      rewardsDisabledNote: 'rewards are disabled',
+      leaderboards: 'Leaderboards',
+      lbDaily: 'Daily',
+      lbWeekly: 'Weekly',
+      lbMonthly: 'Monthly',
+      lbRank: 'Rank',
+      lbName: 'Agent',
+      lbPnlPct: 'P&L %',
+      lbPnlUsd: 'P&L $',
+      lbEquity: 'Equity',
+      lbTrades: 'Trades',
+      lbEmpty: 'no leaderboard data yet',
+      lbAsOf: 'as of',
+      plan: 'Strategy & plan',
+      planSummary: 'Summary',
+      planEntry: 'Entry rule',
+      planExit: 'Exit rules',
+      planRisk: 'Risk rule',
+      planNext: 'Next step',
+      planTriggers: 'Triggers',
+      planPosition: 'Position plan',
+      planNoPosition: 'no open position',
+      planNextResearch: 'Next research',
+      planEmpty: 'no strategy plan yet',
+      tx: 'Transactions',
+      txEmpty: 'no transactions yet',
+      txOrderId: 'Order',
+      rankDay: 'D',
+      rankWeek: 'W',
+      rankMonth: 'M',
+      rankBadge: 'Rank',
+      operatorControls: 'Operator controls',
+      cadenceEnabled: 'Collection',
+      cadenceInfluence: 'Influence trades',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -278,6 +353,81 @@ window.__ModuleLoader__.load({
       researchHourly: '每小时',
       researchBadgeHint: '隔离的每小时新闻分析',
       researchNone: '—',
+      cadence: '研究频率',
+      cadenceMode: '计划',
+      cadenceInterval: '间隔',
+      cadence1h: '每 1 小时',
+      cadence3h: '每 3 小时',
+      cadence6h: '每 6 小时',
+      cadence24h: '每 24 小时',
+      cadencePreOpen: '开盘前',
+      cadencePostClose: '收盘后',
+      cadencePreOpenPostClose: '开盘前 + 收盘后',
+      cadenceApply: '应用频率',
+      cadenceCurrent: '当前',
+      cadenceNextDue: '下次到期',
+      cadenceCustom: '自定义间隔',
+      rewards: '奖励',
+      rewardsEnabled: '启用奖励',
+      rewardsPeriod: '周期',
+      rewardsDaily: '每日',
+      rewardsWeekly: '每周',
+      rewardsMonthly: '每月',
+      rewardsFirst: '第 1 名',
+      rewardsSecond: '第 2 名',
+      rewardsThird: '第 3 名',
+      rewardsMax: '每周期上限',
+      rewardsNoMax: '（无上限）',
+      rewardsPreview: '预览',
+      rewardsCash: '账户现金',
+      rewardsPool: '可分配池',
+      rewardsCapRemaining: '剩余分配上限',
+      rewardsApply: '应用奖励设置',
+      rewardsLastRun: '上次发放',
+      rewardsNextRun: '下个周期边界',
+      rewardsLastWinners: '上次获奖者',
+      rewardsHistory: '发放历史',
+      rewardsNoHistory: '暂无发放记录',
+      rewardsPayBoundary: '仅在周期边界发放 —— 不提供“立即发放”',
+      rewardsTotal: '合计',
+      rewardsCappedBy: '受限于',
+      rewardsPoolCap: '可分配池',
+      rewardsAllocationCap: '分配上限',
+      rewardsMaxCap: '每周期上限',
+      rewardsDisabledNote: '奖励已禁用',
+      leaderboards: '排行榜',
+      lbDaily: '每日',
+      lbWeekly: '每周',
+      lbMonthly: '每月',
+      lbRank: '排名',
+      lbName: '个体',
+      lbPnlPct: '盈亏 %',
+      lbPnlUsd: '盈亏 $',
+      lbEquity: '权益',
+      lbTrades: '成交',
+      lbEmpty: '暂无排行榜数据',
+      lbAsOf: '截至',
+      plan: '策略与计划',
+      planSummary: '摘要',
+      planEntry: '入场规则',
+      planExit: '离场规则',
+      planRisk: '风险规则',
+      planNext: '下一步',
+      planTriggers: '触发条件',
+      planPosition: '持仓计划',
+      planNoPosition: '暂无持仓',
+      planNextResearch: '下次研究',
+      planEmpty: '暂无策略计划',
+      tx: '交易记录',
+      txEmpty: '暂无交易记录',
+      txOrderId: '订单',
+      rankDay: '日',
+      rankWeek: '周',
+      rankMonth: '月',
+      rankBadge: '排名',
+      operatorControls: '操作员控制',
+      cadenceEnabled: '收集简报',
+      cadenceInfluence: '影响交易',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -799,6 +949,10 @@ window.__ModuleLoader__.load({
           influence: null,
           shadow: false,
           disabledReason: null,
+          scheduleMode: null,
+          configurable: { scheduleModes: null, intervalOptionsSec: null },
+          note: null,
+          pausedReason: null,
           intervalSec: null,
           lastRunAt: null,
           nextDueAt: null,
@@ -812,6 +966,7 @@ window.__ModuleLoader__.load({
       const enabled = raw.enabled === true ? true : raw.enabled === false ? false : null;
       const influence = raw.influence === true ? true : raw.influence === false ? false : null;
       const disabledReason = configured === false ? 'unconfigured' : enabled === false ? 'disabled' : null;
+      const configurable = plainObject(raw.configurable);
       return {
         available: true,
         enabled,
@@ -819,6 +974,13 @@ window.__ModuleLoader__.load({
         influence,
         shadow: influence === false,
         disabledReason,
+        scheduleMode: typeof raw.scheduleMode === 'string' ? raw.scheduleMode : null,
+        configurable: {
+          scheduleModes: Array.isArray(configurable.scheduleModes) ? configurable.scheduleModes : null,
+          intervalOptionsSec: Array.isArray(configurable.intervalOptionsSec) ? configurable.intervalOptionsSec.map((value) => toNumber(value)).filter((value) => value !== null) : null,
+        },
+        note: typeof raw.note === 'string' ? raw.note : null,
+        pausedReason: raw.pausedReason ?? raw.note ?? null,
         intervalSec: toNumber(raw.intervalSec),
         lastRunAt: raw.lastRunAt ?? null,
         nextDueAt: raw.nextDueAt ?? null,
@@ -835,6 +997,276 @@ window.__ModuleLoader__.load({
       if (statusResearch.influence === true) return 'researchInfluence';
       if (statusResearch.influence === false) return 'researchShadow';
       return 'researchUnknown';
+    }
+
+    // -----------------------------------------------------------------------
+    // operator controls mapping: research cadence, rewards, leaderboards
+    // -----------------------------------------------------------------------
+
+    /** Cadence options (docs/CONTROL-PANEL.md): keys double as UI values. */
+    const RESEARCH_CADENCE_OPTIONS = Object.freeze([
+      { key: 'interval:3600', mode: 'interval', intervalSec: 3600, labelKey: 'cadence1h' },
+      { key: 'interval:10800', mode: 'interval', intervalSec: 10800, labelKey: 'cadence3h' },
+      { key: 'interval:21600', mode: 'interval', intervalSec: 21600, labelKey: 'cadence6h' },
+      { key: 'interval:86400', mode: 'interval', intervalSec: 86400, labelKey: 'cadence24h' },
+      { key: 'pre-open', mode: 'pre-open', intervalSec: null, labelKey: 'cadencePreOpen' },
+      { key: 'post-close', mode: 'post-close', intervalSec: null, labelKey: 'cadencePostClose' },
+      { key: 'pre-open+post-close', mode: 'pre-open+post-close', intervalSec: null, labelKey: 'cadencePreOpenPostClose' },
+    ]);
+
+    /** Current cadence selection key for one research-status projection. */
+    function researchCadenceKey(statusResearch) {
+      if (!statusResearch || statusResearch.available !== true) return null;
+      const mode = typeof statusResearch.scheduleMode === 'string' ? statusResearch.scheduleMode : null;
+      if (mode !== null && mode !== 'interval') return mode;
+      const interval = toNumber(statusResearch.intervalSec);
+      if (mode === 'interval' || interval !== null) {
+        const option = RESEARCH_CADENCE_OPTIONS.find((candidate) => candidate.mode === 'interval' && candidate.intervalSec === interval);
+        return option ? option.key : `interval:${interval ?? 3600}`;
+      }
+      return null;
+    }
+
+    /** Build the `set-research-settings` patch from a cadence key + toggles. */
+    function researchSettingsFromCadence(cadenceKey, { enabled, influence } = {}) {
+      const option = RESEARCH_CADENCE_OPTIONS.find((candidate) => candidate.key === cadenceKey);
+      if (!option) return null;
+      const patch = { mode: option.mode };
+      if (option.mode === 'interval' && option.intervalSec !== null) patch.intervalSec = option.intervalSec;
+      if (typeof enabled === 'boolean') patch.enabled = enabled;
+      if (typeof influence === 'boolean') patch.influence = influence;
+      return patch;
+    }
+
+    /** Normalized `engine.rewards` view for the operator rewards card. */
+    function rewardsControlState(statusRewards) {
+      const raw = plainObject(statusRewards);
+      const percents = Array.isArray(raw.rankPercents) && raw.rankPercents.length === 3
+        ? raw.rankPercents.map((value) => toNumber(value) ?? 0)
+        : [0.05, 0.03, 0.02];
+      return {
+        available: Object.keys(raw).length > 0,
+        enabled: raw.enabled !== false,
+        period: ['daily', 'weekly', 'monthly'].includes(raw.period) ? raw.period : 'daily',
+        rankPercents: percents,
+        basis: typeof raw.basis === 'string' ? raw.basis : 'account-cash',
+        maxPerPeriodUsd: raw.maxPerPeriodUsd === null || raw.maxPerPeriodUsd === undefined ? null : toNumber(raw.maxPerPeriodUsd),
+        accountCashUsd: toNumber(raw.accountCashUsd),
+        poolUsd: toNumber(raw.poolUsd),
+        allocationCapRemainingUsd: toNumber(raw.allocationCapRemainingUsd),
+        lastRunAt: raw.lastRunAt ?? null,
+        nextRunAt: raw.nextRunAt ?? null,
+        lastWinners: Array.isArray(raw.lastWinners) ? raw.lastWinners : [],
+      };
+    }
+
+    /**
+     * Money preview for the configured rank percentages, capped exactly like the rewards
+     * module: proportional scaling when pool / allocation-cap / max-per-period are short.
+     */
+    function rewardsPreview(stateRewards, rankPercents) {
+      const state = rewardsControlState(stateRewards);
+      const percents = Array.isArray(rankPercents) && rankPercents.length === 3
+        ? rankPercents.map((value) => toNumber(value) ?? 0)
+        : state.rankPercents;
+      const cash = state.accountCashUsd;
+      const rawAmounts = percents.map((percent) => (cash === null ? null : round2(percent * cash)));
+      const rawTotal = rawAmounts.reduce((total, amount) => total + (amount ?? 0), 0);
+      const caps = [];
+      if (state.poolUsd !== null) caps.push({ key: 'pool', availableUsd: state.poolUsd });
+      if (state.allocationCapRemainingUsd !== null) caps.push({ key: 'allocation', availableUsd: state.allocationCapRemainingUsd });
+      if (state.maxPerPeriodUsd !== null) caps.push({ key: 'max', availableUsd: state.maxPerPeriodUsd });
+      let scale = 1;
+      let cappedBy = null;
+      for (const cap of caps) {
+        if (rawTotal <= 0) break;
+        if (cap.availableUsd < rawTotal * scale) {
+          scale = Math.max(0, cap.availableUsd / rawTotal);
+          cappedBy = cap.key;
+        }
+      }
+      const amounts = rawAmounts.map((amount) => (amount === null ? null : round2(amount * scale)));
+      const totalUsd = round2(amounts.reduce((total, amount) => total + (amount ?? 0), 0));
+      return {
+        period: state.period,
+        basis: state.basis,
+        accountCashUsd: cash,
+        poolUsd: state.poolUsd,
+        allocationCapRemainingUsd: state.allocationCapRemainingUsd,
+        maxPerPeriodUsd: state.maxPerPeriodUsd,
+        rankPercents: percents,
+        rawAmounts,
+        rawTotalUsd: round2(rawTotal),
+        amounts,
+        totalUsd,
+        scale,
+        cappedBy,
+        capped: cappedBy !== null,
+      };
+    }
+
+    /** History rows for the rewards card (newest first, last 8). */
+    function rewardHistoryRows(status) {
+      const history = Array.isArray(status?.rewards?.history) ? status.rewards.history : [];
+      return history.slice(0, 8).map((entry, index) => {
+        const winners = Array.isArray(entry?.winners) ? entry.winners : [];
+        return {
+          key: `${entry?.periodKey ?? 'period'}-${index}`,
+          periodKey: entry?.periodKey ?? null,
+          period: entry?.period ?? null,
+          at: entry?.at ?? null,
+          totalUsd: round2(winners.reduce((total, winner) => total + (toNumber(winner?.amountUsd) ?? 0), 0)),
+          winners: winners.map((winner, winnerIndex) => ({
+            key: `${winner?.agentId ?? 'winner'}-${winnerIndex}`,
+            rank: toNumber(winner?.rank),
+            agentId: winner?.agentId ?? null,
+            name: winner?.name ?? winner?.agentId ?? '—',
+            percent: toNumber(winner?.percent),
+            amountUsd: toNumber(winner?.amountUsd),
+          })),
+        };
+      });
+    }
+
+    /** Last-winners rows from engine.rewards.lastWinners. */
+    function lastWinnerRows(statusRewards) {
+      const state = rewardsControlState(statusRewards);
+      return state.lastWinners.map((winner, index) => ({
+        key: `${winner?.agentId ?? 'winner'}-${index}`,
+        rank: toNumber(winner?.rank),
+        agentId: winner?.agentId ?? null,
+        name: winner?.name ?? winner?.agentId ?? '—',
+        percent: toNumber(winner?.percent),
+        amountUsd: toNumber(winner?.amountUsd),
+      }));
+    }
+
+    const MEDALS = Object.freeze({ 1: '🥇', 2: '🥈', 3: '🥉' });
+
+    function mapLeaderboardRows(entries) {
+      const list = Array.isArray(entries) ? entries : [];
+      return list.map((entry, index) => {
+        const rank = toNumber(entry?.rank) ?? index + 1;
+        return {
+          key: `${entry?.agentId ?? 'row'}-${index}`,
+          rank,
+          medal: MEDALS[rank] ?? null,
+          agentId: entry?.agentId ?? null,
+          name: entry?.name ?? entry?.agentId ?? '—',
+          pnlUsd: toNumber(entry?.pnlUsd),
+          pnlPct: toNumber(entry?.pnlPct),
+          equityUsd: toNumber(entry?.equityUsd),
+          baselineEquityUsd: toNumber(entry?.baselineEquityUsd),
+          trades: toNumber(entry?.trades),
+          history: entry?.history ?? null,
+        };
+      });
+    }
+
+    /** Leaderboards projection from `status.rankings` (daily/weekly/monthly). */
+    function leaderboardPeriods(status) {
+      const periods = plainObject(status?.rankings?.periods);
+      return {
+        asOf: status?.rankings?.asOf ?? null,
+        daily: mapLeaderboardRows(periods.daily),
+        weekly: mapLeaderboardRows(periods.weekly),
+        monthly: mapLeaderboardRows(periods.monthly),
+      };
+    }
+
+    /** Strategy explanation / plan / next-step mapping for the agent detail pane. */
+    function agentPlanMapping(plan) {
+      const raw = plainObject(plan);
+      if (Object.keys(raw).length === 0) return null;
+      const triggers = plainObject(raw.triggers);
+      const triggerItems = [];
+      const pushTrigger = (key, label, format) => {
+        if (triggers[key] === undefined || triggers[key] === null) return;
+        triggerItems.push({ key, label, value: format ? format(triggers[key]) : String(triggers[key]) });
+      };
+      pushTrigger('family', 'family', familyLabel);
+      pushTrigger('symbol', 'symbol');
+      pushTrigger('entryZ', 'entryZ');
+      pushTrigger('exitZ', 'exitZ');
+      pushTrigger('stopPct', 'stop', fmtPctPlain);
+      pushTrigger('targetPct', 'target', fmtPctPlain);
+      pushTrigger('maxHoldBars', 'maxHold');
+      pushTrigger('sizePct', 'size', fmtPctPlain);
+      pushTrigger('sessionFilter', 'session');
+      const position = plainObject(raw.position);
+      const hasPosition = Object.keys(position).length > 0;
+      return {
+        summary: typeof raw.summary === 'string' ? raw.summary : null,
+        entryRule: typeof raw.entryRule === 'string' ? raw.entryRule : null,
+        exitRules: Array.isArray(raw.exitRules) ? raw.exitRules.filter((rule) => typeof rule === 'string' && rule.trim().length > 0) : [],
+        riskRule: typeof raw.riskRule === 'string' ? raw.riskRule : null,
+        nextStep: typeof raw.nextStep === 'string' ? raw.nextStep : null,
+        triggers: triggerItems,
+        position: hasPosition ? {
+          symbol: position.symbol ?? null,
+          qty: toNumber(position.qty),
+          qtyText: fmtQty(position.qty),
+          avgPriceUsd: toNumber(position.avgPriceUsd),
+          stopPriceUsd: toNumber(position.stopPriceUsd),
+          targetPriceUsd: toNumber(position.targetPriceUsd),
+          barsHeld: toNumber(position.barsHeld),
+          maxHoldBars: toNumber(position.maxHoldBars),
+        } : null,
+        nextResearchAt: raw.nextResearchAt ?? null,
+        hasContent: Boolean(raw.summary || raw.entryRule || raw.nextStep || raw.exitRules?.length || raw.riskRule || triggerItems.length || hasPosition),
+      };
+    }
+
+    /** Full order/fill history rows for the agent detail "Transactions" table. */
+    function agentTransactionRows(orders) {
+      const list = Array.isArray(orders) ? orders : [];
+      return list.map((order, index) => {
+        const sideRaw = String(order?.side ?? '').toLowerCase();
+        const qty = toNumber(order?.qty);
+        const price = toNumber(order?.priceUsd);
+        return {
+          key: `${order?.orderId ?? order?.id ?? 'order'}-${index}`,
+          symbol: order?.symbol ?? '—',
+          side: sideRaw === 'sell' ? 'sell' : sideRaw === 'buy' ? 'buy' : '—',
+          qty,
+          qtyText: fmtQty(qty),
+          priceUsd: price,
+          notionalUsd: toNumber(order?.notionalUsd) ?? (qty !== null && price !== null ? round2(qty * price) : null),
+          realizedPlUsd: toNumber(order?.realizedPlUsd),
+          at: order?.at ?? null,
+          orderId: order?.orderId ?? null,
+        };
+      });
+    }
+
+    /** Ranking badges (`dayRank/weekRank/monthRank`) for the detail header. */
+    function agentRankingBadges(rankings) {
+      const raw = plainObject(rankings);
+      if (Object.keys(raw).length === 0) return [];
+      const badges = [];
+      const push = (key, labelKey, rankKey, pctKey) => {
+        const rank = toNumber(raw[rankKey]);
+        if (rank === null) return;
+        badges.push({ key, labelKey, rank, pct: toNumber(raw[pctKey]), medal: MEDALS[rank] ?? null });
+      };
+      push('day', 'rankDay', 'dayRank', 'dayPct');
+      push('week', 'rankWeek', 'weekRank', 'weekPct');
+      push('month', 'rankMonth', 'monthRank', 'monthPct');
+      return badges;
+    }
+
+    /** P&L view used by the detail summary (`agent.pnl`, optional). */
+    function agentPnlMapping(pnl) {
+      const raw = plainObject(pnl);
+      if (Object.keys(raw).length === 0) return null;
+      return {
+        realizedUsd: toNumber(raw.realizedUsd),
+        unrealizedUsd: toNumber(raw.unrealizedUsd),
+        netUsd: toNumber(raw.netUsd),
+        dayPct: toNumber(raw.dayPct),
+        weekPct: toNumber(raw.weekPct),
+        monthPct: toNumber(raw.monthPct),
+      };
     }
 
 
@@ -870,6 +1302,10 @@ window.__ModuleLoader__.load({
         const roleCosts = roleCostRows(safeAgent.roleCosts);
         const roleCostsTotal = round2(roleCosts.reduce((total, entry) => total + entry.amountUsd, 0));
         const research = mapResearchBriefing(safeAgent.research);
+        const transactions = agentTransactionRows(safeAgent.orders);
+        const plan = agentPlanMapping(safeAgent.plan);
+        const pnl = agentPnlMapping(safeAgent.pnl);
+        const rankBadges = agentRankingBadges(safeAgent.rankings);
         const parentId = safeAgent.parentId ? String(safeAgent.parentId) : null;
         const mutation = plainObject(safeAgent.mutation);
         const hasMutation = Object.keys(mutation).length > 0;
@@ -924,6 +1360,11 @@ window.__ModuleLoader__.load({
           tradesCount: toNumber(safeAgent.tradesCount) ?? activity.length,
           research,
           researchBadge: researchBadge(research),
+          transactions,
+          transactionCount: transactions.length,
+          pnl,
+          plan,
+          rankBadges,
           roleCosts,
           roleCostsTotal,
         };
@@ -988,6 +1429,8 @@ window.__ModuleLoader__.load({
         obituaryStats: status?.obituaries?.stats ?? null,
         at: status?.at ?? null,
         research: researchStatusSummary(status),
+        rewards: engine.rewards ?? null,
+        rankings: status?.rankings ?? null,
         control: status?.control ?? null,
       };
     }
@@ -1365,6 +1808,42 @@ window.__ModuleLoader__.load({
 .atm-research-list li{margin:0}
 .atm-source-link{color:var(--dsw-alias-state-business-primary,inherit);text-decoration:underline;overflow-wrap:anywhere}
 .atm-research-summary{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
+.atm-operator-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
+.atm-card-block{display:flex;flex-direction:column;gap:8px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:10px;padding:9px 11px}
+.atm-block-title{margin:0;font-size:12.5px;font-weight:600;line-height:18px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.atm-seg{display:flex;flex-wrap:wrap;gap:4px}
+.atm-seg button{font:inherit;font-size:11px;line-height:16px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:999px;padding:1px 8px;cursor:pointer;white-space:nowrap}
+.atm-seg button:hover{background:var(--dsw-alias-interactive-bg-hover,transparent)}
+.atm-seg button[data-active="true"]{color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-label-primary,currentColor);background:var(--dsw-alias-bg-l2,transparent)}
+.atm-form-row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.atm-field{display:flex;flex-direction:column;gap:1px;font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);min-width:0}
+.atm-num{font:inherit;font-size:12px;line-height:18px;width:82px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,inherit);padding:1px 6px}
+.atm-num:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,currentColor));outline-offset:1px}
+.atm-switch{font:inherit;font-size:11px;line-height:18px;display:inline-flex;align-items:center;gap:5px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:1px 9px;cursor:pointer;background:transparent;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-switch[data-on="true"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-switch[data-on="false"]{color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-switch .atm-dot{opacity:.5}
+.atm-switch[data-on="true"] .atm-dot{opacity:1}
+.atm-preview{display:flex;flex-direction:column;gap:2px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-preview-row{display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
+.atm-pill-amount{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit);font-weight:600}
+.atm-rank-badges{display:flex;gap:4px;flex-wrap:wrap}
+.atm-rank-badge{display:inline-flex;align-items:baseline;gap:3px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 6px;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-rank-badge[data-medal="true"]{color:var(--dsw-alias-label-primary,inherit)}
+.atm-medal{font-size:11px}
+.atm-lb-wrap{overflow:auto;max-height:260px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px}
+.atm-lb-table{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;line-height:16px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.atm-lb-table th{position:sticky;top:0;z-index:1;text-align:left;font-weight:500;color:var(--dsw-alias-label-tertiary,inherit);background:var(--dsw-alias-bg-l2,var(--dsw-alias-bg-base,Canvas));border-bottom:.5px solid var(--dsw-alias-border-l2,currentColor);padding:2px 6px}
+.atm-lb-table td{border-bottom:.5px solid var(--dsw-alias-border-l2,currentColor);padding:2px 6px;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.atm-lb-table tbody tr{cursor:pointer}
+.atm-lb-table tbody tr:hover{background:var(--dsw-alias-interactive-bg-hover,transparent)}
+.atm-lb-table tbody tr[data-top="true"]{background:var(--dsw-alias-bg-l2,transparent)}
+.atm-lb-table tbody tr:last-child td{border-bottom:0}
+.atm-plan-block{display:flex;flex-direction:column;gap:2px;min-width:0}
+.atm-plan-label{font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary,inherit);font-weight:600}
+.atm-plan-text{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
+.atm-plan-list{margin:0;padding-left:15px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-primary,inherit)}
+.atm-plan-list li{margin:0}
 .atm-close{font:inherit;font-size:13px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:6px;padding:0 7px;cursor:pointer}
 .atm-close:hover{color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-interactive-bg-hover,transparent)}
 .atm-icon{display:block}
@@ -1727,6 +2206,410 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'atm-research-section', key: 'research' }, children);
     }
 
+    // -----------------------------------------------------------------------
+    // operator controls: research cadence, rewards, leaderboards
+    // -----------------------------------------------------------------------
+
+    function SwitchButton({ on, label, onClick, title }) {
+      return h('button', {
+        type: 'button',
+        className: 'atm-switch',
+        'data-on': on ? 'true' : 'false',
+        title: title ?? label,
+        onClick,
+      }, h('span', { className: 'atm-dot', 'aria-hidden': true }), label);
+    }
+
+    function CadenceOptionLabel({ t, option }) {
+      return t(option.labelKey);
+    }
+
+    /** Research cadence segmented control (interval / pre-open / post-close / both). */
+    function ResearchCadenceControl({ t, research, controlState, runControl }) {
+      const currentKey = researchCadenceKey(research);
+      const [cadence, setCadence] = React.useState(currentKey ?? 'interval:3600');
+      const [enabled, setEnabled] = React.useState(research?.enabled !== false);
+      const [influence, setInfluence] = React.useState(research?.influence !== false);
+      React.useEffect(() => {
+        if (currentKey) setCadence(currentKey);
+        setEnabled(research?.enabled !== false);
+        setInfluence(research?.influence !== false);
+      }, [currentKey, research?.enabled, research?.influence]);
+
+      const pending = controlState.pending === 'set-research-settings';
+      const related = controlState.action === 'set-research-settings';
+      const currentOption = RESEARCH_CADENCE_OPTIONS.find((option) => option.key === currentKey);
+      const apply = () => {
+        const settings = researchSettingsFromCadence(cadence, { enabled, influence });
+        if (settings) runControl({ action: 'set-research-settings', settings });
+      };
+
+      return h('div', { className: 'atm-card-block' }, [
+        h('h4', { className: 'atm-block-title', key: 'title' }, t('cadence')),
+        research?.configured === false
+          ? h('p', { className: 'atm-warn', key: 'disabled' }, t('researchDisabled'))
+          : null,
+        h('div', { className: 'atm-seg', key: 'seg' }, RESEARCH_CADENCE_OPTIONS.map((option) => h('button', {
+          key: option.key,
+          type: 'button',
+          'data-active': cadence === option.key ? 'true' : 'false',
+          onClick: () => setCadence(option.key),
+        }, h(CadenceOptionLabel, { t, option })))),
+        h('div', { className: 'atm-form-row', key: 'toggles' }, [
+          h(SwitchButton, {
+            key: 'enabled',
+            label: t('cadenceEnabled'),
+            on: enabled,
+            onClick: () => setEnabled((value) => !value),
+          }),
+          h(SwitchButton, {
+            key: 'influence',
+            label: t('cadenceInfluence'),
+            on: influence,
+            title: t(influence ? 'researchInfluence' : 'researchShadow'),
+            onClick: () => setInfluence((value) => !value),
+          }),
+        ]),
+        h('div', { className: 'atm-preview', key: 'current' }, [
+          h('span', { key: 'mode', className: 'atm-preview-row' },
+            `${t('cadenceCurrent')}: ${currentOption ? t(currentOption.labelKey) : t('none')} · ${t('researchProvider')} ${research?.provider ?? '—'}/${t('researchModel')} ${research?.model ?? '—'}`),
+          h('span', { key: 'next', className: 'atm-preview-row' },
+            `${t('cadenceNextDue')} ${fmtAgo(research?.nextDueAt)} ${research?.nextDueAt ? `(${fmtDateTime(research.nextDueAt)})` : ''}`),
+          research?.pausedReason ? h('span', { key: 'paused', className: 'atm-warn' }, research.pausedReason) : null,
+        ]),
+        h('div', { className: 'atm-form-row', key: 'actions' }, [
+          h('button', {
+            key: 'apply',
+            type: 'button',
+            className: 'atm-btn',
+            'data-variant': 'primary',
+            disabled: pending,
+            onClick: apply,
+          }, pending ? `${t('cadenceApply')}…` : t('cadenceApply')),
+          related && controlState.error
+            ? h('span', { key: 'err', className: 'atm-err' }, errorText(controlState.error))
+            : null,
+          related && controlState.message
+            ? h('span', { key: 'ok', className: 'atm-muted' }, t('controlOk').replace('{action}', controlState.message))
+            : null,
+        ]),
+      ]);
+    }
+
+    /** Rewards settings + live payout preview + last winners/history. */
+    function RewardsControl({ t, rewards, history, controlState, runControl }) {
+      const state = rewardsControlState(rewards);
+      const [enabled, setEnabled] = React.useState(state.enabled);
+      const [period, setPeriod] = React.useState(state.period);
+      const [first, setFirst] = React.useState(String(Math.round(state.rankPercents[0] * 100)));
+      const [second, setSecond] = React.useState(String(Math.round(state.rankPercents[1] * 100)));
+      const [third, setThird] = React.useState(String(Math.round(state.rankPercents[2] * 100)));
+      const [maxPerPeriod, setMaxPerPeriod] = React.useState(state.maxPerPeriodUsd === null ? '' : String(state.maxPerPeriodUsd));
+      React.useEffect(() => {
+        setEnabled(state.enabled);
+        setPeriod(state.period);
+        setFirst(String(Math.round(state.rankPercents[0] * 100)));
+        setSecond(String(Math.round(state.rankPercents[1] * 100)));
+        setThird(String(Math.round(state.rankPercents[2] * 100)));
+        setMaxPerPeriod(state.maxPerPeriodUsd === null ? '' : String(state.maxPerPeriodUsd));
+      }, [state.enabled, state.period, state.rankPercents.join(','), state.maxPerPeriodUsd]);
+
+      const parsePercent = (value) => {
+        const number = toNumber(value);
+        return number === null ? 0 : number / 100;
+      };
+      const percents = [parsePercent(first), parsePercent(second), parsePercent(third)];
+      const preview = rewardsPreview(rewards, percents);
+      const pending = controlState.pending === 'set-reward-settings';
+      const related = controlState.action === 'set-reward-settings';
+      const winners = lastWinnerRows(rewards);
+      const historyRows = rewardHistoryRows({ rewards: { history } });
+      const apply = () => {
+        const maxValue = maxPerPeriod.trim() === '' ? null : Number(maxPerPeriod);
+        runControl({
+          action: 'set-reward-settings',
+          settings: { enabled, period, rankPercents: percents, maxPerPeriodUsd: maxValue },
+        });
+      };
+      const capLabel = (key) => t(key === 'pool' ? 'rewardsPoolCap' : key === 'allocation' ? 'rewardsAllocationCap' : 'rewardsMaxCap');
+
+      return h('div', { className: 'atm-card-block' }, [
+        h('h4', { className: 'atm-block-title', key: 'title' }, t('rewards')),
+        h('div', { className: 'atm-form-row', key: 'row1' }, [
+          h(SwitchButton, {
+            key: 'enabled',
+            label: t('rewardsEnabled'),
+            on: enabled,
+            onClick: () => setEnabled((value) => !value),
+          }),
+          h('div', { className: 'atm-seg', key: 'period' }, ['daily', 'weekly', 'monthly'].map((value) => h('button', {
+            key: value,
+            type: 'button',
+            'data-active': period === value ? 'true' : 'false',
+            onClick: () => setPeriod(value),
+          }, value === 'daily' ? t('rewardsDaily') : value === 'weekly' ? t('rewardsWeekly') : t('rewardsMonthly')))),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'percents' }, [
+          h('label', { className: 'atm-field', key: 'p1' }, `${t('rewardsFirst')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: first, onChange: (event) => setFirst(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'p2' }, `${t('rewardsSecond')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: second, onChange: (event) => setSecond(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'p3' }, `${t('rewardsThird')} %`,
+            h('input', { className: 'atm-num', type: 'number', min: 0, max: 50, step: 1, value: third, onChange: (event) => setThird(event.target.value) })),
+          h('label', { className: 'atm-field', key: 'max' }, t('rewardsMax'),
+            h('input', {
+              className: 'atm-num',
+              type: 'number',
+              min: 0,
+              step: '0.01',
+              placeholder: t('rewardsNoMax'),
+              value: maxPerPeriod,
+              onChange: (event) => setMaxPerPeriod(event.target.value),
+            })),
+        ]),
+        h('div', { className: 'atm-preview', key: 'preview' }, [
+          h('span', { key: 'bases', className: 'atm-preview-row' },
+            `${t('rewardsCash')} ${fmtUsd(preview.accountCashUsd)} · ${t('rewardsPool')} ${fmtUsd(preview.poolUsd)} · ${t('rewardsCapRemaining')} ${fmtUsd(preview.allocationCapRemainingUsd)}`),
+          h('span', { key: 'amounts', className: 'atm-preview-row' },
+            preview.rankPercents.map((percent, index) => {
+              const amount = preview.amounts[index];
+              return h('span', { key: `amount-${index}` }, `${t(index === 0 ? 'rewardsFirst' : index === 1 ? 'rewardsSecond' : 'rewardsThird')} ${Math.round(percent * 100)}% ≈ `, h('span', { className: 'atm-pill-amount' }, fmtUsd(amount)), '  ');
+            })),
+          h('span', { key: 'total', className: 'atm-preview-row' },
+            `${t('rewardsTotal')} ${fmtUsd(preview.totalUsd)}`,
+            preview.capped ? ` · ${t('rewardsCappedBy')} ${capLabel(preview.cappedBy)}` : ''),
+          h('span', { key: 'boundary', className: 'atm-muted' }, t('rewardsPayBoundary')),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'status' }, [
+          h('span', { key: 'last', className: 'atm-muted' }, `${t('rewardsLastRun')} ${fmtAgo(state.lastRunAt)}`),
+          h('span', { key: 'next', className: 'atm-muted' }, `${t('rewardsNextRun')} ${fmtAgo(state.nextRunAt)}`),
+        ]),
+        h('div', { className: 'atm-form-row', key: 'actions' }, [
+          h('button', {
+            key: 'apply',
+            type: 'button',
+            className: 'atm-btn',
+            'data-variant': 'primary',
+            disabled: pending,
+            onClick: apply,
+          }, pending ? `${t('rewardsApply')}…` : t('rewardsApply')),
+          related && controlState.error
+            ? h('span', { key: 'err', className: 'atm-err' }, errorText(controlState.error))
+            : null,
+          related && controlState.message
+            ? h('span', { key: 'ok', className: 'atm-muted' }, t('controlOk').replace('{action}', controlState.message))
+            : null,
+        ]),
+        winners.length > 0
+          ? h('div', { className: 'atm-plan-block', key: 'winners' }, [
+            h('span', { className: 'atm-plan-label', key: 'label' }, t('rewardsLastWinners')),
+            h('ul', { className: 'atm-plan-list', key: 'list' }, winners.map((winner) => h('li', { key: winner.key },
+              `${MEDALS[winner.rank] ?? `#${winner.rank ?? '—'}`} ${winner.name} · ${fmtUsd(winner.amountUsd)}`))),
+          ])
+          : null,
+        historyRows.length > 0
+          ? h('div', { className: 'atm-plan-block', key: 'history' }, [
+            h('span', { className: 'atm-plan-label', key: 'label' }, t('rewardsHistory')),
+            h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
+              h('thead', { key: 'head' }, h('tr', null, [
+                h('th', { key: 'period' }, t('rewardsPeriod')),
+                h('th', { key: 'key' }, 'key'),
+                h('th', { key: 'at' }, t('time')),
+                h('th', { key: 'total' }, t('rewardsTotal')),
+                h('th', { key: 'winners' }, t('rewardsLastWinners')),
+              ])),
+              h('tbody', { key: 'body' }, historyRows.map((entry) => h('tr', { key: entry.key }, [
+                h('td', { key: 'period' }, entry.period ?? '—'),
+                h('td', { key: 'key', className: 'atm-mono' }, entry.periodKey ?? '—'),
+                h('td', { key: 'at', className: 'atm-muted' }, fmtAgo(entry.at)),
+                h('td', { key: 'total', className: 'atm-mono' }, fmtUsd(entry.totalUsd)),
+                h('td', { key: 'winners' }, entry.winners.map((winner) => `${MEDALS[winner.rank] ?? ''}${winner.name}:${fmtUsd(winner.amountUsd)}`).join(' · ')),
+              ]))),
+            ])),
+          ])
+          : h('p', { className: 'atm-empty', key: 'no-history' }, t('rewardsNoHistory')),
+      ]);
+    }
+
+    /** Daily / weekly / monthly leaderboards from status.rankings. */
+    function Leaderboards({ t, rankings, onSelect }) {
+      const periods = leaderboardPeriods({ rankings });
+      const [tab, setTab] = React.useState('daily');
+      const rows = periods[tab] ?? [];
+      return h('div', { className: 'atm-card-block' }, [
+        h('h4', { className: 'atm-block-title', key: 'title' }, t('leaderboards'),
+          h('span', { key: 'asof', className: 'atm-muted' }, `${t('lbAsOf')} ${fmtAgo(periods.asOf)}`)),
+        h('div', { className: 'atm-seg', key: 'tabs' }, ['daily', 'weekly', 'monthly'].map((value) => h('button', {
+          key: value,
+          type: 'button',
+          'data-active': tab === value ? 'true' : 'false',
+          onClick: () => setTab(value),
+        }, value === 'daily' ? t('lbDaily') : value === 'weekly' ? t('lbWeekly') : t('lbMonthly')))),
+        rows.length === 0
+          ? h('p', { className: 'atm-empty', key: 'empty' }, t('lbEmpty'))
+          : h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
+            h('thead', { key: 'head' }, h('tr', null, [
+              h('th', { key: 'rank' }, t('lbRank')),
+              h('th', { key: 'name' }, t('lbName')),
+              h('th', { key: 'pnlpct' }, t('lbPnlPct')),
+              h('th', { key: 'pnlusd' }, t('lbPnlUsd')),
+              h('th', { key: 'equity' }, t('lbEquity')),
+              h('th', { key: 'trades' }, t('lbTrades')),
+            ])),
+            h('tbody', { key: 'body' }, rows.map((row) => h('tr', {
+              key: row.key,
+              'data-rank': row.rank,
+              'data-top': row.rank <= 3 ? 'true' : 'false',
+              onClick: () => {
+                if (row.agentId) onSelect(row.agentId);
+              },
+            }, [
+              h('td', { key: 'rank', className: 'atm-mono', title: `#${row.rank}` }, `${row.medal ?? ''}${row.medal ? ' ' : ''}#${row.rank}`),
+              h('td', { key: 'name', title: row.name }, row.name),
+              h('td', { key: 'pnlpct', className: `atm-mono ${(row.pnlPct ?? 0) > 0 ? 'atm-pos' : (row.pnlPct ?? 0) < 0 ? 'atm-neg' : ''}` }, fmtPct(row.pnlPct)),
+              h('td', { key: 'pnlusd', className: `atm-mono ${(row.pnlUsd ?? 0) > 0 ? 'atm-pos' : (row.pnlUsd ?? 0) < 0 ? 'atm-neg' : ''}` }, fmtSignedUsd(row.pnlUsd)),
+              h('td', { key: 'equity', className: 'atm-mono' }, fmtUsd(row.equityUsd)),
+              h('td', { key: 'trades', className: 'atm-mono' }, fmtNum(row.trades)),
+            ]))),
+          ])),
+      ]);
+    }
+
+    /** Operator controls section: research cadence, rewards, leaderboards. */
+    function OperatorPanel({ t, snapshot, summary, controlState, runControl, onSelect }) {
+      const data = snapshot.data ?? {};
+      return h('div', { className: 'atm-section', key: 'operator' }, [
+        h('h3', { className: 'atm-section-title', key: 'title' }, t('operatorControls')),
+        h('div', { className: 'atm-operator-grid', key: 'grid' }, [
+          h(ResearchCadenceControl, {
+            key: 'cadence',
+            t,
+            research: summary.research,
+            controlState,
+            runControl,
+          }),
+          h(RewardsControl, {
+            key: 'rewards',
+            t,
+            rewards: data.engine?.rewards ?? null,
+            history: Array.isArray(data.rewards?.history) ? data.rewards.history : [],
+            controlState,
+            runControl,
+          }),
+          h(Leaderboards, {
+            key: 'leaderboards',
+            t,
+            rankings: data.rankings ?? null,
+            onSelect,
+          }),
+        ]),
+      ]);
+    }
+
+    /** Compact ranking badges for the detail header (day/week/month). */
+    function RankingBadges({ t, row }) {
+      const badges = Array.isArray(row.rankBadges) ? row.rankBadges : [];
+      if (badges.length === 0) return null;
+      return h('div', { className: 'atm-rank-badges' }, badges.map((badge) => h('span', {
+        key: badge.key,
+        className: 'atm-rank-badge',
+        'data-medal': badge.medal ? 'true' : 'false',
+        title: badge.pct === null ? `#${badge.rank}` : `#${badge.rank} · ${fmtPct(badge.pct)}`,
+      }, `${badge.medal ?? ''}${badge.medal ? ' ' : ''}${t(badge.labelKey)} #${badge.rank}`)));
+    }
+
+    /** "Strategy & plan" section: explanation, entry/exit/risk rules, triggers, next step. */
+    function StrategyPlanSection({ t, plan }) {
+      if (!plan || !plan.hasContent) {
+        return h('div', { className: 'atm-section' }, [
+          h('h4', { className: 'atm-detail-title', key: 'title' }, t('plan')),
+          h('p', { className: 'atm-empty', key: 'empty' }, t('planEmpty')),
+        ]);
+      }
+      const blocks = [];
+      if (plan.summary) blocks.push(h('div', { className: 'atm-plan-block', key: 'summary' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planSummary')),
+        h('p', { className: 'atm-plan-text', key: 'text' }, plan.summary),
+      ]));
+      if (plan.entryRule) blocks.push(h('div', { className: 'atm-plan-block', key: 'entry' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planEntry')),
+        h('p', { className: 'atm-plan-text', key: 'text' }, plan.entryRule),
+      ]));
+      if (plan.exitRules.length > 0) blocks.push(h('div', { className: 'atm-plan-block', key: 'exit' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planExit')),
+        h('ul', { className: 'atm-plan-list', key: 'list' }, plan.exitRules.map((rule, index) => h('li', { key: `exit-${index}` }, rule))),
+      ]));
+      if (plan.riskRule) blocks.push(h('div', { className: 'atm-plan-block', key: 'risk' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planRisk')),
+        h('p', { className: 'atm-plan-text', key: 'text' }, plan.riskRule),
+      ]));
+      if (plan.nextStep) blocks.push(h('div', { className: 'atm-plan-block', key: 'next' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planNext')),
+        h('p', { className: 'atm-plan-text', key: 'text' }, plan.nextStep),
+      ]));
+      if (plan.triggers.length > 0) blocks.push(h('div', { className: 'atm-plan-block', key: 'triggers' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planTriggers')),
+        h('div', { className: 'atm-chips', key: 'chips' }, plan.triggers.map((trigger) => h('span', { className: 'atm-param', key: trigger.key }, [
+          h('b', { key: 'l' }, trigger.label),
+          h('span', { key: 'v' }, trigger.value),
+        ]))),
+      ]));
+      blocks.push(h('div', { className: 'atm-plan-block', key: 'position' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planPosition')),
+        plan.position
+          ? h('div', { className: 'atm-chips', key: 'chips' }, [
+            h('span', { className: 'atm-param', key: 'symbol' }, h('b', null, t('symbol')), plan.position.symbol ?? '—'),
+            h('span', { className: 'atm-param', key: 'qty' }, h('b', null, t('qty')), plan.position.qtyText),
+            h('span', { className: 'atm-param', key: 'avg' }, h('b', null, t('avgPrice')), fmtUsd(plan.position.avgPriceUsd)),
+            h('span', { className: 'atm-param', key: 'stop' }, h('b', null, t('planStop')), fmtUsd(plan.position.stopPriceUsd)),
+            h('span', { className: 'atm-param', key: 'target' }, h('b', null, t('planTarget')), fmtUsd(plan.position.targetPriceUsd)),
+            h('span', { className: 'atm-param', key: 'bars' }, h('b', null, t('planBars')), `${fmtNum(plan.position.barsHeld)}/${fmtNum(plan.position.maxHoldBars)}`),
+          ])
+          : h('p', { className: 'atm-empty', key: 'empty' }, t('planNoPosition')),
+      ]));
+      if (plan.nextResearchAt) blocks.push(h('div', { className: 'atm-plan-block', key: 'research' }, [
+        h('span', { className: 'atm-plan-label', key: 'label' }, t('planNextResearch')),
+        h('p', { className: 'atm-plan-text', key: 'text' }, `${fmtAgo(plan.nextResearchAt)} (${fmtDateTime(plan.nextResearchAt)})`),
+      ]));
+      return h('div', { className: 'atm-section' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, t('plan')),
+        ...blocks,
+      ]);
+    }
+
+    /** Full order/fill history table ("Transactions"). */
+    function TransactionsSection({ t, row }) {
+      const rows = Array.isArray(row.transactions) ? row.transactions : [];
+      return h('div', { className: 'atm-section' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('tx')} · ${fmtNum(rows.length)}`),
+        rows.length === 0
+          ? h('p', { className: 'atm-empty', key: 'empty' }, t('txEmpty'))
+          : h('div', { className: 'atm-lb-wrap', key: 'wrap' }, h('table', { className: 'atm-lb-table' }, [
+            h('thead', { key: 'head' }, h('tr', null, [
+              h('th', { key: 'time' }, t('time')),
+              h('th', { key: 'side' }, t('side')),
+              h('th', { key: 'symbol' }, t('symbol')),
+              h('th', { key: 'qty' }, t('qty')),
+              h('th', { key: 'price' }, t('price')),
+              h('th', { key: 'notional' }, t('notional')),
+              h('th', { key: 'realized' }, t('realized')),
+              h('th', { key: 'order' }, t('txOrderId')),
+            ])),
+            h('tbody', { key: 'body' }, rows.map((order) => h('tr', { key: order.key }, [
+              h('td', { key: 'time', className: 'atm-muted', title: fmtDateTime(order.at) }, fmtAgo(order.at)),
+              h('td', { key: 'side', className: `atm-side ${order.side === 'buy' ? 'atm-pos' : order.side === 'sell' ? 'atm-neg' : ''}`, 'data-side': order.side },
+                order.side === 'sell' ? t('sell') : order.side === 'buy' ? t('buy') : '—'),
+              h('td', { key: 'symbol', className: 'atm-mono' }, order.symbol),
+              h('td', { key: 'qty', className: 'atm-mono' }, order.qtyText),
+              h('td', { key: 'price', className: 'atm-mono' }, fmtUsd(order.priceUsd)),
+              h('td', { key: 'notional', className: 'atm-mono' }, fmtUsd(order.notionalUsd)),
+              h('td', { key: 'realized', className: `atm-mono ${(order.realizedPlUsd ?? 0) > 0 ? 'atm-pos' : (order.realizedPlUsd ?? 0) < 0 ? 'atm-neg' : ''}` }, fmtSignedUsd(order.realizedPlUsd)),
+              h('td', { key: 'order', className: 'atm-muted atm-mono', title: order.orderId ?? '' }, order.orderId ?? '—'),
+            ]))),
+          ])),
+      ]);
+    }
+
     /** Runway bar fill percent: 72 h = healthy full bar; unknown/dead = 0. */
     const RUNWAY_FULL_HOURS = 72;
     function runwayPercent(hours) {
@@ -1972,6 +2855,13 @@ window.__ModuleLoader__.load({
         { key: 'runway', label: t('runway'), value: fmtHours(row.runwayHours) },
         { key: 'drawdown', label: t('drawdown'), value: fmtPct(row.drawdownPct) },
         { key: 'firstProfit', label: t('firstProfit'), value: row.firstProfitAt ? fmtAgo(row.firstProfitAt) : t('neverProfited') },
+        ...(row.pnl
+          ? [
+            { key: 'weekPct', label: t('rankWeek'), value: fmtPct(row.pnl.weekPct) },
+            { key: 'monthPct', label: t('rankMonth'), value: fmtPct(row.pnl.monthPct) },
+            { key: 'netPnl', label: t('pnl'), value: fmtSignedUsd(row.pnl.netUsd) },
+          ]
+          : []),
       ];
 
       return h('aside', { className: 'atm-detail', 'aria-label': `${t('detailTitle')}: ${row.name}` }, [
@@ -1982,6 +2872,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'atm-toolbar', key: 'badges', style: { marginTop: 2 } }, [
               h(StatusCell, { key: 'status', t, row }),
               h('span', { className: 'atm-muted', key: 'gen' }, `gen ${fmtNum(row.generation)}`),
+              h(RankingBadges, { key: 'ranks', t, row }),
             ]),
           ]),
           h('button', {
@@ -1998,6 +2889,7 @@ window.__ModuleLoader__.load({
           h('h4', { className: 'atm-detail-title', key: 'title' }, t('tradingState')),
           h(DetailKv, { key: 'kv', items: deathInfo }),
         ]) : null,
+        h(StrategyPlanSection, { key: 'plan', t, plan: row.plan }),
         h('div', { key: 'holdings' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('holdings')} · ${fmtNum(row.positionCount)}`),
           h(HoldingsTable, { key: 'table', t, row }),
@@ -2007,6 +2899,7 @@ window.__ModuleLoader__.load({
           h(ActivityFeed, { key: 'feed', t, row }),
         ]),
         h(ResearchSection, { key: 'research', t, research: row.research, researchStatus }),
+        h(TransactionsSection, { key: 'transactions', t, row }),
         h('div', { key: 'strategy' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, t('strategyParams')),
           h('p', { className: 'atm-note', key: 'genome-label' }, `${t('genomeParams')} · ${row.genomeText}`),
@@ -2106,6 +2999,15 @@ window.__ModuleLoader__.load({
         h(HeaderStats, { key: 'stats', t, summary }),
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
         h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
+        h(OperatorPanel, {
+          key: 'operator',
+          t,
+          snapshot,
+          summary,
+          controlState,
+          runControl,
+          onSelect,
+        }),
         h('div', { className: 'atm-workspace', key: 'workspace', 'data-detail': selectedRow ? 'true' : 'false' }, [
           h('div', { className: 'atm-main-col', key: 'left' }, [
             h(AgentTable, {
@@ -2286,6 +3188,20 @@ window.__ModuleLoader__.load({
         researchBadge,
         researchStatusSummary,
         researchModeKey,
+        RESEARCH_CADENCE_OPTIONS,
+        researchCadenceKey,
+        researchSettingsFromCadence,
+        rewardsControlState,
+        rewardsPreview,
+        rewardHistoryRows,
+        lastWinnerRows,
+        leaderboardPeriods,
+        leaderboardRows: (status, period) => leaderboardPeriods(status)[['daily', 'weekly', 'monthly'].includes(period) ? period : 'daily'],
+        agentPlanMapping,
+        agentTransactionRows,
+        agentRankingBadges,
+        agentPnlMapping,
+        MEDALS,
         summarize,
         generationRows,
         obituaryRows,

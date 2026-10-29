@@ -101,8 +101,19 @@ export function defaultConfig() {
       vetoMinRisks: 5,
       riskPenalty: 0.6,
       errorCooldownSec: 900,
+      // Operator-selectable cadence (control panel): interval | pre-open | post-close | both.
+      scheduleMode: 'interval',
+      preMarketOffsetMin: 30,
+      postCloseOffsetMin: 30,
       provider: null,
       model: null,
+    },
+    rewards: {
+      enabled: true,
+      period: 'daily',
+      rankPercents: [0.05, 0.03, 0.02],
+      basis: 'account-cash',
+      maxPerPeriodUsd: null,
     },
     paths: {
       stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
@@ -218,6 +229,24 @@ export function loadConfig(options = {}) {
     cwd,
     options.envFile ?? config.paths.envFile ?? '.env',
   );
+
+  // Operator settings overlay written by the control panel (stateDir/settings.json). It is
+  // applied AFTER the config file/env so a UI change survives restarts, but only the two
+  // operator-owned sections are merged; everything else stays code/file controlled.
+  const settingsFile = path.join(config.paths.stateDir, 'settings.json');
+  if (fileExists(settingsFile)) {
+    const settings = readJsonSync(settingsFile, null);
+    if (settings && typeof settings === 'object') {
+      if (settings.research && typeof settings.research === 'object') {
+        config = mergeDeep(config, { research: settings.research });
+        sources.push(`settings:research:${settingsFile}`);
+      }
+      if (settings.rewards && typeof settings.rewards === 'object') {
+        config = mergeDeep(config, { rewards: settings.rewards });
+        sources.push(`settings:rewards:${settingsFile}`);
+      }
+    }
+  }
 
   validateConfig(config);
   config = freezeConfig(config);
@@ -363,11 +392,34 @@ export function validateConfig(config) {
   assertNumber(research.vetoMinRisks, 'research.vetoMinRisks', { min: 2, max: 5 });
   assertNumber(research.riskPenalty, 'research.riskPenalty', { min: 0.2, max: 1 });
   assertNumber(research.errorCooldownSec, 'research.errorCooldownSec', { min: 60, max: 86_400 });
+  const RESEARCH_SCHEDULE_MODES = ['interval', 'pre-open', 'post-close', 'pre-open+post-close'];
+  if (!RESEARCH_SCHEDULE_MODES.includes(research.scheduleMode)) {
+    fail('CONFIG_INVALID', `research.scheduleMode must be one of ${RESEARCH_SCHEDULE_MODES.join('|')}`);
+  }
+  assertNumber(research.preMarketOffsetMin, 'research.preMarketOffsetMin', { min: 0, max: 180 });
+  assertNumber(research.postCloseOffsetMin, 'research.postCloseOffsetMin', { min: 0, max: 180 });
   if (research.provider !== null && typeof research.provider !== 'string') {
     fail('CONFIG_INVALID', 'research.provider must be a string or null');
   }
   if (research.model !== null && typeof research.model !== 'string') {
     fail('CONFIG_INVALID', 'research.model must be a string or null');
+  }
+
+  const rewards = config.rewards;
+  if (!rewards || typeof rewards !== 'object') fail('CONFIG_INVALID', 'rewards config object is required');
+  if (typeof rewards.enabled !== 'boolean') fail('CONFIG_INVALID', 'rewards.enabled must be boolean');
+  if (!['daily', 'weekly', 'monthly'].includes(rewards.period)) {
+    fail('CONFIG_INVALID', 'rewards.period must be daily|weekly|monthly');
+  }
+  if (rewards.basis !== 'account-cash') fail('CONFIG_INVALID', 'rewards.basis must be "account-cash"');
+  if (!Array.isArray(rewards.rankPercents) || rewards.rankPercents.length !== 3) {
+    fail('CONFIG_INVALID', 'rewards.rankPercents must be exactly 3 numbers');
+  }
+  for (const percent of rewards.rankPercents) {
+    assertNumber(percent, 'rewards.rankPercents[i]', { min: 0, max: 0.5 });
+  }
+  if (rewards.maxPerPeriodUsd !== null) {
+    assertNumber(rewards.maxPerPeriodUsd, 'rewards.maxPerPeriodUsd', { min: 0, max: 1_000_000 });
   }
 
   if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
@@ -413,6 +465,9 @@ export function statePaths(config) {
     treasuryState: path.join(stateDir, 'treasury.json'),
     researchDir: path.join(stateDir, 'research'),
     researchState: path.join(stateDir, 'research', 'state.json'),
+    rankings: path.join(stateDir, 'rankings.json'),
+    rewardsFile: path.join(stateDir, 'rewards.json'),
+    settingsFile: path.join(stateDir, 'settings.json'),
   };
 }
 
@@ -528,6 +583,20 @@ export function configSummary(config) {
     endowmentUsd: config.endowmentUsd,
     deathFloorUsd: Math.max(config.deathFloorUsd, config.deathFloorPct * config.endowmentUsd),
     replication: config.replication,
+    research: {
+      enabled: config.research.enabled,
+      influence: config.research.influence,
+      scheduleMode: config.research.scheduleMode,
+      intervalSec: config.research.intervalSec,
+      preMarketOffsetMin: config.research.preMarketOffsetMin,
+      postCloseOffsetMin: config.research.postCloseOffsetMin,
+    },
+    rewards: {
+      enabled: config.rewards.enabled,
+      period: config.rewards.period,
+      rankPercents: config.rewards.rankPercents,
+      maxPerPeriodUsd: config.rewards.maxPerPeriodUsd,
+    },
     stateDir: config.paths.stateDir,
     envFile: config.paths.envFile,
   };
