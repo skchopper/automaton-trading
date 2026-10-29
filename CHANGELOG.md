@@ -10,7 +10,7 @@ existing state migrate with **zero** data changes.
 
 ---
 
-## v2.2.0 (unreleased) — trading-hours-only monitoring + two execution tiers
+## v2.2.0 — 2026-10-29 — trading-hours monitoring + two execution tiers
 
 - **Price monitoring now runs only during trading hours.** `engine.tradingHoursOnly: true` makes the
   loop read the broker clock every cycle; outside RTH it runs a cheap maintenance pass (no market
@@ -34,9 +34,8 @@ existing state migrate with **zero** data changes.
   boundary, closed-market maintenance pass asserting no executions and no cycle charges) →
   **227 tests across 8 suites**.
 - Docs: `docs/RUNBOOK.md` §8b (tiered cadence + trading-hours gate, tuning and revert), README.
-- Upgrade: restart the Harness app so the engine reloads config; press Start (auto-start off).
 
-## v2.1.0 (unreleased) — fast intraday profile (minute monitoring)
+## v2.1.0 — 2026-10-29 — fast intraday profile (minute monitoring)
 
 - **1-minute decision loop for the paper population:** `cycleIntervalSec: 60`, `data.timeframe: "1Min"`,
   `data.feed: "iex"`, `lookbackBars: 120`, `risk.maxDailyOrders: 12`. The engine now re-prices the whole
