@@ -72,5 +72,17 @@
     "seed": 7,
     "tradingHoursOnly": true,
     "offHoursIntervalSec": 300
+  },
+  "agents": {
+    "enabled": true,
+    "reviewIntervalDaySec": 300,
+    "reviewIntervalSwingSec": 3600,
+    "maxReviewsPerCycle": 4,
+    "costPerReviewUsd": 0.001,
+    "maxAgeSec": 7200,
+    "logLimit": 120,
+    "maxInputChars": 8000,
+    "maxOutputTokens": 700,
+    "errorCooldownSec": 900
   }
 }

@@ -136,13 +136,21 @@ the operating config).
   analysed/trade every ~60 s on 1-minute IEX bars**, **mid/long-term bots hourly on 1-hour bars**
   (`cadence.day` / `cadence.swing`); swing positions still get an exit-only risk pass every cycle.
   Bar-based hold rules are measured in each tier's timeframe. Trade-offs and revert instructions:
-  `docs/RUNBOOK.md` §8a–8b.
+  `docs/RUNBOOK.md` §8a–8c.
+- **Per-bot agent brains + strategy categories:** every bot is its own isolated agent — it reviews
+  its strategy, book, market and research in a private context on its own cadence (day bots ~5 min,
+  swing bots hourly), keeps its own review journal/policy, and writes decisions the Executor applies
+  (`trade`/`cautious`/`stand_down`, size multiplier, `exit` pressure). The population is categorised
+  by strategy type: **Swing · mid-long** (momentum / mean-reversion, 1-hour lane) and **Day · intraday**
+  (breakout / gap-fade, 1-minute lane); genesis mixes them ~50/50 and existing populations rebalance
+  once on first start. The panel groups agents by category and shows each bot's strategy type,
+  estimated trading interval, and its latest agent thesis/plan. Contract: `docs/BOT-AGENTS.md`.
 
 ## Status (this build)
 
-- 8 test suites: mortality 55, market 27, plugin 40, independent integration 21, security 41,
-  research 13, rankings 16 and control 14 — **227 tests, 227 pass, 0 fail**. Run each file directly,
-  e.g. `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- 9 test suites: mortality 55, market 34, plugin 41, independent integration 21, security 41,
+  research 13, rankings 16, control 15 and bot-agent 8 — **244 tests, 244 pass, 0 fail**. Run each
+  file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live
   reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/
   monthly leaderboards; period-boundary rewards with cap scaling, once-per-period and live reward

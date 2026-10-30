@@ -36,11 +36,13 @@ import { createReplicator } from './replicator.js';
 import { createProspector } from './prospector.js';
 import { createBuilder } from './builder.js';
 import { createExecutor } from './executor.js';
+import { createBotAgents } from './bot-agent.js';
 import { createRankings, periodKeyEndMs } from './rankings.js';
 import { createReaper } from './reaper.js';
 import { createResearcher } from './research.js';
 import { createRewards } from './rewards.js';
 import { explainAgentPlan } from './strategy-explain.js';
+import { resolveStrategyType, strategyMix as computeStrategyMix, targetFamilyForIndex, tierForFamily } from './strategy-types.js';
 import { nextAgentName, usedNames } from './naming.js';
 
 const log = createLogger('automaton');
@@ -74,7 +76,9 @@ function genesisGenome(config, index) {
   const symbols = config.symbols.length > 0 ? config.symbols : ['SPY'];
   const seed = Number(config.engine?.seed ?? 7) >>> 0;
   const rng = mulberry32((seed * 2654435761 + index * 40503 + 1) >>> 0);
-  const family = HYPOTHESIS_FAMILIES[Math.floor(index / symbols.length) % HYPOTHESIS_FAMILIES.length];
+  // Balanced population mix (docs/BOT-AGENTS.md): half swing (momentum/meanrev, 1-hour lane) and
+  // half day (breakout/gapfade, 1-minute lane); the tier is implied by the family.
+  const family = targetFamilyForIndex(index, Math.max(1, Number(config.population?.initial) || 30));
   const symbol = symbols[index % symbols.length];
   const round = (value, digits) => {
     const factor = 10 ** digits;
@@ -240,6 +244,25 @@ export async function createAutomaton(options = {}) {
   const rankings = createRankings({ paths, config, clock });
   let operatorRewardsConfig = { ...(config.rewards ?? {}) };
   let rewards = createRewards({ paths, config: { ...config, rewards: operatorRewardsConfig }, clock });
+
+  // Per-bot agent brain (docs/BOT-AGENTS.md): each living bot gets its own isolated LLM review on
+  // its cadence and writes a policy the Executor consumes. Same LLM seam as the research sidecar.
+  const agentGenerate = options.agentGenerate ?? options.researchGenerate ?? options.generate ?? null;
+  const specLookup = (agentId) => {
+    const agent = registry.get(agentId);
+    return agent?.specId ? state.specs.get(agent.specId) ?? null : null;
+  };
+  const botAgents = createBotAgents({
+    config,
+    paths,
+    clock,
+    registry,
+    ledger,
+    broker,
+    researcher,
+    generate: typeof agentGenerate === 'function' ? agentGenerate : undefined,
+    specFor: specLookup,
+  });
 
   // -------------------------------------------------------------------------
   // persistence helpers
@@ -412,7 +435,9 @@ export async function createAutomaton(options = {}) {
         // Split the genesis population across the two execution tiers (docs/CONTROL-PANEL.md):
         // 'day' bots are evaluated on the intraday cadence (default 1 min), 'swing' bots on the
         // mid/long-term cadence (default 1 h). Children inherit their parent's tier.
-        tier: i % 2 === 0 ? 'day' : 'swing',
+        // Tier is implied by the strategy family: swing families (momentum/meanrev) trade the
+        // 1-hour lane, day families (breakout/gapfade) the intraday lane.
+        tier: tierForFamily(genome.family),
         notes: ['genesis'],
       });
       await ledger.ensureAgent(agent.id, { endowmentUsd: config.endowmentUsd, at: clock.now() });
@@ -451,16 +476,20 @@ export async function createAutomaton(options = {}) {
   }
 
   /**
-   * Backfill the execution tier for agents created before tiers existed (e.g. a running
-   * population upgraded in place): alternate day/swing deterministically by registry order.
+   * Backfill the execution tier for agents created before tiers existed. The tier is derived from
+   * the strategy family (swing: momentum/meanrev, day: breakout/gapfade) so the population is
+   * always categorised by its real strategy type.
    */
   async function backfillAgentTiers() {
-    const agents = registry.alive().filter((agent) => !agent.tier);
+    const agents = registry.alive().filter((agent) => {
+      const expected = tierForFamily(agent?.genome?.family);
+      return agent.tier !== expected;
+    });
     if (agents.length === 0) return;
     let changed = 0;
-    for (const [index, agent] of agents.entries()) {
+    for (const agent of agents) {
       try {
-        await registry.update(agent.id, { tier: index % 2 === 0 ? 'day' : 'swing' });
+        await registry.update(agent.id, { tier: tierForFamily(agent?.genome?.family) });
         changed += 1;
       } catch {
         /* dead/immutable records keep their default tier */
@@ -468,7 +497,44 @@ export async function createAutomaton(options = {}) {
     }
     if (changed > 0) {
       await registry.save();
-      log.info('agent tiers backfilled', { count: changed });
+      log.info('agent tiers aligned to strategy family', { count: changed });
+    }
+  }
+
+  /**
+   * One-time strategy-mix adjustment for a population seeded before the taxonomy existed: if the
+   * living population is lopsided (e.g. all momentum/meanrev), deterministically reassign genomes so
+   * roughly half the bots trade swing strategies and half trade day strategies. Specs are cleared
+   * and strategy-derived names refreshed; ids, ledgers, positions and history are untouched.
+   */
+  async function rebalanceStrategyMix() {
+    const alive = registry.alive();
+    if (alive.length < 8) return;
+    const counts = { swing: 0, day: 0 };
+    for (const agent of alive) counts[tierForFamily(agent?.genome?.family)] += 1;
+    const swingRatio = counts.swing / alive.length;
+    if (swingRatio >= 0.4 && swingRatio <= 0.6) return;
+    let changed = 0;
+    for (let index = 0; index < alive.length; index += 1) {
+      const agent = alive[index];
+      const target = targetFamilyForIndex(index, alive.length);
+      if ((agent?.genome?.family ?? null) === target) continue;
+      const genome = { ...(agent.genome ?? {}), family: target };
+      const patch = { genome, tier: tierForFamily(target), specId: null };
+      try {
+        if (agent.name) {
+          const taken = usedNames(registry.all().filter((candidate) => candidate.id !== agent.id));
+          patch.name = nextAgentName(genome, taken);
+        }
+        await registry.update(agent.id, patch);
+        changed += 1;
+      } catch {
+        /* immutable/dead records are skipped */
+      }
+    }
+    if (changed > 0) {
+      await registry.save();
+      log.info('strategy mix rebalanced', { changed, population: alive.length, before: counts });
     }
   }
 
@@ -480,6 +546,7 @@ export async function createAutomaton(options = {}) {
     await ledger.load();
     await loadDayStats(clock.now());
     await researcher.init();
+    await botAgents.init();
     await rankings.load();
     await rewards.load();
     // Reload compiled specs from disk so a restart does not silently drop strategies.
@@ -496,6 +563,7 @@ export async function createAutomaton(options = {}) {
     await seedGenesis(Number(account?.equityUsd) || 0);
     await backfillAgentNames();
     await backfillAgentTiers();
+    await rebalanceStrategyMix();
     state.initialized = true;
     const snapshot = await buildSnapshot({ account, treasury: null, halted: false, haltReasons: [] });
     await writeStateFile(snapshot);
@@ -850,6 +918,8 @@ export async function createAutomaton(options = {}) {
             // Fresh per-agent briefing (null when missing/stale/disabled); the executor may
             // veto entries, scale size or force an exit — it can never place orders itself.
             research: researcher.latest(agent.id),
+            // The bot's own agent policy (stance/size/exit pressure); null when missing/stale.
+            policy: botAgents.policy(agent.id),
           });
           if (due) state.lastAnalysisAt.set(agent.id, cadenceNowMs);
           trace.executions.push({
@@ -960,6 +1030,35 @@ export async function createAutomaton(options = {}) {
       // It never trades, never reads another agent's book, and each briefing is paid for by
       // the agent's own ledger. Halted treasuries skip research (no spend while reconciling).
       await runResearchPhase(trace, marketClock, treasuryView.halted);
+
+      // 7b. BOT AGENTS: each due bot reviews its own strategy in isolation and writes a policy the
+      // Executor applies on the next cycle. Runs after execution (no order waits on a model turn)
+      // and after research (the review sees this cycle's briefing). Cost is paid by the bot itself.
+      try {
+        const agentRun = await botAgents.tick({
+          market: { prices: state.lastPrices ?? {}, quotes: state.lastQuotes ?? {}, marketOpen },
+        });
+        trace.agents = {
+          enabled: agentRun.enabled,
+          configured: agentRun.configured,
+          due: agentRun.due,
+          reviewed: agentRun.reviewed.length,
+          deferred: agentRun.deferred ?? 0,
+          skipped: agentRun.skipped,
+          errors: agentRun.reviewed.filter((entry) => entry.error).length,
+          budgetUsd: round4(agentRun.reviewed.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0)),
+        };
+        if (!agentRun.enabled || !agentRun.configured) {
+          trace.agents.note = !agentRun.enabled ? 'disabled by config' : 'no LLM generator configured';
+        }
+        if (agentRun.paused) {
+          trace.agents.paused = true;
+          trace.agents.note = agentRun.note ?? 'paused after provider error';
+        }
+        if ((agentRun.reviewed ?? []).some((entry) => entry.costUsd > 0)) await ledger.save();
+      } catch (error) {
+        trace.errors.push({ role: 'agents', ...errorInfo(error) });
+      }
 
       // 8. REPLICATOR: only when the Treasurer's gate says so, one mutation, cap enforced
       if (treasuryView.mayReplicate && !treasuryView.halted) {
@@ -1203,6 +1302,14 @@ export async function createAutomaton(options = {}) {
             nextAnalysisAt: new Date(nextMs).toISOString(),
           };
         })(),
+        // Strategy taxonomy (type + category + estimated trading interval for the panel table).
+        strategy: resolveStrategyType({
+          family: agent?.genome?.family,
+          tier: agent.tier,
+          cadence,
+        }),
+        // This bot's own agent brain: latest review policy, review count, next review time.
+        policy: botAgents.status(agent.id),
         // Strategy explanation + current plan/next step for the detail page.
         plan: explainAgentPlan({
           agent,
@@ -1217,6 +1324,7 @@ export async function createAutomaton(options = {}) {
         note: isCondemned ? 'death verdict written; the external Reaper executes it' : null,
       };
     });
+    const strategyMixView = computeStrategyMix(agents.map((row) => ({ genome: row.genome, strategy: row.strategy })));
     const obituaryStats = journal.stats ? await journal.stats() : null;
     return {
       at: new Date(clock.now()).toISOString(),
@@ -1236,6 +1344,7 @@ export async function createAutomaton(options = {}) {
             intervalOptionsSec: [3600, 10800, 21600, 86400],
           },
         },
+        agents: botAgents.schedule(),
         rewards: rewardsView,
         cadence,
         tradingHoursOnly: config.engine?.tradingHoursOnly === true,
@@ -1264,6 +1373,7 @@ export async function createAutomaton(options = {}) {
         byGeneration: registry.generationStats ? registry.generationStats() : {},
       },
       agents,
+      strategyMix: strategyMixView,
       rankings: rankingsView,
       rewards: rewardsView,
       obituaries: obituaryStats,

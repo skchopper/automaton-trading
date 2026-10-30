@@ -93,6 +93,25 @@ Economics: each successful briefing is charged to that agent's own ledger
 therefore shortens runway exactly like real inference does — research that does not pay for
 itself kills the agent that bought it. Full contract: `docs/RESEARCH.md`.
 
+### The per-bot agent brain (isolated decision support)
+
+Every bot is also its own agent in a second, stronger sense: on its own cadence (day bots ~5 min,
+swing bots hourly) it receives a **private review** whose context is only its identity/genome/spec,
+its virtual book, market data for its symbol, its own research briefing and its own earlier reviews.
+The review is written to `automaton-data/agents/<agentId>.jsonl` and returns a validated policy:
+`stance` (`trade`/`cautious`/`stand_down`), a size multiplier (0.2–1, only shrinks), an exit-pressure
+flag, confidence, thesis and plan. The Executor consumes the fresh policy next cycle: stand-down
+blocks new entries (exits still fire), size shrinks entries before every cap, exit pressure forces a
+position exit after any research ALERT. Execution and the 14 brakes remain deterministic so
+minute-level reactions never wait on a model turn — the bot agent is the persistent "brain", the
+executor is the reflex. Reviews are charged to the bot (category `agent`) and survive restarts.
+Full contract: `docs/BOT-AGENTS.md`.
+
+**Strategy classes.** Momentum/mean-reversion bots are swing/mid-long (1-hour lane); breakout/gap-fade
+bots are day/intraday (1-minute lane). The tier is derived from the strategy family, replication
+inherits it from the mutated child genome, and genesis mixes a new population ~50/50. Status exposes
+the taxonomy per agent and a population `strategyMix` for the panel's category tabs.
+
 ---
 
 ## 3. Metabolism, runway, death

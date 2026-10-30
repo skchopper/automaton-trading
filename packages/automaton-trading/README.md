@@ -25,6 +25,8 @@ obituary the living read.
 | Research sidecar | Host-side Harness-LLM bridge for the engine's per-agent isolated hourly analyst; briefings surface in the agent table and detail pane |
 | Operator settings | Research cadence (1h/3h/6h/24h, before open, after close, both), winner rewards (period + 1st/2nd/3rd % of account cash + caps) and daily/weekly/monthly leaderboards, all applied through loopback-only control actions |
 | Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, day/week/month P&L |
+| Strategy taxonomy | Per-bot **strategy type** + **estimated trading interval** columns, category tabs (All / Swing · mid-long / Day · intraday with counts) and category-coloured chips |
+| Per-bot agent brains | Each bot has its own agent brain (isolated per-bot reviews): a **Bot agent** section (stance, size/risk multipliers, confidence, thesis, plan, watch list, review count, last/next review, stale warning) plus a small engine-level bridge line |
 
 Everything is dependency-free ESM with no build step; the browser module is loaded as
 plain JavaScript (`./client`). `dsh.client.inject` orders the client half after the real
@@ -41,9 +43,16 @@ sorting and the obituary feed use the name first.
 
 The dashboard shows, per agent: name, generation, **Genome** (`family symbol` inherited
 from the parent, e.g. `Momentum AAPL`) and **Trading (spec)** (the compiled hypothesis the
-Builder actually trades — it can differ from the genome, shown with a `≠` marker), equity,
-USD/percent P&L, day P&L, net-7d, a runway bar, treasury state, alive/dead/condemned
-status plus cause, and a positions/trades count.
+Builder actually trades — it can differ from the genome, shown with a `≠` marker), the
+**Strategy type** chip (`Momentum swing` / `Mean-reversion swing` / `Intraday breakout` /
+`Day-trade gap fade`, colour-coded by category), the **Est. interval** (`~30s` / `~5m` /
+`~1h` …), research badge, equity, USD/percent P&L, day P&L, net-7d, a runway bar, treasury
+state, alive/dead/condemned status plus cause, and a positions/trades count.
+
+Above the table, **category tabs** filter the population by strategy class:
+`All (n) / Swing · mid-long (n) / Day · intraday (n)` — counts come from
+`status.strategyMix` (falling back to the agent rows), and they compose with the
+alive/dead filter, search and sorting.
 
 **Click any agent row** to open the inline detail pane (right-hand side on wide screens,
 stacked below on narrow ones; `Esc` or the × closes it):
@@ -58,16 +67,18 @@ stacked below on narrow ones; `Esc` or the × closes it):
 - **Strategy parameters** for both the inherited **genome** and the compiled **spec**
   (lookback / entryZ / exitZ / stop / target / max-hold / size / session), with a warning
   when the compiled spec differs, and a note when an agent has no compiled spec yet;
-- **Strategy & plan**, **Transactions**, **ranking badges** and the research section — see
-  “Agent detail: strategy & plan, transactions, rankings” below;
+- **Strategy & plan**, **Transactions**, **ranking badges**, the **Bot agent** section and
+  the research section — see “Agent detail: strategy & plan, transactions, rankings” and
+  “Strategy types & per-bot agent brains” below;
 - **Role costs** per role (treasurer / prospector / builder / executor / replicator /
   reaper).
 
 Plus:
 
 - **Sort** by clicking the Agent, Gen, Equity, P&L, Day %, Runway or Status headers.
-- **Filter** by All / Alive / Dead (plus Condemned when any exist) and free-text search
-  across name, id, symbol, family and parent name.
+- **Filter** by category tabs (All / Swing · mid-long / Day · intraday with counts),
+  status All / Alive / Dead (plus Condemned when any exist) and free-text search across
+  name, id, symbol, family and parent name.
 - **Generations** summarises born/alive/dead per generation; **Obituaries** lists the
   last 8 deaths (name, cause, lifespan, net P&L, first-profit time).
 - **Auto-refresh**: 3 s, with an explicit Pause/Resume toggle shared by every surface.
@@ -104,6 +115,35 @@ instead of a stop button.
    generation is alive (`REAPER_UNAVAILABLE` with an operator hint).
 2. **Start** — once the Reaper row shows `not running` (a fresh Reaper is spawned by
    `engine.start()` for paper/live), press `Start`.
+
+### Strategy types & per-bot agent brains
+
+Each bot's genome family maps to a strategy class (contract `docs/BOT-AGENTS.md`):
+
+| Genome family | Strategy type | Category | Timeframe | Est. interval |
+|---|---|---|---|---|
+| `momentum` | Momentum swing | Swing · mid-long | 1Hour | ~1h |
+| `meanrev` | Mean-reversion swing | Swing · mid-long | 1Hour | ~1h |
+| `breakout` | Intraday breakout | Day · intraday | 1Min | ~5m |
+| `gapfade` | Day-trade gap fade | Day · intraday | 1Min | ~5m |
+
+The table's **Strategy type** chip uses `agent.strategy.typeLabel` (the client falls back
+to the genome family when the engine has not added `agent.strategy` yet) and
+**Est. interval** formats `strategy.estimatedIntervalSec` (`<120s → ~Xs`,
+`<3600s → ~Xm`, else `~Xh`), falling back to `agent.cadence`. The header shows a small
+engine-level bridge line from `status.engine.agents` (enabled/configured, provider/model,
+day/swing cadence, runs/errors, next due); it degrades to
+"bot-agent bridge not configured yet" when the engine has no per-bot layer.
+
+Each bot also has its own **isolated agent brain**, reviewed on its category cadence (day
+bots every few minutes, swing bots hourly; ~200 reviews/hour for 30 bots). The detail
+pane's **Bot agent** section renders from `agent.policy`: stance badge
+(`TRADE` / `CAUTIOUS` / `STAND DOWN`), size/risk multipliers, confidence, exit pressure,
+thesis, plan list, watch symbols, review count, last/next review time and a **stale**
+warning (the executor then falls back to the last valid policy or the baseline). Empty
+state: "bot agent has not reviewed yet (first review pending)". `GET /automaton/state`
+carries `strategyMix`, `engine.agents`, each agent's `strategy` and `policy`; every new
+field is optional so the panel still renders on older engine builds.
 
 ### Research sidecar — isolated hourly analyst
 
@@ -267,6 +307,14 @@ so the new client module + routes load), verify:
 9. Agent detail: the "Strategy & plan" and "Transactions" sections render from
    `agents[].plan` / `agents[].orders`, and day/week/month ranking badges show when
    `agents[].rankings` exists.
+10. Strategy taxonomy: the table shows a colour-coded **Strategy type** chip and an
+    **Est. interval** for every bot; the category tabs show
+    `All (30) / Swing · mid-long (n) / Day · intraday (n)` and filter the rows; the
+    detail header shows the category chip and the "Bot agent" section shows the latest
+    stance/thesis/plan (or the first-review-pending empty state).
+11. Bot-agent bridge: the header line shows "Bot agents · configured · provider/model ·
+    Day ~5m · Swing ~1h · runs/errors · next review" once `engine.agents` is present, and
+    the generic "bot-agent bridge not configured yet" note otherwise.
 
 ## Configuration
 
@@ -383,9 +431,11 @@ network, a broker, or the Harness profile. (Under the Windows DSH sandbox the de
 file in-process with `node test/plugin.test.js` or disable test isolation as shown.)
 
 Layout: `index.js` (Host tools + state/control routes + engine lifecycle + validator for
-research/reward settings + the operator-only Reaper stop helper), `client.js` (shared
-dashboard: sidebar entry + keyed `main` panel + settings page; names/genome-vs-spec/
-holdings/activity/research/cadence/rewards/leaderboards/plan/transactions mapping are pure
-functions exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata),
-`icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the core project).
+research/reward settings + the operator-only Reaper stop helper; passes `rankings`,
+`strategyMix`, `rewards` and `engine.agents` through from the engine status), `client.js`
+(shared dashboard: sidebar entry + keyed `main` panel + settings page; names/genome-vs-spec/
+holdings/activity/research/cadence/rewards/leaderboards/plan/transactions/strategy-type/
+bot-agent-policy mapping are pure functions exported as `helpers` for tests),
+`locale/{en,zh}.json` (plugin metadata), `icon.svg`, `test/plugin.test.js`, `src/**`
+(engine implemented by the core project).
 

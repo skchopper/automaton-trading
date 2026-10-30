@@ -15,10 +15,10 @@
  * `sizePct * mandate.sizeBudgetUsd` and capped by absolute notional caps, rounded to
  * 4 decimal fractional shares, stamped `atm:<agentId>:<specId>:<seq>`.
  *
- * Optional advisory input: `research` (an isolated per-agent briefing). When the
- * sidecar is enabled and influencing, and the briefing is fresh, it can only veto an
- * entry, shrink an entry, or force an exit. It never creates an order, never widens a
- * size, and never bypasses the brake wall.
+ * Optional advisory inputs: `research` (an isolated per-agent briefing) and `policy` (the
+ * bot's own agent-brain policy from docs/BOT-AGENTS.md). When enabled and fresh, each can
+ * only veto/skip an entry, shrink an entry, or force an exit. Neither ever creates an
+ * order, widens a size, or bypasses the brake wall.
  *
  * Contract: docs/CONTRACTS.md § "Data feeder / market helpers" (executor.js).
  * Owner: market teammate.
@@ -64,6 +64,56 @@ function timestampOf(value) {
 
 /** Research verdicts the executor understands; anything else behaves as HOLD. */
 export const RESEARCH_VERDICTS = Object.freeze(['HOLD', 'AVOID', 'ALERT']);
+
+/** Stances a bot agent's own policy may declare (docs/BOT-AGENTS.md). */
+export const AGENT_STANCES = Object.freeze(['trade', 'cautious', 'stand_down']);
+
+/**
+ * Resolve whether a per-bot agent policy may influence this execution cycle.
+ *
+ * Policy is advisory *for execution* but authoritative for that bot's own stance: it is
+ * gated on `config.agents.enabled === true`, must be fresh within `config.agents.maxAgeSec`
+ * (default 2 h), and malformed/deprecated/missing policies resolve to null — which means
+ * "exactly the behaviour before bot agents existed". It can only reduce exposure
+ * (stand down, shrink size, exit); it can never create an order, increase a size, or
+ * bypass a brake.
+ *
+ * @param {{
+ *   policy?: object|null,
+ *   config?: object,
+ *   atMs: number,
+ * }} input
+ * @returns {{stance:'trade'|'cautious'|'stand_down', sizeMultiplier:number,
+ *            exitPressure:'none'|'exit', confidence:number, at:number}|null}
+ */
+export function resolveAgentPolicy({ policy, config, atMs }) {
+  const cfg = config && typeof config === 'object' && config.agents && typeof config.agents === 'object'
+    ? config.agents
+    : null;
+  if (!cfg || cfg.enabled !== true) return null;
+  if (!policy || typeof policy !== 'object') return null;
+  // bot-agent.policy() already marks stale against the bot's own cadence; trust it.
+  if (policy.stale === true) return null;
+  const observedAtMs = timestampOf(policy.atMs ?? policy.at ?? policy.observedAt);
+  if (observedAtMs === null) return null; // malformed: no decision date, no influence
+  const maxAgeSec = numberOrNull(cfg.maxAgeSec);
+  const maxAgeMs = (maxAgeSec !== null && maxAgeSec > 0 ? maxAgeSec : 7200) * 1000;
+  const ageMs = atMs - observedAtMs;
+  if (ageMs > maxAgeMs) return null; // stale: ignored by the executor, still shown in the UI
+  const rawStance = typeof policy.stance === 'string' ? policy.stance.trim().toLowerCase() : '';
+  if (!AGENT_STANCES.includes(rawStance)) return null; // malformed stance: ignore entirely
+  const rawSize = numberOrNull(policy.sizeMultiplier);
+  // v1: sizing can only shrink; out-of-range values are clamped into [0.2, 1].
+  const sizeMultiplier = rawSize === null ? 1 : clamp(rawSize, 0.2, 1);
+  const exitPressure = policy.exitPressure === 'exit' ? 'exit' : 'none';
+  return {
+    stance: rawStance,
+    sizeMultiplier,
+    exitPressure,
+    confidence: clamp(numberOrNull(policy.confidence) ?? 0, 0, 1),
+    at: observedAtMs,
+  };
+}
 
 /**
  * Resolve whether a research briefing may influence this execution cycle.
@@ -302,6 +352,9 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   // Research influence is opt-in and gated by config.research (shadow mode = influence:false).
   const researchConfig = config.research && typeof config.research === 'object' ? config.research : {};
   const researchInfluenceEnabled = researchConfig.enabled === true && researchConfig.influence === true;
+  // Per-bot agent policy consumption is opt-in and gated by config.agents (docs/BOT-AGENTS.md).
+  const agentsConfig = config.agents && typeof config.agents === 'object' ? config.agents : {};
+  const agentsEnabled = agentsConfig.enabled === true;
 
   /** Monotonic per-agent order sequence, so client_order_id never repeats. */
   const orderSeq = new Map();
@@ -321,12 +374,13 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
      *   bars?: Record<string, Array<object>>|Array<object>,
      *   dayStats?: object, now?: number|string|Date,
      *   research?: object|null,   // research.latest(agentId); advisory, fresh-only
+     *   policy?: object|null,     // botAgents.policy(agentId); own-bot stance, fresh-only
      *   marketOpen?: boolean, marketClock?: object,
      * }} args
      * @returns {Promise<{agentId:string, actions:Array<object>, orders:Array<object>,
      *           denied:Array<{code:string, reason:string}>, spentUsd:number}>}
      */
-    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
+    async run({ agent, spec, mandate, quotes, bars: providedBars, dayStats, now: nowInput, research, policy, marketOpen, marketClock, timeframe: runTimeframe, riskOnly = false } = {}) {
       const atMs = normalizeNow(nowInput, now);
       const at = new Date(atMs).toISOString();
       const agentId = String(agent?.id ?? agent?.agentId ?? spec?.agentId ?? '');
@@ -519,6 +573,20 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       const researchRiskFactor = researchBriefing && researchBriefing.risks.length >= 2 ? researchRiskPenalty : 1;
       const researchSizeFactor = clamp(researchBaseFactor * researchRiskFactor, 0.3, 1.0);
 
+      // --- per-bot agent policy (own brain, fresh-only, config-gated) --------------
+      // `policy` is botAgents.policy(agentId). The bot's own stance can only reduce
+      // exposure: stand down (no entries), shrink the entry size, or force an exit.
+      // It never creates an order, never grows a size, and never bypasses a brake.
+      const policyState = agentsEnabled
+        ? resolveAgentPolicy({ policy, config, atMs })
+        : null;
+      const policyStandDown = Boolean(policyState && policyState.stance === 'stand_down');
+      const policyExitPressure = Boolean(policyState && policyState.exitPressure === 'exit');
+      const policySizeFactor = policyState ? policyState.sizeMultiplier : 1;
+      const policyEffect = policyState
+        ? { stance: policyState.stance, sizeMultiplier: policyState.sizeMultiplier }
+        : null;
+
       // --- own position book (never broker.getAccount) ----------------------------
       // Reconcile pending fills BEFORE reading the book so today's fills become positions.
       await reconcileBrokerFills();
@@ -610,7 +678,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
        * Check the brakes, submit, and book the fill for one intended order.
        * @returns {Promise<object|null>} submitted order or null when denied/skipped
        */
-      async function submitChecked({ symbol, side, qty, priceUsd, reason, kind, quote, positionsSnapshot, research: actionResearch = null }) {
+      async function submitChecked({ symbol, side, qty, priceUsd, reason, kind, quote, positionsSnapshot, research: actionResearch = null, policy: actionPolicy = null }) {
         const ticker = String(symbol).toUpperCase();
         const orderQty = round4(qty);
         if (!(orderQty > 0)) {
@@ -717,6 +785,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           fillPriceUsd: bookedQty > 0 ? round2(booked.price) : null,
           pending: bookedQty === 0,
           ...(actionResearch ? { research: actionResearch } : {}),
+          ...(actionPolicy ? { policy: actionPolicy } : {}),
         });
         // Position book changed; keep the local map current for the rest of the cycle.
         if (bookedQty > 0) {
@@ -761,11 +830,17 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 
         let exitReason = null;
         let exitResearch = null;
+        let exitPolicy = null;
         if (researchExitAlert) {
           // Research pressure is risk-reducing, so it runs in the exit pass and before
           // the mechanical rules: an isolated analyst calling ALERT forces the exit.
           exitReason = 'research_alert';
           exitResearch = { ...researchEffect, applied: 'exit' };
+        } else if (policyExitPressure) {
+          // The bot's own brain pressed the exit: force the held position out before the
+          // mechanical rules (stop/target/hold/signal) get a chance to hold it.
+          exitReason = 'agent_exit_pressure';
+          exitPolicy = { ...policyEffect, applied: 'exit' };
         } else if (position.avgPriceUsd > 0 && quote.last <= stopPrice) exitReason = 'stop';
         else if (position.avgPriceUsd > 0 && quote.last >= targetPrice) exitReason = 'target';
         else if (barsHeld >= maxHoldBars) exitReason = 'max_hold';
@@ -790,6 +865,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           quote,
           positionsSnapshot: Object.fromEntries(positions),
           research: exitResearch,
+          policy: exitPolicy,
         });
       }
 
@@ -835,6 +911,15 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
               reason: signal.reason ?? 'no_signal',
               z: signal.z,
             });
+          } else if (policyStandDown) {
+            // The bot's own brain said stand down: no new exposure. This is a stance
+            // skip, not a brake denial; the exit pass above still ran for held positions.
+            result.actions.push({
+              type: 'skip',
+              symbol,
+              reason: 'agent_stand_down',
+              policy: { stance: policyState.stance },
+            });
           } else if (researchVeto) {
             // The isolated analyst vetoed the entry that the signal would otherwise take.
             // This is an advisory skip, not a brake denial: no order ever reaches the wall.
@@ -846,9 +931,11 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
             });
           } else {
             const price = round4(quote.ask ?? quote.last);
-            // Research sizing can only shrink: the factor multiplies the target notional
-            // before the existing mandate/risk caps are applied below.
-            const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor];
+            // Research and bot-agent sizing can only shrink: both factors multiply the
+            // target notional BEFORE the existing mandate/risk caps are applied below.
+            const caps = [
+              (spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor,
+            ];
             if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
             if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
             if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
@@ -877,6 +964,7 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
               quote,
               positionsSnapshot: Object.fromEntries(positions),
               research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
+              policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
             });
           }
         }
@@ -899,6 +987,12 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           influence: researchConfig.influence === true,
           influenceActive: researchInfluenceEnabled,
           maxAgeSec: Number.isFinite(Number(researchConfig.maxAgeSec)) ? Number(researchConfig.maxAgeSec) : null,
+        },
+        agents: {
+          enabled: agentsEnabled,
+          policyActive: agentsEnabled,
+          maxAgeSec: Number.isFinite(Number(agentsConfig.maxAgeSec)) ? Number(agentsConfig.maxAgeSec) : 7200,
+          effects: ['stand_down', 'size_multiplier', 'exit_pressure'],
         },
       };
     },

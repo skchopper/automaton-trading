@@ -624,6 +624,7 @@ async function buildState(holder, row) {
     limits,
     agents: Array.isArray(status?.agents) ? status.agents : [],
     rankings: status?.rankings ?? null,
+    strategyMix: status?.strategyMix ?? null,
     rewards: status?.rewards ?? (status?.engine?.rewards ? { ...status.engine.rewards, history: [] } : null),
     obituaries: {
       stats: obituaries.stats ?? status?.obituaries ?? null,

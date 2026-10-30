@@ -10,6 +10,49 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v2.3.0 — 2026-10-30 — per-bot agents, strategy categories and a richer panel
+
+- **Every bot is now its own agent.** On its own cadence each bot gets a private LLM review whose
+  context contains only its identity, strategy genome/spec, virtual book, market data for its symbol,
+  its own research briefing and its own earlier reviews. Nothing is shared with other bots or the
+  operator, and no other bot's data can appear in the prompt. Reviews are stored per bot
+  (`agents/<agentId>.jsonl` + `agents/state.json`) and survive restarts.
+  - Review cadence: **day bots every 5 minutes**, **swing bots every hour** (~200 reviews/hour for a
+    30-bot population); a per-cycle cap spreads the cold start without blocking execution.
+  - Each review returns a validated, clamped policy: `stance` (`trade` / `cautious` / `stand_down`),
+    `sizeMultiplier` (0.2–1, only shrinks), `exitPressure` (`none` / `exit`), `confidence`, `thesis`,
+    `plan`, `watch`. Malformed replies are contained (JSON repair + one retry, no policy, no charge)
+    and failures never stall the trading loop.
+  - Reviews are charged to the bot's own ledger (category `agent`); missing/stale/disabled policies
+    leave the Executor byte-for-byte at its previous behaviour.
+- **Strategy taxonomy and population mix.** Momentum and mean-reversion are **Swing · mid-long**
+  strategies on the 1-hour lane; breakout and gap-fade are **Day · intraday** strategies on the
+  1-minute lane. Genesis mixes a new population roughly 50/50 across the two classes (8/7/8/7 for 30
+  bots over 10 symbols, keeping every symbol/family pair unique). The execution tier is derived from
+  the strategy family, and children derive their tier from the mutated genome. Populations seeded
+  before the taxonomy are rebalanced once on first start (genome family refreshed, spec recompiled,
+  strategy-derived name updated; ids, ledgers, positions and history untouched).
+- **Executor policy consumption (hybrid architecture).** Execution and the 14 brakes stay
+  deterministic so minute-level reactions never wait on a model turn: `stand_down` blocks new
+  entries (risk-reducing exits still fire), `sizeMultiplier` shrinks entry notional before every
+  existing cap (never grows), `exitPressure: exit` forces a position exit after any research ALERT
+  and before mechanical rules. Every order still passes the brake wall.
+- **Control panel.** Agents are grouped by trading category with **All / Swing · mid-long / Day ·
+  intraday** tabs; the agent table gains **Strategy type** and **Est. interval** columns. Each agent's
+  detail page gains a **Bot agent** section (stance, size, confidence, exit pressure, thesis, plan,
+  watch list, last/next review, review count and a stale warning) plus a category header chip, and
+  the engine header shows the bot-agent bridge status (provider/model, cadences, runs/errors, next
+  review). Older snapshots render genome-derived fallbacks and empty states.
+- **Status contract.** `status.strategyMix` (swing/day counts and families), `status.engine.agents`
+  (enabled/configured, provider/model, day+swing cadences, last/next review, runs, errors) and per
+  agent `strategy` + `policy` views. `status.engine.agents.configured` is false without an LLM bridge
+  (heads-up only; trading continues).
+- **Tests:** 9 suites, **244 tests** (mortality 55, market 34, plugin 41, integration 21, security 41,
+  research 13, rankings 16, control 15, bot-agent 8), all passing.
+- **Compatibility:** new optional config block `agents` (enabled, review intervals, per-cycle cap,
+  cost, max age, journal limits, cooldown) with defaults; no new tools, settings/control actions
+  unchanged; paper remains the default mode.
+
 ## v2.2.0 — 2026-10-29 — trading-hours monitoring + two execution tiers
 
 - **Price monitoring now runs only during trading hours.** `engine.tradingHoursOnly: true` makes the

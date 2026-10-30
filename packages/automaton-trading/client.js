@@ -182,6 +182,31 @@ window.__ModuleLoader__.load({
       operatorControls: 'Operator controls',
       cadenceEnabled: 'Collection',
       cadenceInfluence: 'Influence trades',
+      strategyType: 'Strategy type',
+      estInterval: 'Est. interval',
+      categoryAll: 'All',
+      categorySwing: 'Swing · mid-long',
+      categoryDay: 'Day · intraday',
+      botAgent: 'Bot agent',
+      botAgentEmpty: 'bot agent has not reviewed yet (first review pending)',
+      botAgentBridge: 'Bot agents',
+      botAgentBridgeOff: 'bot-agent bridge not configured yet',
+      botAgentStale: 'policy is stale — the executor falls back to the last valid policy or baseline',
+      stance: 'Stance',
+      stanceTrade: 'TRADE',
+      stanceCautious: 'CAUTIOUS',
+      stanceStandDown: 'STAND DOWN',
+      stanceUnknown: '—',
+      sizeMultiplier: 'Size ×',
+      riskMultiplier: 'Risk ×',
+      confidence: 'Confidence',
+      exitPressure: 'Exit pressure',
+      reviewCount: 'Reviews',
+      lastReview: 'Last review',
+      nextReview: 'Next review',
+      watchlist: 'Watch',
+      thesis: 'Thesis',
+      reviewInterval: 'Review interval',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -428,6 +453,31 @@ window.__ModuleLoader__.load({
       operatorControls: '操作员控制',
       cadenceEnabled: '收集简报',
       cadenceInfluence: '影响交易',
+      strategyType: '策略类型',
+      estInterval: '预计间隔',
+      categoryAll: '全部',
+      categorySwing: '波段 · 中长线',
+      categoryDay: '日内 · 短线',
+      botAgent: '机器人代理',
+      botAgentEmpty: '机器人代理尚未复盘（首次复盘待执行）',
+      botAgentBridge: '机器人代理',
+      botAgentBridgeOff: '机器人代理桥接尚未配置',
+      botAgentStale: '策略已过期 —— 执行层回退到最近的可用策略或基线',
+      stance: '姿态',
+      stanceTrade: '交易',
+      stanceCautious: '谨慎',
+      stanceStandDown: '观望',
+      stanceUnknown: '—',
+      sizeMultiplier: '仓位 ×',
+      riskMultiplier: '风险 ×',
+      confidence: '置信度',
+      exitPressure: '离场压力',
+      reviewCount: '复盘次数',
+      lastReview: '上次复盘',
+      nextReview: '下次复盘',
+      watchlist: '关注',
+      thesis: '观点',
+      reviewInterval: '复盘间隔',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -1269,6 +1319,179 @@ window.__ModuleLoader__.load({
       };
     }
 
+    // -----------------------------------------------------------------------
+    // strategy taxonomy + per-bot agent brain (docs/BOT-AGENTS.md)
+    // -----------------------------------------------------------------------
+
+    const STRATEGY_CATEGORY_LABELS = Object.freeze({ swing: 'Swing · mid-long', day: 'Day · intraday' });
+    const STRATEGY_CATEGORY_SHORT = Object.freeze({ swing: 'Swing', day: 'Day' });
+    const STRATEGY_CATEGORY_KEYS = Object.freeze({ swing: 'categorySwing', day: 'categoryDay' });
+    /** Client-side taxonomy fallback when the engine has not added `agent.strategy` yet. */
+    const STRATEGY_TYPE_FALLBACK = Object.freeze({
+      momentum: { category: 'swing', typeLabel: 'Momentum swing', className: 'momentum', estimatedIntervalSec: 3600, timeframe: '1Hour' },
+      meanrev: { category: 'swing', typeLabel: 'Mean-reversion swing', className: 'meanrev', estimatedIntervalSec: 3600, timeframe: '1Hour' },
+      breakout: { category: 'day', typeLabel: 'Intraday breakout', className: 'breakout', estimatedIntervalSec: 300, timeframe: '1Min' },
+      gapfade: { category: 'day', typeLabel: 'Day-trade gap fade', className: 'gapfade', estimatedIntervalSec: 300, timeframe: '1Min' },
+    });
+
+    /** Format an estimated decision interval in seconds ("~30s" / "~5m" / "~1h"). */
+    function estimatedIntervalLabel(seconds) {
+      const value = toNumber(seconds);
+      if (value === null || value <= 0) return '—';
+      if (value < 120) return `~${Math.round(value)}s`;
+      if (value < 3600) return `~${Math.round(value / 60)}m`;
+      return `~${Math.round((value / 3600) * 10) / 10}h`;
+    }
+
+    /** Category label ("Swing · mid-long" / "Day · intraday") from a strategy mapping. */
+    function strategyCategoryLabel(category) {
+      return STRATEGY_CATEGORY_LABELS[category] ?? null;
+    }
+
+    /**
+     * Per-agent strategy taxonomy projection. Uses `agent.strategy` when the engine
+     * provides it, otherwise falls back to the genome family (same mapping as the engine).
+     * @param {object} agent raw status agent
+     * @returns {object} always available (unknown families fall back to swing)
+     */
+    function agentStrategyMapping(agent) {
+      const safeAgent = plainObject(agent);
+      const raw = plainObject(safeAgent.strategy);
+      const genome = plainObject(safeAgent.genome);
+      const family = String(raw.family ?? genome.family ?? 'unknown').toLowerCase();
+      const fallback = STRATEGY_TYPE_FALLBACK[family] ?? {
+        category: 'swing',
+        typeLabel: 'Custom swing',
+        className: 'custom',
+        estimatedIntervalSec: 3600,
+        timeframe: '1Hour',
+      };
+      const category = raw.category === 'day' || raw.category === 'swing' ? raw.category : fallback.category;
+      const cadence = plainObject(safeAgent.cadence);
+      const lane = plainObject(cadence[category]);
+      const timeframe = raw.timeframe ?? lane.timeframe ?? fallback.timeframe;
+      let estimatedIntervalSec = toNumber(raw.estimatedIntervalSec);
+      if (estimatedIntervalSec === null) estimatedIntervalSec = toNumber(lane.intervalSec);
+      if (estimatedIntervalSec === null) estimatedIntervalSec = fallback.estimatedIntervalSec;
+      const typeLabel = typeof raw.typeLabel === 'string' && raw.typeLabel.length > 0 ? raw.typeLabel : fallback.typeLabel;
+      const categoryLabel = typeof raw.categoryLabel === 'string' && raw.categoryLabel.length > 0
+        ? raw.categoryLabel
+        : (STRATEGY_CATEGORY_LABELS[category] ?? category);
+      return {
+        hasEngineStrategy: Object.keys(raw).length > 0,
+        family,
+        category,
+        tier: raw.tier ?? category,
+        typeLabel,
+        className: typeof raw.className === 'string' ? raw.className : fallback.className,
+        description: typeof raw.description === 'string' ? raw.description : '',
+        categoryLabel,
+        categoryShortLabel: STRATEGY_CATEGORY_SHORT[category] ?? category,
+        categoryKey: STRATEGY_CATEGORY_KEYS[category] ?? 'categoryAll',
+        estimatedIntervalSec,
+        estimatedIntervalLabel: estimatedIntervalLabel(estimatedIntervalSec),
+        timeframe,
+        reviewSec: toNumber(raw.reviewSec) ?? toNumber(lane.intervalSec) ?? null,
+      };
+    }
+
+    /** Stance badge projection for a bot-agent policy. */
+    function stanceBadge(stance) {
+      const key = String(stance ?? '').toLowerCase();
+      if (key === 'stand_down') return { stance: 'stand_down', labelKey: 'stanceStandDown', tone: 'stand_down', label: 'STAND DOWN' };
+      if (key === 'cautious') return { stance: 'cautious', labelKey: 'stanceCautious', tone: 'cautious', label: 'CAUTIOUS' };
+      if (key === 'trade') return { stance: 'trade', labelKey: 'stanceTrade', tone: 'trade', label: 'TRADE' };
+      return { stance: 'unknown', labelKey: 'stanceUnknown', tone: 'unknown', label: '—' };
+    }
+
+    /**
+     * Per-bot agent brain policy projection (`agent.policy`).
+     * @param {object|null} policy {at, atMs, stance, sizeMultiplier, riskMultiplier, exitPressure,
+     *   confidence, thesis, plan[], watch[], reviewSec, stale, reviewCount, nextReviewAt}
+     * @returns {object|null} null when the bot agent has not reviewed yet
+     */
+    function botAgentPolicyMapping(policy) {
+      const raw = plainObject(policy);
+      if (Object.keys(raw).length === 0) return null;
+      const stance = stanceBadge(raw.stance);
+      const plan = Array.isArray(raw.plan) ? raw.plan.filter((item) => typeof item === 'string' && item.trim().length > 0).slice(0, 8) : [];
+      const watch = Array.isArray(raw.watch)
+        ? raw.watch.map((symbol) => (typeof symbol === 'string' ? symbol : symbol?.symbol)).filter((symbol) => typeof symbol === 'string' && symbol.length > 0).slice(0, 12)
+        : [];
+      return {
+        available: true,
+        at: raw.at ?? null,
+        atMs: toNumber(raw.atMs),
+        stance: stance.stance,
+        stanceBadge: stance,
+        sizeMultiplier: toNumber(raw.sizeMultiplier),
+        riskMultiplier: toNumber(raw.riskMultiplier),
+        exitPressure: typeof raw.exitPressure === 'string' ? raw.exitPressure : null,
+        confidence: toNumber(raw.confidence),
+        thesis: typeof raw.thesis === 'string' ? raw.thesis : null,
+        plan,
+        watch,
+        reviewSec: toNumber(raw.reviewSec),
+        stale: raw.stale === true,
+        reviewCount: toNumber(raw.reviewCount),
+        nextReviewAt: raw.nextReviewAt ?? null,
+      };
+    }
+
+    /** Engine-level bot-agent bridge status line (`status.engine.agents`). */
+    function botAgentEngineStatus(engineAgents) {
+      const raw = plainObject(engineAgents);
+      if (Object.keys(raw).length === 0) {
+        return { available: false, enabled: null, configured: null, provider: null, model: null, intervalDaySec: null, intervalSwingSec: null, lastReviewAt: null, nextDueAt: null, runs: null, errors: null, note: null, dayLabel: '—', swingLabel: '—' };
+      }
+      const intervalDaySec = toNumber(raw.intervalDaySec);
+      const intervalSwingSec = toNumber(raw.intervalSwingSec);
+      return {
+        available: true,
+        enabled: raw.enabled === true ? true : raw.enabled === false ? false : null,
+        configured: raw.configured === true ? true : raw.configured === false ? false : null,
+        provider: raw.provider ?? null,
+        model: raw.model ?? null,
+        intervalDaySec,
+        intervalSwingSec,
+        dayLabel: estimatedIntervalLabel(intervalDaySec),
+        swingLabel: estimatedIntervalLabel(intervalSwingSec),
+        lastReviewAt: raw.lastReviewAt ?? null,
+        nextDueAt: raw.nextDueAt ?? null,
+        runs: toNumber(raw.runs),
+        errors: toNumber(raw.errors),
+        note: typeof raw.note === 'string' ? raw.note : null,
+      };
+    }
+
+    /**
+     * Category tabs for the agent table: All / Swing · mid-long / Day · intraday with counts.
+     * Prefers `status.strategyMix`; falls back to counting the mapped agent rows.
+     */
+    function categoryTabs(status, agents) {
+      const list = Array.isArray(agents) ? agents : [];
+      const mix = plainObject(status?.strategyMix);
+      const derive = (category) => list.filter((agent) => {
+        const strategy = agent?.strategy && typeof agent.strategy === 'object' ? agent.strategy : agentStrategyMapping(agent);
+        return strategy.category === category;
+      }).length;
+      const swingCount = toNumber(mix.swing?.count) ?? derive('swing');
+      const dayCount = toNumber(mix.day?.count) ?? derive('day');
+      const total = toNumber(mix.total) ?? list.length;
+      return [
+        { key: 'all', labelKey: 'categoryAll', label: 'All', count: total },
+        { key: 'swing', labelKey: 'categorySwing', label: STRATEGY_CATEGORY_LABELS.swing, count: swingCount },
+        { key: 'day', labelKey: 'categoryDay', label: STRATEGY_CATEGORY_LABELS.day, count: dayCount },
+      ];
+    }
+
+    /** Filter agent rows by strategy category ('all' | 'swing' | 'day'). */
+    function filterRowsByCategory(rows, category) {
+      const list = Array.isArray(rows) ? rows : [];
+      if (category !== 'swing' && category !== 'day') return list;
+      return list.filter((row) => row?.strategy?.category === category);
+    }
+
 
     /**
      * Turn one status payload into table/detail rows. Pure: no DOM, no fetch, no mutation
@@ -1306,6 +1529,8 @@ window.__ModuleLoader__.load({
         const plan = agentPlanMapping(safeAgent.plan);
         const pnl = agentPnlMapping(safeAgent.pnl);
         const rankBadges = agentRankingBadges(safeAgent.rankings);
+        const strategy = agentStrategyMapping(safeAgent);
+        const policy = botAgentPolicyMapping(safeAgent.policy);
         const parentId = safeAgent.parentId ? String(safeAgent.parentId) : null;
         const mutation = plainObject(safeAgent.mutation);
         const hasMutation = Object.keys(mutation).length > 0;
@@ -1365,6 +1590,13 @@ window.__ModuleLoader__.load({
           pnl,
           plan,
           rankBadges,
+          strategy,
+          strategyTypeLabel: strategy.typeLabel,
+          category: strategy.category,
+          categoryLabel: strategy.categoryLabel,
+          categoryShortLabel: strategy.categoryShortLabel,
+          intervalLabel: strategy.estimatedIntervalLabel,
+          policy,
           roleCosts,
           roleCostsTotal,
         };
@@ -1431,6 +1663,8 @@ window.__ModuleLoader__.load({
         research: researchStatusSummary(status),
         rewards: engine.rewards ?? null,
         rankings: status?.rankings ?? null,
+        strategyMix: status?.strategyMix ?? null,
+        engineAgents: botAgentEngineStatus(engine.agents ?? status?.engine?.agents),
         control: status?.control ?? null,
       };
     }
@@ -1808,6 +2042,25 @@ window.__ModuleLoader__.load({
 .atm-research-list li{margin:0}
 .atm-source-link{color:var(--dsw-alias-state-business-primary,inherit);text-decoration:underline;overflow-wrap:anywhere}
 .atm-research-summary{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
+.atm-type-chip{display:inline-flex;align-items:baseline;gap:3px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-left-width:3px;border-radius:999px;padding:0 7px;font-size:10.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit)}
+.atm-type-chip[data-category="swing"]{border-left-color:var(--dsw-alias-state-business-primary,currentColor)}
+.atm-type-chip[data-category="day"]{border-left-color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-tertiary,currentColor))}
+.atm-interval{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-tertiary,inherit);font-size:11px;line-height:16px;white-space:nowrap}
+.atm-cat-tabs{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.atm-cat-tab{font:inherit;font-size:11px;line-height:17px;border:.5px solid var(--dsw-alias-border-l2,currentColor);background:transparent;color:var(--dsw-alias-label-tertiary,inherit);border-radius:999px;padding:1px 9px;cursor:pointer;white-space:nowrap}
+.atm-cat-tab:hover{background:var(--dsw-alias-interactive-bg-hover,transparent)}
+.atm-cat-tab[data-active="true"]{color:var(--dsw-alias-label-primary,inherit);border-color:var(--dsw-alias-label-primary,currentColor);background:var(--dsw-alias-bg-l2,transparent)}
+.atm-cat-tab .atm-count{color:var(--dsw-alias-label-tertiary,inherit);font-variant-numeric:tabular-nums}
+.atm-stance{display:inline-flex;align-items:center;gap:4px;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 8px;font-size:10.5px;line-height:17px;font-weight:600;letter-spacing:.02em;white-space:nowrap;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-stance[data-tone="trade"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-stance[data-tone="cautious"]{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit));border-color:currentColor}
+.atm-stance[data-tone="stand_down"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor}
+.atm-botagent{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.atm-botagent-card{display:flex;flex-direction:column;gap:4px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px;padding:7px 9px}
+.atm-botagent-metrics{display:flex;gap:8px;flex-wrap:wrap;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-botagent-metric b{color:var(--dsw-alias-label-primary,inherit);font-variant-numeric:tabular-nums;font-weight:600}
+.atm-bridge-line{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit);display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
+.atm-bridge-line b{color:var(--dsw-alias-label-primary,inherit);font-weight:600}
 .atm-operator-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
 .atm-card-block{display:flex;flex-direction:column;gap:8px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:10px;padding:9px 11px}
 .atm-block-title{margin:0;font-size:12.5px;font-weight:600;line-height:18px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
@@ -2518,7 +2771,90 @@ window.__ModuleLoader__.load({
       }, `${badge.medal ?? ''}${badge.medal ? ' ' : ''}${t(badge.labelKey)} #${badge.rank}`)));
     }
 
-    /** "Strategy & plan" section: explanation, entry/exit/risk rules, triggers, next step. */
+    /** Category-coloured strategy type chip (table + detail header). */
+    function StrategyTypeChip({ t, strategy }) {
+      if (!strategy) return null;
+      return h('span', {
+        className: 'atm-type-chip',
+        'data-category': strategy.category,
+        title: strategy.description || strategy.typeLabel,
+      }, strategy.typeLabel);
+    }
+
+    /** Small engine-level bot-agent bridge status line (header). */
+    function BotAgentBridgeLine({ t, engineAgents }) {
+      if (!engineAgents || engineAgents.available !== true) {
+        return h('p', { className: 'atm-bridge-line' }, t('botAgentBridgeOff'));
+      }
+      const parts = [];
+      parts.push(h('b', { key: 'title' }, t('botAgentBridge')));
+      if (engineAgents.enabled === false) parts.push(h('span', { key: 'enabled' }, t('disabled')));
+      else if (engineAgents.configured === false) parts.push(h('span', { key: 'configured' }, t('researchDisabled')));
+      else parts.push(h('span', { key: 'configured' }, 'configured'));
+      parts.push(h('span', { key: 'model' }, `${engineAgents.provider ?? '—'}/${engineAgents.model ?? '—'}`));
+      parts.push(h('span', { key: 'cadence' }, `${t('categoryDay')} ${engineAgents.dayLabel} · ${t('categorySwing')} ${engineAgents.swingLabel}`));
+      parts.push(h('span', { key: 'runs' }, `${t('runs')} ${fmtNum(engineAgents.runs)} · ${t('errors')} ${fmtNum(engineAgents.errors)}`));
+      parts.push(h('span', { key: 'next' }, `${t('nextReview')} ${fmtAgo(engineAgents.nextDueAt)}`));
+      if (engineAgents.note) parts.push(h('span', { key: 'note', className: 'atm-muted' }, engineAgents.note));
+      return h('p', { className: 'atm-bridge-line' }, parts);
+    }
+
+    /** "Bot agent" policy section: the bot's own isolated brain decision. */
+    function BotAgentSection({ t, policy }) {
+      if (!policy || policy.available !== true) {
+        return h('div', { className: 'atm-section' }, [
+          h('h4', { className: 'atm-detail-title', key: 'title' }, t('botAgent')),
+          h('p', { className: 'atm-empty', key: 'empty' }, t('botAgentEmpty')),
+        ]);
+      }
+      const stance = policy.stanceBadge;
+      const metrics = [];
+      if (policy.sizeMultiplier !== null) metrics.push(h('span', { className: 'atm-botagent-metric', key: 'size' }, `${t('sizeMultiplier')} `, h('b', null, `${policy.sizeMultiplier.toFixed(2)}`)));
+      if (policy.riskMultiplier !== null) metrics.push(h('span', { className: 'atm-botagent-metric', key: 'risk' }, `${t('riskMultiplier')} `, h('b', null, `${policy.riskMultiplier.toFixed(2)}`)));
+      if (policy.confidence !== null) metrics.push(h('span', { className: 'atm-botagent-metric', key: 'conf' }, `${t('confidence')} `, h('b', null, `${Math.round(policy.confidence * 100)}%`)));
+      if (policy.exitPressure && policy.exitPressure !== 'none') metrics.push(h('span', { className: 'atm-botagent-metric', key: 'exit' }, `${t('exitPressure')} `, h('b', null, policy.exitPressure)));
+      if (policy.reviewCount !== null) metrics.push(h('span', { className: 'atm-botagent-metric', key: 'count' }, `${t('reviewCount')} `, h('b', null, fmtNum(policy.reviewCount))));
+      metrics.push(h('span', { className: 'atm-botagent-metric', key: 'last' }, `${t('lastReview')} `, h('b', null, policy.at ? fmtAgo(policy.at) : '—')));
+      metrics.push(h('span', { className: 'atm-botagent-metric', key: 'next' }, `${t('nextReview')} `, h('b', null, policy.nextReviewAt ? fmtAgo(policy.nextReviewAt) : '—')));
+      if (policy.reviewSec !== null) metrics.push(h('span', { className: 'atm-botagent-metric', key: 'interval' }, `${t('reviewInterval')} `, h('b', null, estimatedIntervalLabel(policy.reviewSec))));
+      return h('div', { className: 'atm-section' }, [
+        h('div', { className: 'atm-toolbar', key: 'title' }, [
+          h('h4', { className: 'atm-detail-title', key: 'title', style: { margin: 0 } }, t('botAgent')),
+          h('span', {
+            key: 'stance',
+            className: 'atm-stance',
+            'data-tone': stance.tone,
+            title: policy.thesis ?? '',
+          }, `${t('stance')}: ${t(stance.labelKey)}`),
+          policy.stale ? h('span', { key: 'stale', className: 'atm-warn' }, t('botAgentStale')) : null,
+        ]),
+        h('div', { className: 'atm-botagent', key: 'metrics' }, [
+          h('div', { className: 'atm-botagent-card', key: 'metrics' }, [
+            h('span', { className: 'atm-plan-label', key: 'label' }, t('botAgent')),
+            h('div', { className: 'atm-botagent-metrics', key: 'values' }, metrics),
+          ]),
+          policy.thesis
+            ? h('div', { className: 'atm-botagent-card', key: 'thesis' }, [
+              h('span', { className: 'atm-plan-label', key: 'label' }, t('thesis')),
+              h('p', { className: 'atm-plan-text', key: 'text' }, policy.thesis),
+            ])
+            : null,
+          policy.plan.length > 0
+            ? h('div', { className: 'atm-botagent-card', key: 'plan' }, [
+              h('span', { className: 'atm-plan-label', key: 'label' }, t('planNext')),
+              h('ul', { className: 'atm-plan-list', key: 'list' }, policy.plan.map((item, index) => h('li', { key: `plan-${index}` }, item))),
+            ])
+            : null,
+          policy.watch.length > 0
+            ? h('div', { className: 'atm-botagent-card', key: 'watch' }, [
+              h('span', { className: 'atm-plan-label', key: 'label' }, t('watchlist')),
+              h('div', { className: 'atm-chips', key: 'chips' }, policy.watch.map((symbol) => h('span', { className: 'atm-param', key: symbol }, symbol))),
+            ])
+            : null,
+        ]),
+      ]);
+    }
+
     function StrategyPlanSection({ t, plan }) {
       if (!plan || !plan.hasContent) {
         return h('div', { className: 'atm-section' }, [
@@ -2635,6 +2971,8 @@ window.__ModuleLoader__.load({
       { key: 'index', label: '#', sortable: false, width: '30px' },
       { key: 'name', labelKey: 'agent', sortable: true },
       { key: 'generation', labelKey: 'gen', sortable: true },
+      { key: 'strategyType', labelKey: 'strategyType', sortable: false },
+      { key: 'estInterval', labelKey: 'estInterval', sortable: false },
       { key: 'genome', labelKey: 'genome', sortable: false },
       { key: 'trading', labelKey: 'trading', sortable: false },
       { key: 'research', labelKey: 'research', sortable: false },
@@ -2646,15 +2984,20 @@ window.__ModuleLoader__.load({
       { key: 'positions', labelKey: 'positions', sortable: false },
     ];
 
-    function AgentTable({ t, rows, selectedId, onSelect }) {
+    function AgentTable({ t, rows, selectedId, onSelect, strategyMix }) {
       const [sortKey, setSortKey] = React.useState('pnlUsd');
       const [direction, setDirection] = React.useState('desc');
       const [filter, setFilter] = React.useState('all');
+      const [category, setCategory] = React.useState('all');
       const [query, setQuery] = React.useState('');
 
       const visible = React.useMemo(
-        () => sortAgentRows(filterAgentRows(rows, filter, query), sortKey, direction),
-        [rows, filter, query, sortKey, direction],
+        () => sortAgentRows(filterAgentRows(filterRowsByCategory(rows, category), filter, query), sortKey, direction),
+        [rows, category, filter, query, sortKey, direction],
+      );
+      const categoryOptions = React.useMemo(
+        () => categoryTabs(strategyMix ? { strategyMix } : null, rows),
+        [strategyMix, rows],
       );
 
       const onSort = (key) => {
@@ -2670,6 +3013,15 @@ window.__ModuleLoader__.load({
       const filters = STATUS_FILTERS.filter((value) => value !== 'condemned' || showCondemned);
 
       return h('div', { className: 'atm-section' }, [
+        h('div', { className: 'atm-cat-tabs', key: 'categories' }, categoryOptions.map((option) => h('button', {
+          key: option.key,
+          type: 'button',
+          className: 'atm-cat-tab',
+          'data-active': category === option.key ? 'true' : 'false',
+          'data-category': option.key,
+          onClick: () => setCategory(option.key),
+          title: option.label,
+        }, `${t(option.labelKey)} (${fmtNum(option.count)})`))),
         h('div', { className: 'atm-toolbar', key: 'toolbar' }, [
           h('h3', { className: 'atm-section-title', key: 'title' }, `${t('agents')} · ${fmtNum(visible.length)} ${t('rows')}`),
           h('span', { className: 'atm-muted', key: 'hint' }, t('clickHint')),
@@ -2724,6 +3076,8 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'atm-name-sub atm-mono', key: 'id', title: row.id }, row.shortId),
                 ])),
                 h('td', { key: 'gen', className: 'atm-mono' }, fmtNum(row.generation)),
+                h('td', { key: 'strategyType' }, h(StrategyTypeChip, { t, strategy: row.strategy })),
+                h('td', { key: 'estInterval', className: 'atm-interval', title: row.strategy?.timeframe ?? '' }, row.intervalLabel),
                 h('td', { key: 'genome', title: row.genomeParamsText }, row.genomeText),
                 h('td', { key: 'trading', title: row.specParamsText }, [
                   h('span', { key: 'spec' }, row.specText ?? t('none')),
@@ -2872,6 +3226,9 @@ window.__ModuleLoader__.load({
             h('div', { className: 'atm-toolbar', key: 'badges', style: { marginTop: 2 } }, [
               h(StatusCell, { key: 'status', t, row }),
               h('span', { className: 'atm-muted', key: 'gen' }, `gen ${fmtNum(row.generation)}`),
+              row.strategy ? h('span', { key: 'category', className: 'atm-muted', title: row.strategy.description }, row.categoryLabel) : null,
+              h(StrategyTypeChip, { key: 'type', t, strategy: row.strategy }),
+              h('span', { className: 'atm-muted', key: 'interval' }, `${t('estInterval')} ${row.intervalLabel}`),
               h(RankingBadges, { key: 'ranks', t, row }),
             ]),
           ]),
@@ -2890,6 +3247,7 @@ window.__ModuleLoader__.load({
           h(DetailKv, { key: 'kv', items: deathInfo }),
         ]) : null,
         h(StrategyPlanSection, { key: 'plan', t, plan: row.plan }),
+        h(BotAgentSection, { key: 'bot-agent', t, policy: row.policy }),
         h('div', { key: 'holdings' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('holdings')} · ${fmtNum(row.positionCount)}`),
           h(HoldingsTable, { key: 'table', t, row }),
@@ -2997,6 +3355,7 @@ window.__ModuleLoader__.load({
           ? h('p', { className: 'atm-warn', key: 'research-note' }, t(summary.research.disabledReason === 'disabled' ? 'researchDisabledConfig' : 'researchDisabled'))
           : null,
         h(HeaderStats, { key: 'stats', t, summary }),
+        h(BotAgentBridgeLine, { key: 'bot-agents', t, engineAgents: summary.engineAgents }),
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
         h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
         h(OperatorPanel, {
@@ -3016,6 +3375,7 @@ window.__ModuleLoader__.load({
               rows,
               selectedId: selectedRow ? selectedRow.id : null,
               onSelect,
+              strategyMix: summary.strategyMix,
             }),
             h('div', { className: 'atm-two', key: 'bottom' }, [
               h(Generations, { key: 'gens', t, summaryData: snapshot.data }),
@@ -3183,6 +3543,14 @@ window.__ModuleLoader__.load({
         buildAgentRows,
         buildHoldingsRows,
         buildActivityRows,
+        agentStrategyMapping,
+        estimatedIntervalLabel,
+        strategyCategoryLabel,
+        categoryTabs,
+        filterRowsByCategory,
+        botAgentPolicyMapping,
+        stanceBadge,
+        botAgentEngineStatus,
         describeReaper,
         mapResearchBriefing,
         researchBadge,

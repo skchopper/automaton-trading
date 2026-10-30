@@ -297,6 +297,8 @@ function agentFixture(index) {
     pnl: pnlFixture(index),
     plan: planFixture(index),
     rankings: rankingsFixture(index),
+    strategy: strategyFixture(index),
+    policy: policyFixture(index),
   };
 }
 
@@ -429,6 +431,72 @@ function rankingsFixture(index) {
   };
 }
 
+/** Deterministic strategy taxonomy view (matches src/strategy-types.js for the fixture families). */
+function strategyFixture(index) {
+  const family = familyAt(index);
+  const category = family === 'breakout' || family === 'gapfade' ? 'day' : 'swing';
+  const typeLabel = family === 'momentum'
+    ? 'Momentum swing'
+    : family === 'meanrev'
+      ? 'Mean-reversion swing'
+      : family === 'breakout'
+        ? 'Intraday breakout'
+        : 'Day-trade gap fade';
+  return {
+    family,
+    category,
+    tier: category,
+    typeLabel,
+    className: family,
+    description: `${typeLabel} fixture description`,
+    categoryLabel: category === 'swing' ? 'Swing · mid-long' : 'Day · intraday',
+    estimatedIntervalSec: category === 'day' ? 300 : 3600,
+    timeframe: category === 'day' ? '1Min' : '1Hour',
+    reviewSec: category === 'day' ? 300 : 3600,
+  };
+}
+
+/** Deterministic bot-agent policy: trade / cautious / stand_down (stale) / expired / null. */
+function policyFixture(index) {
+  const mod = index % 5;
+  if (mod === 0) return null;
+  const stance = mod === 1 ? 'trade' : mod === 2 ? 'cautious' : 'stand_down';
+  const stale = mod === 3 || mod === 4;
+  return {
+    at: '2026-01-02T00:00:00.000Z',
+    atMs: 1767312000000,
+    stance,
+    sizeMultiplier: stance === 'trade' ? 1 : stance === 'cautious' ? 0.5 : 0,
+    riskMultiplier: stance === 'trade' ? 1 : stance === 'cautious' ? 1.2 : 2,
+    exitPressure: stance === 'stand_down' ? 'exit' : 'none',
+    confidence: stance === 'trade' ? 0.72 : stance === 'cautious' ? 0.55 : 0.31,
+    thesis: `${familyName(familyAt(index))} bot ${symbolAt(index)}: fixture thesis about the current book and news.`,
+    plan: ['hold existing position', 'wait for the next confirmation'],
+    watch: [symbolAt(index), symbolAt(index + 1)],
+    reviewSec: strategyFixture(index).reviewSec,
+    stale,
+    reviewCount: 3 + (index % 4),
+    nextReviewAt: '2026-01-02T00:05:00.000Z',
+  };
+}
+
+function buildStrategyMixPayload(agents) {
+  const mix = {
+    swing: { count: 0, families: {} },
+    day: { count: 0, families: {} },
+  };
+  for (const agent of agents) {
+    const strategy = agent.strategy;
+    mix[strategy.category].count += 1;
+    mix[strategy.category].families[strategy.family] = (mix[strategy.category].families[strategy.family] ?? 0) + 1;
+  }
+  return {
+    swing: { key: 'swing', label: 'Swing · mid-long', shortLabel: 'Swing', ...mix.swing },
+    day: { key: 'day', label: 'Day · intraday', shortLabel: 'Day', ...mix.day },
+    total: mix.swing.count + mix.day.count,
+  };
+}
+
 function buildRankingsPayload(agents) {
   const aliveAgents = agents.filter((agent) => agent.status === 'alive');
   const buildPeriod = (offset) => {
@@ -459,7 +527,7 @@ function buildRankingsPayload(agents) {
 }
 
 /** Full 30-agent status payload, close to what GET /automaton/state returns. */
-function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings } = {}) {
+function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings, strategyMix, engineAgents } = {}) {
   const agents = Array.from({ length: agentCount }, (_, index) => agentFixture(index));
   const alive = agents.filter((agent) => agent.status === 'alive').length;
   const dead = agents.filter((agent) => agent.status === 'dead').length;
@@ -529,6 +597,18 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
           { rank: 3, agentId: agents[2].id, name: agents[2].name, percent: 0.02, amountUsd: 300, periodKey: '2026-01-01', at: '2026-01-01T00:00:00.000Z' },
         ],
       },
+      agents: engineAgents ?? {
+        enabled: true,
+        configured: true,
+        provider: 'deepseek-account',
+        model: 'deepseek-flash',
+        intervalDaySec: 300,
+        intervalSwingSec: 3600,
+        lastReviewAt: '2026-01-02T00:00:00.000Z',
+        nextDueAt: '2026-01-02T00:05:00.000Z',
+        runs: 7,
+        errors: 0,
+      },
     },
     account: {
       equityUsd: 20000,
@@ -587,6 +667,7 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
     brakes: { count: 14, enforced: true, killSwitch: false },
     control: { route: CONTROL_PATH, loopbackOnly: true, actions: ['start', 'stop', 'emergency-stop', 'reaper-stop', 'set-research-settings', 'set-reward-settings'] },
     rankings: rankings ?? buildRankingsPayload(agents),
+    strategyMix: strategyMix ?? buildStrategyMixPayload(agents),
     rewards: {
       ...(rewards ?? {}),
       history: [
@@ -987,6 +1068,16 @@ test('GET /automaton/state returns the redacted 30-agent snapshot', async () => 
   assert.ok(Array.isArray(json.agents[0].orders));
   assert.equal(typeof json.agents[1].plan.summary, 'string');
   assert.equal(json.agents[1].rankings.dayRank >= 1, true);
+  // Strategy taxonomy + per-bot agents additions pass through unchanged.
+  assert.equal(json.strategyMix.total, 30);
+  assert.equal(json.strategyMix.swing.count, 20);
+  assert.equal(json.strategyMix.day.count, 10);
+  assert.equal(json.engine.agents.provider, 'deepseek-account');
+  assert.equal(json.agents[0].strategy.typeLabel, 'Momentum swing');
+  assert.equal(json.agents[10].strategy.category, 'swing');
+  assert.equal(json.agents[20].strategy.category, 'day');
+  assert.equal(json.agents[1].policy.stance, 'trade');
+  assert.equal(json.agents[5].policy, null);
   // Names + drill-down data cross the route untouched by the host.
   assert.equal(json.agents[0].name, 'Momentum AAPL');
   assert.equal(Array.isArray(json.agents[0].recentTrades), true);
@@ -2465,6 +2556,185 @@ test('pure data mapping: research cadence, rewards preview/history and leaderboa
     assert.equal(helpers.lastWinnerRows(null).length, 0);
     assert.equal(helpers.rewardHistoryRows(bareStatus).length, 0);
     assert.equal(helpers.rewardsControlState(undefined).available, false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: strategy types/intervals, category tabs and bot-agent policy', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildStatusPayload({ running: true });
+    const rows = helpers.buildAgentRows(status);
+
+    // ---- strategy taxonomy (engine-provided) ----
+    const momentumRow = rows.find((row) => row.strategy.family === 'momentum' && row.strategy.hasEngineStrategy);
+    assert.ok(momentumRow);
+    assert.equal(momentumRow.strategy.typeLabel, 'Momentum swing');
+    assert.equal(momentumRow.strategy.category, 'swing');
+    assert.equal(momentumRow.strategy.categoryLabel, 'Swing · mid-long');
+    assert.equal(momentumRow.strategy.estimatedIntervalSec, 3600);
+    assert.equal(momentumRow.strategy.estimatedIntervalLabel, '~1h');
+    assert.equal(momentumRow.strategy.timeframe, '1Hour');
+    assert.equal(momentumRow.strategyTypeLabel, 'Momentum swing');
+    assert.equal(momentumRow.category, 'swing');
+    assert.equal(momentumRow.intervalLabel, '~1h');
+
+    const meanrevRow = rows.find((row) => row.strategy.family === 'meanrev' && row.strategy.hasEngineStrategy);
+    assert.ok(meanrevRow);
+    assert.equal(meanrevRow.strategy.typeLabel, 'Mean-reversion swing');
+    assert.equal(meanrevRow.strategy.category, 'swing');
+
+    const dayRow = rows.find((row) => row.strategy.category === 'day');
+    assert.ok(dayRow);
+    assert.equal(dayRow.strategy.typeLabel, 'Intraday breakout');
+    assert.equal(dayRow.strategy.categoryLabel, 'Day · intraday');
+    assert.equal(dayRow.strategy.estimatedIntervalSec, 300);
+    assert.equal(dayRow.intervalLabel, '~5m');
+    assert.equal(dayRow.strategy.timeframe, '1Min');
+
+    // ---- taxonomy fallback when the engine has not added agent.strategy yet ----
+    const fallbackSwing = helpers.agentStrategyMapping({ genome: { family: 'meanrev' }, status: 'alive' });
+    assert.equal(fallbackSwing.hasEngineStrategy, false);
+    assert.equal(fallbackSwing.typeLabel, 'Mean-reversion swing');
+    assert.equal(fallbackSwing.category, 'swing');
+    assert.equal(fallbackSwing.estimatedIntervalLabel, '~1h');
+    const fallbackDay = helpers.agentStrategyMapping({ genome: { family: 'gapfade' } });
+    assert.equal(fallbackDay.typeLabel, 'Day-trade gap fade');
+    assert.equal(fallbackDay.category, 'day');
+    assert.equal(fallbackDay.estimatedIntervalLabel, '~5m');
+    const fallbackUnknown = helpers.agentStrategyMapping({ genome: { family: 'exotic' } });
+    assert.equal(fallbackUnknown.typeLabel, 'Custom swing');
+    assert.equal(fallbackUnknown.category, 'swing');
+    const fallbackCadence = helpers.agentStrategyMapping({ genome: { family: 'momentum' }, cadence: { swing: { intervalSec: 10800, timeframe: '1Hour' } } });
+    assert.equal(fallbackCadence.estimatedIntervalSec, 10800);
+    assert.equal(fallbackCadence.estimatedIntervalLabel, '~3h');
+
+    // ---- interval label formatting ----
+    assert.equal(helpers.estimatedIntervalLabel(30), '~30s');
+    assert.equal(helpers.estimatedIntervalLabel(119), '~119s');
+    assert.equal(helpers.estimatedIntervalLabel(120), '~2m');
+    assert.equal(helpers.estimatedIntervalLabel(300), '~5m');
+    assert.equal(helpers.estimatedIntervalLabel(3600), '~1h');
+    assert.equal(helpers.estimatedIntervalLabel(5400), '~1.5h');
+    assert.equal(helpers.estimatedIntervalLabel(86400), '~24h');
+    assert.equal(helpers.estimatedIntervalLabel(null), '—');
+    assert.equal(helpers.estimatedIntervalLabel(0), '—');
+    assert.equal(helpers.estimatedIntervalLabel(-5), '—');
+    assert.equal(helpers.strategyCategoryLabel('swing'), 'Swing · mid-long');
+    assert.equal(helpers.strategyCategoryLabel('day'), 'Day · intraday');
+    assert.equal(helpers.strategyCategoryLabel('bogus'), null);
+
+    // ---- category tabs + filtering ----
+    const tabs = helpers.categoryTabs(status, rows);
+    assert.equal(tabs.length, 3);
+    assert.deepEqual(tabs.map((tab) => tab.key), ['all', 'swing', 'day']);
+    assert.equal(tabs[0].count, 30);
+    assert.equal(tabs[1].count, 20);
+    assert.equal(tabs[2].count, 10);
+    assert.equal(tabs[1].labelKey, 'categorySwing');
+    assert.equal(tabs[2].labelKey, 'categoryDay');
+    const derivedTabs = helpers.categoryTabs(null, rows);
+    assert.deepEqual(derivedTabs.map((tab) => tab.count), [30, 20, 10]);
+    assert.equal(helpers.filterRowsByCategory(rows, 'all').length, 30);
+    assert.equal(helpers.filterRowsByCategory(rows, 'swing').length, 20);
+    assert.equal(helpers.filterRowsByCategory(rows, 'day').length, 10);
+    assert.equal(helpers.filterRowsByCategory(rows, 'bogus').length, 30);
+    assert.equal(helpers.filterRowsByCategory(rows, 'day').every((row) => row.category === 'day'), true);
+
+    // ---- bot-agent policy variants ----
+    const tradePolicy = rows.find((row) => row.policy && row.policy.stance === 'trade' && row.policy.stale === false);
+    assert.ok(tradePolicy);
+    assert.equal(tradePolicy.policy.available, true);
+    assert.equal(tradePolicy.policy.stanceBadge.labelKey, 'stanceTrade');
+    assert.equal(tradePolicy.policy.stanceBadge.tone, 'trade');
+    assert.equal(tradePolicy.policy.sizeMultiplier, 1);
+    assert.equal(tradePolicy.policy.riskMultiplier, 1);
+    assert.equal(tradePolicy.policy.confidence, 0.72);
+    assert.equal(tradePolicy.policy.exitPressure, 'none');
+    assert.match(tradePolicy.policy.thesis, /fixture thesis/);
+    assert.deepEqual(tradePolicy.policy.plan, ['hold existing position', 'wait for the next confirmation']);
+    assert.equal(tradePolicy.policy.watch.length, 2);
+    assert.equal(tradePolicy.policy.reviewCount, 4);
+    assert.equal(tradePolicy.policy.nextReviewAt, '2026-01-02T00:05:00.000Z');
+    assert.equal(tradePolicy.policy.at, '2026-01-02T00:00:00.000Z');
+
+    const cautiousPolicy = rows.find((row) => row.policy && row.policy.stance === 'cautious');
+    assert.ok(cautiousPolicy);
+    assert.equal(cautiousPolicy.policy.stanceBadge.labelKey, 'stanceCautious');
+    assert.equal(cautiousPolicy.policy.stanceBadge.tone, 'cautious');
+    assert.equal(cautiousPolicy.policy.sizeMultiplier, 0.5);
+    assert.equal(cautiousPolicy.policy.riskMultiplier, 1.2);
+
+    const standDownPolicy = rows.find((row) => row.policy && row.policy.stance === 'stand_down');
+    assert.ok(standDownPolicy);
+    assert.equal(standDownPolicy.policy.stanceBadge.labelKey, 'stanceStandDown');
+    assert.equal(standDownPolicy.policy.stanceBadge.tone, 'stand_down');
+    assert.equal(standDownPolicy.policy.exitPressure, 'exit');
+    assert.equal(standDownPolicy.policy.stale, true);
+
+    const stalePolicy = rows.find((row) => row.policy && row.policy.stale === true);
+    assert.ok(stalePolicy);
+    assert.equal(stalePolicy.policy.stale, true);
+
+    const noPolicy = rows.find((row) => row.policy === null);
+    assert.ok(noPolicy, 'some bots have not reviewed yet (empty state)');
+    assert.equal(helpers.botAgentPolicyMapping(null), null);
+    assert.equal(helpers.botAgentPolicyMapping({}), null);
+    assert.equal(helpers.botAgentPolicyMapping('garbage'), null);
+    const minimal = helpers.botAgentPolicyMapping({ stance: 'trade', plan: ['x', '', 3], watch: [{ symbol: 'AAPL' }, { bad: true }, 'TSLA'] });
+    assert.equal(minimal.available, true);
+    assert.deepEqual(minimal.plan, ['x']);
+    assert.deepEqual(minimal.watch, ['AAPL', 'TSLA']);
+    assert.equal(minimal.stanceBadge.labelKey, 'stanceTrade');
+
+    assert.equal(helpers.stanceBadge('trade').tone, 'trade');
+    assert.equal(helpers.stanceBadge('cautious').tone, 'cautious');
+    assert.equal(helpers.stanceBadge('stand_down').tone, 'stand_down');
+    assert.equal(helpers.stanceBadge('unknown').tone, 'unknown');
+    assert.equal(helpers.stanceBadge(undefined).labelKey, 'stanceUnknown');
+
+    // ---- engine bot-agent bridge line ----
+    const engineAgents = helpers.botAgentEngineStatus(status.engine.agents);
+    assert.equal(engineAgents.available, true);
+    assert.equal(engineAgents.enabled, true);
+    assert.equal(engineAgents.configured, true);
+    assert.equal(engineAgents.provider, 'deepseek-account');
+    assert.equal(engineAgents.model, 'deepseek-flash');
+    assert.equal(engineAgents.intervalDaySec, 300);
+    assert.equal(engineAgents.intervalSwingSec, 3600);
+    assert.equal(engineAgents.dayLabel, '~5m');
+    assert.equal(engineAgents.swingLabel, '~1h');
+    assert.equal(engineAgents.runs, 7);
+    assert.equal(engineAgents.errors, 0);
+    assert.equal(engineAgents.nextDueAt, '2026-01-02T00:05:00.000Z');
+    assert.equal(helpers.botAgentEngineStatus(null).available, false);
+    assert.equal(helpers.botAgentEngineStatus({}).available, false);
+    const unconfiguredEngine = helpers.botAgentEngineStatus({ enabled: true, configured: false, intervalDaySec: 300, intervalSwingSec: 3600, note: 'no LLM bridge' });
+    assert.equal(unconfiguredEngine.configured, false);
+    assert.equal(unconfiguredEngine.note, 'no LLM bridge');
+
+    const summary = helpers.summarize(status);
+    assert.equal(summary.strategyMix.total, 30);
+    assert.equal(summary.engineAgents.available, true);
+    assert.equal(helpers.summarize({}).engineAgents.available, false);
+
+    // ---- bare payload: engine has none of the new fields yet ----
+    const bareStatus = buildStatusPayload({ running: true });
+    for (const agent of bareStatus.agents) {
+      delete agent.strategy;
+      delete agent.policy;
+    }
+    delete bareStatus.strategyMix;
+    delete bareStatus.engine.agents;
+    const bareRows = helpers.buildAgentRows(bareStatus);
+    assert.equal(bareRows.every((row) => row.policy === null), true);
+    assert.equal(bareRows.every((row) => typeof row.strategy.typeLabel === 'string'), true, 'type falls back to the genome family');
+    assert.equal(bareRows.every((row) => typeof row.intervalLabel === 'string'), true);
+    assert.deepEqual(helpers.categoryTabs(null, bareRows).map((tab) => tab.count), [30, 20, 10]);
+    assert.equal(helpers.summarize(bareStatus).engineAgents.available, false);
+    assert.equal(helpers.botAgentEngineStatus(undefined).available, false);
   } finally {
     loaded.restore();
   }

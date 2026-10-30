@@ -512,3 +512,78 @@ describe('tiered cadence (day every minute, swing every hour) and trading-hours 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// strategy taxonomy + per-bot agent brain (docs/BOT-AGENTS.md)
+// ---------------------------------------------------------------------------
+
+describe('strategy categories and per-bot agent status', () => {
+  it('splits a new population across swing/day strategy types and exposes bot-agent policies', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-agents-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-29T14:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 4, cap: 8 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+          agents: { enabled: true, reviewIntervalDaySec: 300, reviewIntervalSwingSec: 3600, maxReviewsPerCycle: 4, costPerReviewUsd: 0.001 },
+        },
+      }).config;
+      const broker = createSimBroker(config, { seed: 11, accountEquityUsd: 100000 });
+      const agentGenerate = async () => ({
+        text: JSON.stringify({
+          stance: 'cautious',
+          sizeMultiplier: 0.5,
+          riskMultiplier: 1,
+          exitPressure: 'none',
+          confidence: 0.55,
+          thesis: 'Fixture bot-agent thesis.',
+          plan: ['wait for confirmation'],
+          watch: ['AAPL'],
+        }),
+        provider: 'fake',
+        model: 'fake-agent-model',
+        usage: { inputTokens: 10, outputTokens: 20 },
+      });
+      const automaton = await createAutomaton({ config, broker, clock, agentGenerate });
+      await automaton.init();
+      const before = await automaton.status();
+      assert.equal(before.strategyMix.total, 4);
+      assert.equal(before.strategyMix.swing.count, 2);
+      assert.equal(before.strategyMix.day.count, 2);
+      const families = before.agents.map((agent) => agent.strategy.family);
+      assert.equal(new Set(families).size, 4, 'a small genesis population covers all four strategy families');
+      assert.equal(before.engine.agents.configured, true);
+
+      await automaton.tick();
+      const status = await automaton.status();
+      for (const agent of status.agents) {
+        assert.ok(agent.strategy, 'every agent has a strategy taxonomy view');
+        assert.equal(agent.strategy.category, agent.tier);
+        assert.ok(agent.strategy.typeLabel.length > 0);
+        assert.ok(agent.strategy.estimatedIntervalSec >= 60);
+        assert.ok(['1Min', '1Hour'].includes(agent.strategy.timeframe));
+        assert.equal(agent.strategy.family, agent.genome.family);
+      }
+      const reviewed = status.agents.filter((agent) => agent.policy && agent.policy.at);
+      assert.equal(reviewed.length >= 1, true, 'bot reviews run after the execution pass');
+      const sample = reviewed[0].policy;
+      assert.equal(sample.stance, 'cautious');
+      assert.equal(sample.sizeMultiplier, 0.5);
+      assert.equal(sample.confidence, 0.55);
+      assert.ok(Array.isArray(sample.plan));
+      assert.equal(status.engine.agents.enabled, true);
+      assert.equal(status.engine.agents.configured, true);
+      assert.equal(status.engine.agents.provider, 'fake');
+      assert.equal(status.engine.agents.runs >= 1, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -47,6 +47,7 @@ import { OBITUARY_FIELDS, validateObituary } from '../src/journal.js';
 import { burnPerHour } from '../src/treasurer.js';
 import { MUTABLE_FIELDS } from '../src/replicator.js';
 import { createClock, round2 } from '../src/util.js';
+import { targetFamilyForIndex } from '../src/strategy-types.js';
 
 const PKG_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const T0 = Date.UTC(2026, 0, 5, 15, 0, 0); // Mon 10:00 America/New_York (inside 09:35-15:50)
@@ -219,17 +220,17 @@ describe('end-to-end (mode=sim): population, metabolism, orders, demo death, per
     assert.equal(genesis.agents.length, 3);
     const symbols = genesis.agents.map((agent) => agent.genome.symbol);
     const families = genesis.agents.map((agent) => agent.genome.family);
-    // symbols rotate per index; families advance one step per symbols.length agents, so a
-    // population of symbols x families gets a unique (symbol, family) strategy per agent.
+    // symbols rotate per index; families follow the balanced swing/day genesis mix
+    // (docs/BOT-AGENTS.md): momentum/meanrev blocks then breakout/gapfade blocks.
     assert.deepEqual(symbols, [config.symbols[0], config.symbols[1], config.symbols[2]]);
-    const familyOrder = ['momentum', 'meanrev', 'breakout', 'gapfade'];
-    const expectedFamilies = symbols.map((_, index) => familyOrder[Math.floor(index / config.symbols.length) % familyOrder.length]);
+    const expectedFamilies = genesis.agents.map((_, index) => targetFamilyForIndex(index, config.population.initial));
     assert.deepEqual(families, expectedFamilies);
     // deterministic AND distinct: same config+index always yields the same genome, and a
-    // full population of symbols x families has no duplicate strategy
-    const populationSize = Math.min(30, config.symbols.length * familyOrder.length);
-    const genomes = Array.from({ length: populationSize }, (_, index) => genesisGenome(config, index));
-    assert.deepEqual(genesisGenome(config, 0), genomes[0], 'genesis genomes must be deterministic');
+    // population of 30 over 10 symbols x 4 families has no duplicate strategy
+    const fullConfig = { ...config, population: { ...config.population, initial: 30 } };
+    const populationSize = Math.min(30, config.symbols.length * 4);
+    const genomes = Array.from({ length: populationSize }, (_, index) => genesisGenome(fullConfig, index));
+    assert.deepEqual(genesisGenome(config, 0), genesisGenome(config, 0), 'genesis genomes must be deterministic');
     const pairs = new Set(genomes.map((genome) => `${genome.symbol}:${genome.family}`));
     assert.equal(pairs.size, populationSize, 'every genesis agent must have its own strategy');
     for (const genome of genomes) {

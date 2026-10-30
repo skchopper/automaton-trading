@@ -310,6 +310,48 @@ The running paper profile now separates **when each bot is analysed** from how o
   set `engine.tradingHoursOnly: false` to keep analysing 24/7 again. Restart the Host after config
   changes (engine modules load on boot).
 
+## 8c. Per-bot agent brains (hybrid architecture)
+
+Every population bot now has its own isolated agent review on top of the deterministic executor
+(contract: `docs/BOT-AGENTS.md`). The review never places orders; it produces a policy the Executor
+applies next cycle, so minute-level reactions never wait on a model turn.
+
+```json
+"agents": {
+  "enabled": true,
+  "reviewIntervalDaySec": 300,
+  "reviewIntervalSwingSec": 3600,
+  "maxReviewsPerCycle": 4,
+  "costPerReviewUsd": 0.001,
+  "maxAgeSec": 7200,
+  "logLimit": 120,
+  "maxInputChars": 8000,
+  "maxOutputTokens": 700,
+  "errorCooldownSec": 900
+}
+```
+
+- **Isolation**: one prompt per bot containing only its own identity/genome/spec/book, market data
+  for its symbol, its own research briefing and its own prior reviews. Journal per bot under
+  `automaton-data/agents/<agentId>.jsonl`, shared cache `agents/state.json` (reloaded on restart).
+- **Cadence**: day bots every `reviewIntervalDaySec` (~5 min), swing bots every
+  `reviewIntervalSwingSec` (1 h); at most `maxReviewsPerCycle` reviews per engine cycle; cold starts
+  spread naturally. Failure of one bot never blocks others; malformed JSON is repaired/retried once,
+  no policy and no charge. Provider errors pause reviews with a cooldown (1 h on fatal/billing).
+- **Policy effects (Executor)**: `stand_down` skips new entries (exits still fire), `sizeMultiplier`
+  shrinks entries only (0.2–1, before every cap), `exitPressure: "exit"` forces a position exit after
+  research ALERT and before stop/target/max-hold/signal. Stale policies (> `maxAgeSec`) or missing
+  LLM bridge → exactly the previous behaviour.
+- **Cost**: each successful review charges the bot `costPerReviewUsd` (category `agent`, role
+  `executor`), so slower/larger bots pay for their own thinking.
+- **Panel**: agents table columns Strategy type + Est. interval; category tabs; Bot agent section in
+  the drill-down; engine header bot-agent bridge line. Disable with `agents.enabled: false` (reviews
+  stop, existing policies become stale and ignored after `maxAgeSec`).
+- **Strategy categories**: momentum/mean-reversion = Swing · mid-long (1-hour lane), breakout/gap-fade
+  = Day · intraday (1-minute lane). Genesis mixes a new population ~50/50; existing populations are
+  rebalanced once on first start (genome family + strategy name refreshed, specs recompiled; ids,
+  ledgers, positions and trade history are never touched).
+
 ## 9. Troubleshooting
 
 - `CONFIG_INVALID: missing Alpaca credentials` → create/fix `.env`; check `--env-file`.

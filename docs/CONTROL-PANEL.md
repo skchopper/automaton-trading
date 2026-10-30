@@ -70,10 +70,24 @@ engine: {
     enabled, period, rankPercents, basis:'account-cash',
     accountCashUsd, poolUsd, allocationCapRemainingUsd,
     lastRunAt, nextRunAt, lastWinners:[{rank, agentId, name, percent, amountUsd, periodKey, at}]
+  },
+  agents: {
+    enabled, configured, provider, model,
+    intervalDaySec, intervalSwingSec, maxReviewsPerCycle,
+    lastReviewAt, nextDueAt, pausedUntil, pauseReason, runs, errors, lastError, agents
   }
+},
+strategyMix: {
+  swing: {label, count, families:{momentum, meanrev}},
+  day:   {label, count, families:{breakout, gapfade}},
+  total
 },
 agents: [{
   ...existing,
+  strategy: {family, category, tier, typeLabel, className, description,
+             categoryLabel, estimatedIntervalSec, timeframe, reviewSec},
+  policy: null | {at, atMs, stance, sizeMultiplier, riskMultiplier, exitPressure, confidence,
+                  thesis, plan:[string], watch:[symbol], reviewSec, stale, reviewCount, nextReviewAt},
   orders: [{symbol, side, qty, priceUsd, notionalUsd, realizedPlUsd, at, orderId}], // full fill history
   pnl: { realizedUsd, unrealizedUsd, netUsd, dayPct, weekPct, monthPct },
   plan: {

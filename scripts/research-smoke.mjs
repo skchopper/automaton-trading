@@ -66,6 +66,25 @@ broker.getNews = async ({ symbols = [] } = {}) =>
 const prompts = [];
 const generate = async ({ system, user }) => {
   prompts.push({ system, user });
+  // The same LLM seam also drives the per-bot agent brain (v2.3.0). Answer each prompt kind with
+  // its own schema so both subsystems succeed during the smoke run.
+  if (String(system).includes('private trading agent')) {
+    return {
+      text: JSON.stringify({
+        stance: 'trade',
+        sizeMultiplier: 0.8,
+        riskMultiplier: 1,
+        exitPressure: 'none',
+        confidence: 0.6,
+        thesis: 'Smoke agent review.',
+        plan: ['hold'],
+        watch: [],
+      }),
+      provider: 'smoke-agent',
+      model: 'smoke-agent-model',
+      usage: { inputTokens: 80, outputTokens: 40 },
+    };
+  }
   return {
     text: JSON.stringify({
       sentiment: 0.2,
@@ -101,11 +120,14 @@ try {
   check('agents carry isolated briefings', withBriefing.length === alive.length, `${withBriefing.length}/${alive.length}`);
   const charged = alive.filter((agent) => (agent.roleCosts?.prospector ?? 0) >= 0.001 - 1e-9);
   check('each briefing charged to its own ledger', charged.length === alive.length, `${charged.length}/${alive.length}`);
-  const firstLines = prompts.map((entry) => entry.user.split('\n')[0]);
+  // Research prompts only: the same generator also serves the per-bot agent brain, which must not
+  // distort the per-agent briefing-scoping assertion.
+  const researchPrompts = prompts.filter((entry) => String(entry.system).includes('news research analyst'));
+  const firstLines = researchPrompts.map((entry) => entry.user.split('\n')[0]);
   check(
     'briefings are agent-scoped',
-    prompts.length === alive.length && new Set(firstLines).size === alive.length,
-    `prompts=${prompts.length}`,
+    researchPrompts.length === alive.length && new Set(firstLines).size === alive.length,
+    `researchPrompts=${researchPrompts.length}`,
   );
   const researchJournal = path.join(dir, 'research');
   check('per-agent journals on disk', fs.readdirSync(researchJournal).filter((name) => name.endsWith('.jsonl')).length === alive.length);

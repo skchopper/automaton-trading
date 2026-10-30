@@ -17,6 +17,7 @@ import { DEFAULT_CONFIG } from './config.js';
 import { effectiveDeathFloor } from './treasurer.js';
 import { round2, SYSTEM_CLOCK } from './util.js';
 import { nextAgentName, usedNames } from './naming.js';
+import { tierForFamily } from './strategy-types.js';
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
@@ -224,9 +225,9 @@ export function createReplicator({ treasurer, registry, ledger, journal, config,
       genome: childGenome,
       mutation,
       specId: null,
-      // The child inherits the parent's execution tier; the one mutation is always a strategy
-      // genome field — the trading cadence class never changes in a birth.
-      tier: parent.tier === 'swing' ? 'swing' : parent.tier === 'day' ? 'day' : null,
+      // The child's execution tier follows its strategy family (the one mutation may change the
+      // family, so the cadence class is derived from the mutated genome rather than copied).
+      tier: tierForFamily(childGenome.family),
       lastCycleAt: null,
       notes: lessons.slice(0, 8),
     });

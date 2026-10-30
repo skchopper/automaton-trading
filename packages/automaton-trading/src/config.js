@@ -122,6 +122,20 @@ export function defaultConfig() {
     // on the intraday timeframe every `intervalSec`; a 'swing' bot on its slower timeframe.
     // null = derive from cycleIntervalSec + data.timeframe (backward compatible).
     cadence: null,
+    // Per-bot agent brain (docs/BOT-AGENTS.md): each bot reviews its own strategy in an isolated
+    // context on its cadence and writes a policy the executor consumes.
+    agents: {
+      enabled: true,
+      reviewIntervalDaySec: 300,
+      reviewIntervalSwingSec: 3600,
+      maxReviewsPerCycle: 4,
+      costPerReviewUsd: 0.001,
+      maxAgeSec: 7200,
+      logLimit: 120,
+      maxInputChars: 8000,
+      maxOutputTokens: 700,
+      errorCooldownSec: 900,
+    },
     paths: {
       stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
       envFile: path.join(WORKSPACE_DEFAULT, '.env'),
@@ -459,6 +473,20 @@ export function validateConfig(config) {
   if (typeof engineCfg.tradingHoursOnly !== 'boolean') fail('CONFIG_INVALID', 'engine.tradingHoursOnly must be boolean');
   assertNumber(engineCfg.offHoursIntervalSec, 'engine.offHoursIntervalSec', { min: 30, max: 3600 });
 
+  // Per-bot agent brain (optional block; absent = brain disabled / neutral).
+  const agentsCfg = config.agents;
+  if (!agentsCfg || typeof agentsCfg !== 'object') fail('CONFIG_INVALID', 'agents config object is required');
+  if (typeof agentsCfg.enabled !== 'boolean') fail('CONFIG_INVALID', 'agents.enabled must be boolean');
+  assertNumber(agentsCfg.reviewIntervalDaySec, 'agents.reviewIntervalDaySec', { min: 60, max: 86_400 });
+  assertNumber(agentsCfg.reviewIntervalSwingSec, 'agents.reviewIntervalSwingSec', { min: 300, max: 86_400 });
+  assertNumber(agentsCfg.maxReviewsPerCycle, 'agents.maxReviewsPerCycle', { min: 1, max: 30 });
+  assertNumber(agentsCfg.costPerReviewUsd, 'agents.costPerReviewUsd', { min: 0, max: 1 });
+  assertNumber(agentsCfg.maxAgeSec, 'agents.maxAgeSec', { min: 300, max: 86_400 });
+  assertNumber(agentsCfg.logLimit, 'agents.logLimit', { min: 10, max: 1000 });
+  assertNumber(agentsCfg.maxInputChars, 'agents.maxInputChars', { min: 1000, max: 60_000 });
+  assertNumber(agentsCfg.maxOutputTokens, 'agents.maxOutputTokens', { min: 128, max: 4000 });
+  assertNumber(agentsCfg.errorCooldownSec, 'agents.errorCooldownSec', { min: 60, max: 86_400 });
+
   if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
     fail('CONFIG_INVALID', 'paths.stateDir is required');
   }
@@ -634,6 +662,16 @@ export function configSummary(config) {
       rankPercents: config.rewards.rankPercents,
       maxPerPeriodUsd: config.rewards.maxPerPeriodUsd,
     },
+    agents: {
+      enabled: config.agents.enabled,
+      reviewIntervalDaySec: config.agents.reviewIntervalDaySec,
+      reviewIntervalSwingSec: config.agents.reviewIntervalSwingSec,
+      maxReviewsPerCycle: config.agents.maxReviewsPerCycle,
+      costPerReviewUsd: config.agents.costPerReviewUsd,
+      maxAgeSec: config.agents.maxAgeSec,
+    },
+    cadence: config.cadence,
+    tradingHoursOnly: config.engine?.tradingHoursOnly === true,
     stateDir: config.paths.stateDir,
     envFile: config.paths.envFile,
   };

@@ -203,6 +203,22 @@ export function createEngine(options = {}) {
     });
   }
 
+  /**
+   * LLM seam for the per-bot agent brain. The Harness plugin injects the same bridge it uses for
+   * research; a headless CLI falls back to the DeepSeek HTTP API. Without either, the agent brain
+   * reports configured:false and trading keeps the deterministic baseline behaviour.
+   */
+  function resolveAgentGenerate(state) {
+    if (typeof options.agentGenerate === 'function') return options.agentGenerate;
+    if (typeof options.researchGenerate === 'function') return options.researchGenerate;
+    if (state.config.agents?.enabled === false) return null;
+    return createHttpResearchGenerator({
+      env: { ...process.env, ...(state.secrets ?? {}) },
+      config: state.config,
+      logger,
+    });
+  }
+
   async function ensureAutomaton() {
     const state = await load();
     if (automaton) return automaton;
@@ -214,6 +230,7 @@ export function createEngine(options = {}) {
       clock,
       logger,
       researchGenerate: resolveResearchGenerate(state),
+      agentGenerate: resolveAgentGenerate(state),
     });
     return automaton;
   }
@@ -396,6 +413,7 @@ export function createEngine(options = {}) {
         killSwitch: fileExists(state.paths.killSwitch),
         liveArmed: liveArmed(state.config),
         research: null,
+        agents: null,
       },
       account: null,
       treasury: null,

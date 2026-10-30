@@ -1050,6 +1050,30 @@ function makeBriefing(overrides = {}) {
   };
 }
 
+/** A valid, fresh per-bot agent policy from the bot brain (docs/BOT-AGENTS.md). */
+function makePolicy(overrides = {}) {
+  return {
+    atMs: T0 - 60_000, // 1 minute old: fresh
+    at: new Date(T0 - 60_000).toISOString(),
+    stance: 'trade',
+    sizeMultiplier: 1,
+    riskMultiplier: 1,
+    exitPressure: 'none',
+    confidence: 0.7,
+    thesis: 'Range-bound tape; stay small and keep the exit tight.',
+    plan: ['buy pullbacks only', 'take profit into strength'],
+    watch: ['AAPL'],
+    stale: false,
+    ...overrides,
+  };
+}
+
+/** Config with the per-bot agent layer switched on (the executor gate). */
+const AGENTS_ON = { agents: { enabled: true, maxAgeSec: 7200 } };
+
+/** Config with the per-bot agent layer switched off. */
+const AGENTS_OFF = { agents: { enabled: false, maxAgeSec: 7200 } };
+
 test('executor: denies market-closed orders with the brake code and places nothing', async () => {
   const harness = executorHarness({
     brakesHandler: () => ({ decision: 'DENY', code: 'MARKET_CLOSED', rule: 'D3', reason: 'market is closed' }),
@@ -1447,6 +1471,213 @@ test('executor × research: stale, disabled, malformed and missing briefings beh
   });
   assert.equal(unknownResult.orders.length, 1);
   assert.ok(!unknownResult.actions.some((action) => action.reason === 'research_veto'));
+});
+
+// ===========================================================================
+// executor × per-bot agent policy (own brain, fresh-only, config-gated)
+// ===========================================================================
+
+test('executor × bot-agent policy: missing, malformed and disabled policies keep baseline behaviour', async () => {
+  const baseline = await runHarness(executorHarness({ configOverrides: AGENTS_ON }));
+  assert.equal(baseline.orders.length, 1);
+  const baselineNotional = baseline.orders[0].qty * baseline.orders[0].avgFillPriceUsd;
+  assert.equal(baseline.actions.find((action) => action.type === 'entry').policy, undefined);
+
+  const ignored = [
+    { name: 'no policy', configOverrides: AGENTS_ON, policy: undefined },
+    { name: 'null policy', configOverrides: AGENTS_ON, policy: null },
+    { name: 'agents disabled', configOverrides: AGENTS_OFF, policy: makePolicy({ stance: 'stand_down' }) },
+    { name: 'missing timestamp', configOverrides: AGENTS_ON, policy: { stance: 'stand_down', sizeMultiplier: 0.2 } },
+    { name: 'malformed stance', configOverrides: AGENTS_ON, policy: makePolicy({ stance: 'yolo' }) },
+    { name: 'empty object', configOverrides: AGENTS_ON, policy: {} },
+  ];
+  for (const testCase of ignored) {
+    const harness = executorHarness({ configOverrides: testCase.configOverrides });
+    const result = await runHarness(harness, { policy: testCase.policy });
+    assert.equal(result.orders.length, 1, `${testCase.name}: baseline entry must still be placed`);
+    const notional = result.orders[0].qty * result.orders[0].avgFillPriceUsd;
+    assert.ok(Math.abs(notional - baselineNotional) < 0.05, `${testCase.name}: notional must be unchanged`);
+    const entry = result.actions.find((action) => action.type === 'entry');
+    assert.equal(entry.policy, undefined, `${testCase.name}: no policy effect may be recorded`);
+    assert.ok(!result.actions.some((action) => action.reason === 'agent_stand_down'), `${testCase.name}: no stand-down`);
+  }
+});
+
+test('executor × bot-agent policy: stand_down blocks entries but exits are still evaluated', async () => {
+  // Entry signal present, but the bot's own brain says stand down -> no new exposure.
+  const flat = executorHarness({ configOverrides: AGENTS_ON });
+  const flatResult = await runHarness(flat, { policy: makePolicy({ stance: 'stand_down', sizeMultiplier: 0.4 }) });
+  assert.equal(flatResult.orders.length, 0);
+  assert.equal(flat.broker.submitted.length, 0, 'no order may reach the broker while standing down');
+  assert.equal(flatResult.denied.length, 0, 'a stand-down is a stance skip, not a brake denial');
+  assert.equal(flat.brakes.calls.length, 0, 'no order is intended, so the brake wall is not reached');
+  const standDown = flatResult.actions.find((action) => action.reason === 'agent_stand_down');
+  assert.ok(standDown);
+  assert.equal(standDown.type, 'skip');
+  assert.equal(standDown.symbol, 'AAPL');
+  assert.equal(standDown.policy.stance, 'stand_down');
+
+  // Exit safety is untouched: a held position at its stop still exits while standing down.
+  const openedAt = new Date(T0 - 2 * HOUR_MS).toISOString();
+  const stopped = executorHarness({
+    configOverrides: AGENTS_ON,
+    positions: { AAPL: { qty: 10, avgPriceUsd: 100, openedAt } },
+    quotes: { AAPL: { bid: 89.9, ask: 90.1, last: 90, ts: T0 } },
+  });
+  const stoppedResult = await runHarness(stopped, { policy: makePolicy({ stance: 'stand_down' }) });
+  assert.equal(stoppedResult.orders.length, 1, 'stand_down must never block a risk-reducing exit');
+  const exit = stoppedResult.actions.find((action) => action.type === 'exit');
+  assert.equal(exit.reason, 'stop');
+  assert.equal(stopped.broker.submitted[0].side, 'sell');
+
+  // ...and a position safely inside its bounds is simply held.
+  const calm = executorHarness({
+    configOverrides: AGENTS_ON,
+    positions: { AAPL: { qty: 10, avgPriceUsd: 110, openedAt } },
+    quotes: { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+  });
+  const calmResult = await runHarness(calm, { policy: makePolicy({ stance: 'stand_down' }) });
+  assert.equal(calmResult.orders.length, 0);
+  assert.ok(calmResult.actions.some((action) => action.type === 'hold'));
+});
+
+test('executor × bot-agent policy: sizeMultiplier shrinks entries and never grows them', async () => {
+  const baseline = await runHarness(executorHarness({ configOverrides: AGENTS_ON }));
+  const baselineNotional = baseline.orders[0].qty * baseline.orders[0].avgFillPriceUsd;
+
+  // cautious + 0.5 shrinks 400 -> 200 and records the applied policy on the entry action
+  const half = executorHarness({ configOverrides: AGENTS_ON });
+  const halfResult = await runHarness(half, { policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.5 }) });
+  assert.equal(halfResult.orders.length, 1);
+  const halfNotional = halfResult.orders[0].qty * halfResult.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(halfNotional - baselineNotional * 0.5) < 0.05, `expected half notional, got ${halfNotional}`);
+  const halfEntry = halfResult.actions.find((action) => action.type === 'entry');
+  assert.deepEqual(halfEntry.policy, { stance: 'cautious', sizeMultiplier: 0.5, applied: 'size' });
+  assert.equal(half.broker.submitted.length, 1);
+  // the brakes still saw the policy-sized order first (target notional 400 * 0.5 = 200)
+  assert.equal(half.brakes.calls.length, 1);
+  assert.ok(Math.abs(half.brakes.calls[0].order.notionalUsd - 200) < 1, `brake notional ${half.brakes.calls[0].order.notionalUsd}`);
+
+  // out-of-range multipliers are clamped into [0.2, 1]: never grows above baseline
+  const huge = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 7 }),
+  });
+  const hugeNotional = huge.orders[0].qty * huge.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(hugeNotional - baselineNotional) < 0.05, `multiplier > 1 must clamp to 1, got ${hugeNotional}`);
+  assert.equal(huge.actions.find((action) => action.type === 'entry').policy.sizeMultiplier, 1);
+
+  const tiny = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.05 }),
+  });
+  const tinyNotional = tiny.orders[0].qty * tiny.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(tinyNotional - baselineNotional * 0.2) < 0.05, `multiplier < 0.2 must clamp to 0.2, got ${tinyNotional}`);
+  assert.equal(tiny.actions.find((action) => action.type === 'entry').policy.sizeMultiplier, 0.2);
+
+  // trade stance with a 1.0 multiplier: same sizing, stance still recorded
+  const trade = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'trade', sizeMultiplier: 1 }),
+  });
+  const tradeNotional = trade.orders[0].qty * trade.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(tradeNotional - baselineNotional) < 0.05);
+  assert.deepEqual(trade.actions.find((action) => action.type === 'entry').policy, {
+    stance: 'trade',
+    sizeMultiplier: 1,
+    applied: 'size',
+  });
+});
+
+test('executor × bot-agent policy: exitPressure exit forces an exit; research ALERT keeps precedence', async () => {
+  const openedAt = new Date(T0 - 2 * HOUR_MS).toISOString();
+  const positions = { AAPL: { qty: 10, avgPriceUsd: 110, openedAt } }; // inside stop/target
+  const quotes = { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } };
+
+  const baseline = await runHarness(
+    executorHarness({ configOverrides: AGENTS_ON, positions, quotes }),
+  );
+  assert.equal(baseline.orders.length, 0, 'baseline would hold this position');
+  assert.ok(baseline.actions.some((action) => action.type === 'hold'));
+
+  const pressured = executorHarness({ configOverrides: AGENTS_ON, positions, quotes });
+  const result = await runHarness(pressured, {
+    policy: makePolicy({ stance: 'cautious', sizeMultiplier: 0.7, exitPressure: 'exit' }),
+  });
+  assert.equal(result.orders.length, 1);
+  const exit = result.actions.find((action) => action.type === 'exit');
+  assert.equal(exit.reason, 'agent_exit_pressure');
+  assert.equal(exit.side, 'sell');
+  assert.deepEqual(exit.policy, { stance: 'cautious', sizeMultiplier: 0.7, applied: 'exit' });
+  assert.equal(pressured.broker.submitted[0].side, 'sell');
+  assert.equal(pressured.brakes.calls.length, 1, 'the forced exit still passes the brakes first');
+
+  // Research ALERT keeps precedence over the bot policy in the exit pass (as today).
+  const withResearch = executorHarness({ configOverrides: AGENTS_ON, positions, quotes });
+  const researchResult = await runHarness(withResearch, {
+    policy: makePolicy({ exitPressure: 'exit' }),
+    research: makeBriefing({ verdict: 'ALERT', sentiment: -0.8 }),
+  });
+  assert.equal(researchResult.orders.length, 1);
+  assert.equal(researchResult.actions.find((action) => action.type === 'exit').reason, 'research_alert');
+
+  // Policy pressure is checked before the mechanical exit rules.
+  const stopped = executorHarness({
+    configOverrides: AGENTS_ON,
+    positions: { AAPL: { qty: 10, avgPriceUsd: 100, openedAt } },
+    quotes: { AAPL: { bid: 89.9, ask: 90.1, last: 90, ts: T0 } }, // stop-loss territory
+  });
+  const stoppedResult = await runHarness(stopped, { policy: makePolicy({ exitPressure: 'exit' }) });
+  assert.equal(stoppedResult.actions.find((action) => action.type === 'exit').reason, 'agent_exit_pressure');
+});
+
+test('executor × bot-agent policy: stale policies are ignored entirely', async () => {
+  const baseline = await runHarness(executorHarness({ configOverrides: AGENTS_ON }));
+  const baselineNotional = baseline.orders[0].qty * baseline.orders[0].avgFillPriceUsd;
+
+  const stalePolicy = makePolicy({
+    stance: 'stand_down',
+    sizeMultiplier: 0.2,
+    atMs: T0 - 3 * 60 * 60 * 1000, // 3 h old, maxAgeSec is 7200 (2 h)
+    at: new Date(T0 - 3 * 60 * 60 * 1000).toISOString(),
+  });
+  const stale = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), { policy: stalePolicy });
+  assert.equal(stale.orders.length, 1, 'a stale policy must not block entries');
+  const staleNotional = stale.orders[0].qty * stale.orders[0].avgFillPriceUsd;
+  assert.ok(Math.abs(staleNotional - baselineNotional) < 0.05);
+  assert.equal(stale.actions.find((action) => action.type === 'entry').policy, undefined);
+
+  // The bot brain's own staleness flag is honoured even when the timestamp looks fresh.
+  const flagged = await runHarness(executorHarness({ configOverrides: AGENTS_ON }), {
+    policy: makePolicy({ stance: 'stand_down', stale: true }),
+  });
+  assert.equal(flagged.orders.length, 1);
+  assert.equal(flagged.actions.find((action) => action.type === 'entry').policy, undefined);
+});
+
+test('executor × bot-agent policy: brakes always run first for policy-sized orders', async () => {
+  const denied = executorHarness({
+    configOverrides: AGENTS_ON,
+    brakesHandler: () => ({ decision: 'DENY', code: 'MARKET_CLOSED', rule: 'D3', reason: 'closed' }),
+  });
+  const result = await runHarness(denied, { policy: makePolicy({ sizeMultiplier: 0.5 }) });
+  assert.equal(result.orders.length, 0);
+  assert.equal(denied.broker.submitted.length, 0);
+  assert.equal(result.denied[0].code, 'MARKET_CLOSED');
+  assert.equal(denied.brakes.calls.length, 1, 'the policy-sized order reached the brake wall first');
+  // the brake decision saw the shrunken notional, not the raw size
+  assert.ok(denied.brakes.calls[0].order.notionalUsd < 400);
+});
+
+test('executor: describe() exposes the per-bot agent policy gate', () => {
+  const on = executorHarness({ configOverrides: AGENTS_ON });
+  const onView = on.executor.describe();
+  assert.equal(onView.agents.enabled, true);
+  assert.equal(onView.agents.policyActive, true);
+  assert.equal(onView.agents.maxAgeSec, 7200);
+  assert.ok(onView.agents.effects.includes('stand_down'));
+  assert.ok(onView.agents.effects.includes('size_multiplier'));
+  assert.ok(onView.agents.effects.includes('exit_pressure'));
+
+  const off = executorHarness({ configOverrides: AGENTS_OFF });
+  assert.equal(off.executor.describe().agents.enabled, false);
 });
 
 // ===========================================================================
