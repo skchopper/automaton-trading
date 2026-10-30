@@ -43,6 +43,12 @@ import { createResearcher } from './research.js';
 import { createRewards } from './rewards.js';
 import { explainAgentPlan } from './strategy-explain.js';
 import { resolveStrategyType, strategyMix as computeStrategyMix, targetFamilyForIndex, tierForFamily } from './strategy-types.js';
+import {
+  agentInstrumentPermissions,
+  playbookForFamily,
+  playbookView,
+  resolveInstrumentPermissions,
+} from './instruments.js';
 import { nextAgentName, usedNames } from './naming.js';
 
 const log = createLogger('automaton');
@@ -538,6 +544,105 @@ export async function createAutomaton(options = {}) {
     }
   }
 
+  /**
+   * One-time v3.0 symbol-coverage migration: dashboards and the option/short playbooks are more
+   * useful when part of the population trades affordable underlyings (whole-share shorts and
+   * sub-$25 option contracts). Every third living bot (up to two per affordable symbol) is
+   * re-pointed at F/SOFI/BAC/INTC; specs recompile and strategy-derived names refresh, while ids,
+   * ledgers and existing positions are untouched (positions keep being managed by the exit pass).
+   * A state-dir marker makes this idempotent.
+   */
+  async function introduceAffordableSymbols() {
+    if (config.instruments?.enabled !== true) return;
+    const affordable = ['F', 'SOFI', 'BAC', 'INTC'].filter((symbol) => config.symbols.includes(symbol));
+    if (!affordable.length) return;
+    const marker = path.join(paths.stateDir, 'instruments-v3-symbols.json');
+    const already = await readJson(marker, null);
+    if (already?.version === 1) return;
+    const alive = registry.alive();
+    if (alive.length < 6) return;
+    const target = Math.min(affordable.length * 2, Math.floor(alive.length / 3));
+    let assigned = 0;
+    for (let index = 0; index < alive.length && assigned < target; index += 1) {
+      const agent = alive[index];
+      if (index % 3 !== 0) continue;
+      const symbol = affordable[assigned % affordable.length];
+      if ((agent?.genome?.symbol ?? null) === symbol) {
+        assigned += 1;
+        continue;
+      }
+      const genome = { ...(agent.genome ?? {}), symbol };
+      try {
+        const taken = usedNames(registry.all().filter((candidate) => candidate.id !== agent.id));
+        await registry.update(agent.id, {
+          genome,
+          specId: null,
+          name: nextAgentName(genome, taken),
+        });
+        assigned += 1;
+      } catch {
+        /* immutable/dead records are skipped */
+      }
+    }
+    if (assigned > 0) {
+      await registry.save();
+      await writeJsonAtomic(marker, { version: 1, at: clock.iso(), assigned });
+      log.info('affordable instrument symbols introduced', { assigned, symbols: affordable });
+    }
+  }
+
+  /**
+   * One-time capital top-up when the operator raises `endowmentUsd` (v3.0: bots moved from $20 to
+   * $50 so margin/short/option tools are usable). Credits the difference to each alive bot's own
+   * ledger, bounded by the account allocation cap, and updates the bot's endowment basis (so the
+   * top-up is not counted as trading profit). Idempotent: no deficit → no credit.
+   */
+  async function capitalizePopulation(accountEquityUsd) {
+    const target = Math.max(0, Number(config.endowmentUsd) || 0);
+    const alive = registry.alive();
+    if (!alive.length || !(target > 0)) return;
+    const deficits = alive
+      .map((agent) => ({ agent, deficit: round2(target - (Number(agent.endowmentUsd) || 0)) }))
+      .filter((entry) => entry.deficit > 0.009);
+    if (!deficits.length) return;
+    if (typeof ledger.credit !== 'function') {
+      log.warn('capital top-up skipped: ledger.credit() not available');
+      return;
+    }
+    const cap = Math.max(0, Number(accountEquityUsd) || 0) * Number(config.account?.allocationCapPct ?? 0.8);
+    const allocated = alive.reduce((sum, agent) => sum + (Number(agent.endowmentUsd) || 0), 0);
+    const available = Math.max(0, cap - allocated);
+    const totalDeficit = deficits.reduce((sum, entry) => sum + entry.deficit, 0);
+    const budget = Math.min(totalDeficit, available);
+    if (!(budget > 0)) return;
+    const scale = budget / totalDeficit;
+    let credited = 0;
+    let changed = 0;
+    for (const { agent, deficit } of deficits) {
+      const amount = round2(deficit * scale);
+      if (!(amount > 0)) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await ledger.credit(agent.id, amount, {
+          category: 'capital',
+          reason: 'v3.0 capital top-up',
+          at: clock.now(),
+        });
+        // eslint-disable-next-line no-await-in-loop
+        await registry.update(agent.id, { endowmentUsd: round2((Number(agent.endowmentUsd) || 0) + amount) });
+        credited = round2(credited + amount);
+        changed += 1;
+      } catch (error) {
+        log.warn('capital top-up failed', { agentId: agent.id, error: String(error?.message ?? error) });
+      }
+    }
+    if (changed > 0) {
+      await ledger.save();
+      await registry.save();
+      log.info('capital top-up credited', { agents: changed, creditedUsd: credited, targetEndowmentUsd: target });
+    }
+  }
+
   async function init() {
     if (state.initialized) return;
     await ensureDir(paths.stateDir);
@@ -564,6 +669,8 @@ export async function createAutomaton(options = {}) {
     await backfillAgentNames();
     await backfillAgentTiers();
     await rebalanceStrategyMix();
+    await introduceAffordableSymbols();
+    await capitalizePopulation(Number(account?.equityUsd) || 0);
     state.initialized = true;
     const snapshot = await buildSnapshot({ account, treasury: null, halted: false, haltReasons: [] });
     await writeStateFile(snapshot);
@@ -1202,15 +1309,32 @@ export async function createAutomaton(options = {}) {
       const positions = Object.entries(book?.positions ?? {}).map(([symbol, position]) => {
         const qty = Number(position?.qty) || 0;
         const avgPriceUsd = Number(position?.avgPriceUsd) || 0;
-        const lastPriceUsd = Number(marks[symbol]) > 0 ? Number(marks[symbol]) : avgPriceUsd;
-        const marketValueUsd = round2(qty * lastPriceUsd);
+        const assetClass = position?.assetClass === 'us_option' ? 'us_option' : 'us_equity';
+        const multiplier = assetClass === 'us_option' ? Number(position?.multiplier) || 100 : 1;
+        const option = position?.option ?? null;
+        const markCandidate = Number(position?.markPriceUsd ?? position?.lastPriceUsd);
+        const lastPriceUsd = Number(marks[symbol]) > 0
+          ? Number(marks[symbol])
+          : Number.isFinite(markCandidate) && markCandidate > 0
+            ? markCandidate
+            : avgPriceUsd;
+        const marketValueUsd = round2(qty * lastPriceUsd * multiplier);
+        const side = assetClass === 'us_option'
+          ? String(option?.type ?? 'option').toUpperCase()
+          : qty < 0 ? 'SHORT' : 'LONG';
         return {
           symbol,
+          assetClass,
+          side,
           qty,
+          qtySigned: qty,
+          multiplier,
+          option,
+          groupId: position?.groupId ?? null,
           avgPriceUsd: round4(avgPriceUsd),
           lastPriceUsd: round4(lastPriceUsd),
           marketValueUsd,
-          unrealizedPlUsd: round2(marketValueUsd - qty * avgPriceUsd),
+          unrealizedPlUsd: round2((lastPriceUsd - avgPriceUsd) * qty * multiplier),
           openedAt: position?.openedAt ?? null,
         };
       });
@@ -1247,6 +1371,9 @@ export async function createAutomaton(options = {}) {
           : null,
         equityUsd: freshEquity?.equityUsd ?? view?.equityUsd ?? null,
         cashUsd: freshEquity?.cashUsd ?? book?.cashUsd ?? view?.cashUsd ?? null,
+        marginDebtUsd: freshEquity?.marginDebtUsd ?? view?.marginDebtUsd ?? null,
+        grossExposureUsd: view?.grossExposureUsd ?? freshEquity?.grossExposureUsd ?? null,
+        netExposureUsd: view?.netExposureUsd ?? freshEquity?.netExposureUsd ?? null,
         positionsValueUsd: freshEquity?.positionsValueUsd ?? view?.positionsValueUsd ?? null,
         runwayHours: view?.runwayHours ?? null,
         treasuryState: view?.state ?? null,
@@ -1308,6 +1435,9 @@ export async function createAutomaton(options = {}) {
           tier: agent.tier,
           cadence,
         }),
+        // Instrument permissions + family playbook (multi-instrument paper trading, v3.0).
+        instrumentPermissions: agentInstrumentPermissions(config, agent),
+        playbook: playbookView(agent?.genome?.family, agentInstrumentPermissions(config, agent)),
         // This bot's own agent brain: latest review policy, review count, next review time.
         policy: botAgents.status(agent.id),
         // Strategy explanation + current plan/next step for the detail page.
@@ -1345,6 +1475,44 @@ export async function createAutomaton(options = {}) {
           },
         },
         agents: botAgents.schedule(),
+        instruments: (() => {
+          const permissions = resolveInstrumentPermissions(config);
+          const acct = account ?? {};
+          const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
+          const t = treasury ?? {};
+          return {
+            ...permissions,
+            enabled: config.instruments.enabled === true,
+            caps: {
+              maxMarginPctEquity: config.instruments.maxMarginPctEquity,
+              maxShortPctEquity: config.instruments.maxShortPctEquity,
+              maxShortNotionalUsd: config.instruments.maxShortNotionalUsd,
+              maxOptionPremiumPctEquity: config.instruments.maxOptionPremiumPctEquity,
+              maxOptionPremiumUsd: config.instruments.maxOptionPremiumUsd,
+              maxContracts: config.instruments.maxContracts,
+              minDTE: config.instruments.minDTE,
+              maxDTE: config.instruments.maxDTE,
+              autoCloseDTE: config.instruments.autoCloseDTE,
+            },
+            optionDataFeed: config.instruments.optionDataFeed,
+            account: account || treasury
+              ? {
+                  buyingPowerUsd: num(acct.buyingPowerUsd ?? acct.buying_power),
+                  optionsBuyingPowerUsd: num(acct.optionsBuyingPowerUsd ?? acct.options_buying_power),
+                  marginMultiplier: num(acct.marginMultiplier ?? acct.margin_multiplier),
+                  shortingEnabled: acct.shortingEnabled ?? acct.shorting_enabled ?? null,
+                  optionsTradingLevel: num(acct.optionsTradingLevel ?? acct.options_trading_level),
+                  marginDebtUsd: num(acct.marginDebtUsd) ?? num(t.marginDebtUsd),
+                  grossExposureUsd: num(acct.grossExposureUsd) ?? num(t.grossExposureUsd),
+                  netExposureUsd: num(acct.netExposureUsd) ?? num(t.netExposureUsd),
+                }
+              : null,
+            treasury: t.instruments ?? null,
+            playbooks: Object.fromEntries(
+              ['momentum', 'meanrev', 'breakout', 'gapfade'].map((family) => [family, playbookView(family, permissions)]),
+            ),
+          };
+        })(),
         rewards: rewardsView,
         cadence,
         tradingHoursOnly: config.engine?.tradingHoursOnly === true,
@@ -1361,6 +1529,10 @@ export async function createAutomaton(options = {}) {
             mayReplicate: treasury.mayReplicate,
             allocatedUsd: treasury.allocatedUsd,
             poolUsd: treasury.poolUsd,
+            marginDebtUsd: treasury.marginDebtUsd ?? null,
+            grossExposureUsd: treasury.grossExposureUsd ?? null,
+            netExposureUsd: treasury.netExposureUsd ?? null,
+            instruments: treasury.instruments ?? null,
             reconciliation: treasury.reconciliation,
           }
         : null,

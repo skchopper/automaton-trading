@@ -89,6 +89,12 @@ export function timeframeToMs(timeframe) {
   return count * unitMs;
 }
 
+/** Round an option premium/mark to a sane 4dp grid (avoid float dust from mid prices). */
+function roundQuotePrice(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 10_000) / 10_000 : null;
+}
+
 /** Truncate a response body to something safe for error details/traces. */
 export function bodySnippet(text) {
   const clean = String(text ?? '')
@@ -113,21 +119,116 @@ function retryDelayMs(response) {
   return RETRY_DELAY_MS;
 }
 
+/** Milliseconds in one day (option DTE math). */
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Options multiplier: one contract covers 100 shares. */
+export const OPTION_MULTIPLIER = 100;
+
+/** True when a symbol looks like an OCC option symbol (e.g. F260116C00013000). */
+export function isOptionSymbol(symbol) {
+  return /^[A-Z]{1,6}\d{6}[CP]\d{8}$/.test(String(symbol ?? '').toUpperCase());
+}
+
+/**
+ * Parse an OCC option symbol into its parts.
+ * `F260116C00013000` -> { underlying:'F', expiration:'2026-01-16', type:'call', strikeUsd:13 }
+ * @param {string} symbol
+ * @returns {{underlying:string, expiration:string, type:'call'|'put', strikeUsd:number, symbol:string}|null}
+ */
+export function parseOccSymbol(symbol) {
+  const text = String(symbol ?? '').trim().toUpperCase();
+  const match = /^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(text);
+  if (!match) return null;
+  const year = 2000 + Number(match[2]);
+  const month = Number(match[3]);
+  const day = Number(match[4]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  const strikeUsd = Number(match[6]) / 1000;
+  if (!Number.isFinite(strikeUsd) || strikeUsd <= 0) return null;
+  return {
+    symbol: text,
+    underlying: match[1],
+    expiration: `${year}-${mm}-${dd}`,
+    type: match[5] === 'C' ? 'call' : 'put',
+    strikeUsd: Math.round(strikeUsd * 1000) / 1000,
+  };
+}
+
+/**
+ * Build an OCC option symbol from normalized parts.
+ * @param {{underlying:string, expiration:string, type:'call'|'put', strikeUsd:number}} contract
+ * @returns {string}
+ */
+export function formatOccSymbol({ underlying, expiration, type, strikeUsd }) {
+  const symbol = String(underlying ?? '').trim().toUpperCase();
+  const fullDate = String(expiration ?? '').slice(0, 10).replace(/-/g, '');
+  const date = fullDate.slice(2); // OCC uses YYMMDD
+  if (!/^[A-Z]{1,6}$/.test(symbol) || !/^\d{6}$/.test(date)) return '';
+  const suffix = String(type ?? '').toLowerCase() === 'put' ? 'P' : 'C';
+  const strike = Math.round(Number(strikeUsd) * 1000);
+  if (!Number.isFinite(strike) || strike <= 0) return '';
+  return `${symbol}${date}${suffix}${String(strike).padStart(8, '0')}`;
+}
+
+/** Whole days from `nowMs` until an option expiration date (`YYYY-MM-DD`, UTC). */
+export function daysToExpiration(expiration, nowMs = Date.now()) {
+  const expiryMs = Date.parse(`${String(expiration ?? '').slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(expiryMs) || !Number.isFinite(Number(nowMs))) return null;
+  return Math.max(0, Math.ceil((expiryMs - Number(nowMs)) / DAY_MS));
+}
+
+/** Derive a UI/reconciliation side label from an asset class + signed quantity. */
+export function sideLabelFor({ assetClass, qtySigned, symbol }) {
+  if (String(assetClass ?? '').toLowerCase() === 'us_option' || isOptionSymbol(symbol)) {
+    const parsed = parseOccSymbol(symbol);
+    return parsed?.type === 'put' ? 'PUT' : 'CALL';
+  }
+  return Number(qtySigned) < 0 ? 'SHORT' : 'LONG';
+}
+
+/** Map one raw Alpaca mleg leg to the contract leg shape. */
+export function mapLeg(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    symbol: String(raw.symbol ?? '').toUpperCase(),
+    side: raw.side ?? null,
+    ratioQty: parseNumber(raw.ratio_qty, 1),
+    qty: parseNumber(raw.qty, 0),
+    filledQty: parseNumber(raw.filled_qty ?? raw.ratio_qty, 0),
+    avgFillPriceUsd: parseNumber(raw.filled_avg_price, null),
+    positionIntent: raw.position_intent ?? null,
+    status: raw.status ?? null,
+  };
+}
+
 /** Map a raw Alpaca order to the contract order shape. */
 export function mapOrder(raw) {
   if (!raw || typeof raw !== 'object') return null;
+  const symbol = String(raw.symbol ?? '').toUpperCase();
+  const assetClass = String(raw.asset_class ?? raw.assetClass ?? (isOptionSymbol(symbol) ? 'us_option' : 'us_equity')).toLowerCase();
+  const legs = Array.isArray(raw.legs) ? raw.legs.map(mapLeg).filter(Boolean) : [];
   return {
     id: raw.id ?? null,
     clientOrderId: raw.client_order_id ?? null,
-    symbol: String(raw.symbol ?? '').toUpperCase(),
+    symbol,
     side: raw.side ?? null,
     qty: parseNumber(raw.qty, 0),
     filledQty: parseNumber(raw.filled_qty, 0),
     avgFillPriceUsd: parseNumber(raw.filled_avg_price, null),
+    filledAvgPriceUsd: parseNumber(raw.filled_avg_price, null),
     status: raw.status ?? null,
     submittedAt: parseTimestamp(raw.submitted_at),
+    filledAt: parseTimestamp(raw.filled_at),
     type: raw.type ?? null,
     notionalUsd: parseNumber(raw.notional, null),
+    assetClass,
+    orderClass: raw.order_class ?? raw.orderClass ?? 'simple',
+    positionIntent: raw.position_intent ?? null,
+    timeInForce: raw.time_in_force ?? null,
+    legs,
+    limitPrice: parseNumber(raw.limit_price, null),
   };
 }
 
@@ -146,15 +247,74 @@ export function mapBar(raw) {
   };
 }
 
-/** Map a raw Alpaca position to the contract position shape. */
+/** Map a raw Alpaca position to the multi-instrument position shape. */
 export function mapPosition(raw) {
   if (!raw || typeof raw !== 'object') return null;
+  const symbol = String(raw.symbol ?? '').toUpperCase();
+  const assetClass = String(raw.asset_class ?? raw.assetClass ?? (isOptionSymbol(symbol) ? 'us_option' : 'us_equity')).toLowerCase();
+  const option = isOptionSymbol(symbol) ? parseOccSymbol(symbol) : null;
+  const isOption = assetClass === 'us_option' || Boolean(option);
+  // Alpaca reports signed qty for short stock and contract counts for options.
+  const qtySigned = parseNumber(raw.qty, 0);
+  const multiplier = isOption ? parseNumber(raw.multiplier, OPTION_MULTIPLIER) ?? OPTION_MULTIPLIER : 1;
   return {
-    symbol: String(raw.symbol ?? '').toUpperCase(),
-    qty: parseNumber(raw.qty, 0),
+    symbol,
+    assetClass,
+    qty: qtySigned,
+    qtySigned,
+    contracts: isOption ? Math.abs(qtySigned) : undefined,
     avgEntryPriceUsd: parseNumber(raw.avg_entry_price, null),
+    avgPriceUsd: parseNumber(raw.avg_entry_price, null),
     marketValueUsd: parseNumber(raw.market_value, null),
     unrealizedPlUsd: parseNumber(raw.unrealized_pl, null),
+    side: sideLabelFor({ assetClass, qtySigned, symbol }),
+    multiplier,
+    option,
+  };
+}
+
+/** Map a raw Alpaca asset to the permissions shape the instruments layer needs. */
+export function mapAsset(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const maintenance = parseNumber(raw.maintenance_margin_requirement, null);
+  return {
+    symbol: String(raw.symbol ?? '').toUpperCase(),
+    assetClass: String(raw.class ?? raw.asset_class ?? 'us_equity').toLowerCase(),
+    tradable: raw.tradable === true,
+    shortable: raw.shortable === true,
+    marginable: raw.marginable === true,
+    fractionable: raw.fractionable === true,
+    easyToBorrow: raw.easy_to_borrow === true,
+    maintenanceMarginPct: maintenance === null ? null : maintenance > 1 ? maintenance / 100 : maintenance,
+  };
+}
+
+/**
+ * Map one raw Alpaca option contract to the normalized chain shape.
+ * @param {unknown} raw
+ * @param {number} nowMs used for deterministic DTE
+ */
+export function mapOptionContract(raw, nowMs = Date.now()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbol = String(raw.symbol ?? '').toUpperCase();
+  const parsed = parseOccSymbol(symbol);
+  const expiration = String(raw.expiration_date ?? parsed?.expiration ?? '').slice(0, 10);
+  if (!expiration) return null;
+  const type = String(raw.type ?? parsed?.type ?? '').toLowerCase() === 'put' ? 'put' : 'call';
+  const strikeUsd = parseNumber(raw.strike_price, parsed?.strikeUsd ?? null);
+  if (!Number.isFinite(strikeUsd)) return null;
+  return {
+    symbol,
+    id: raw.id ?? null,
+    underlying: String(raw.underlying_symbol ?? parsed?.underlying ?? '').toUpperCase(),
+    type,
+    strikeUsd,
+    expiration,
+    dte: daysToExpiration(expiration, nowMs),
+    multiplier: parseNumber(raw.multiplier, OPTION_MULTIPLIER) ?? OPTION_MULTIPLIER,
+    tradable: raw.tradable !== false,
+    closePriceUsd: parseNumber(raw.close_price, null),
+    openInterest: parseNumber(raw.open_interest, null),
   };
 }
 
@@ -241,6 +401,8 @@ export function createBroker(config, options = {}) {
   const mode = config.mode;
   /** @type {ReturnType<typeof resolveCredentials>|null} */
   let credentials = options.credentials ?? null;
+  /** Brief per-underlying chain-snapshot cache (one snapshot feed per cycle, not per leg). */
+  const optionSnapshotCache = new Map();
 
   function creds() {
     if (!credentials) {
@@ -343,24 +505,55 @@ export function createBroker(config, options = {}) {
       };
     },
 
-    /** @returns {Promise<{equityUsd:number, cashUsd:number, buyingPowerUsd:number, status:string, currency:string, mode:string}>} */
+    /**
+     * Account snapshot including margin/short/options capability fields.
+     * @returns {Promise<{equityUsd:number, cashUsd:number, buyingPowerUsd:number,
+     *   optionsBuyingPowerUsd:number, marginMultiplier:number, shortingEnabled:boolean,
+     *   optionsTradingLevel:number, longMarketValueUsd:number, shortMarketValueUsd:number,
+     *   maintenanceMarginUsd:number, status:string, currency:string, mode:string}>}
+     */
     async getAccount() {
       const raw = await request('/v2/account');
+      const buyingPowerUsd = parseNumber(raw?.buying_power, 0);
       return {
         equityUsd: parseNumber(raw?.equity, 0),
         cashUsd: parseNumber(raw?.cash, 0),
-        buyingPowerUsd: parseNumber(raw?.buying_power, 0),
+        buyingPowerUsd,
+        optionsBuyingPowerUsd: parseNumber(raw?.options_buying_power, buyingPowerUsd),
+        marginMultiplier: parseNumber(raw?.multiplier ?? raw?.margin_multiplier, 1),
+        shortingEnabled: raw?.shorting_enabled === true,
+        optionsTradingLevel: parseNumber(raw?.options_trading_level, 0),
+        longMarketValueUsd: parseNumber(raw?.long_market_value, null),
+        shortMarketValueUsd: parseNumber(raw?.short_market_value, null),
+        maintenanceMarginUsd: parseNumber(raw?.maintenance_margin, null),
         status: raw?.status ?? 'UNKNOWN',
         currency: raw?.currency ?? 'USD',
         mode,
       };
     },
 
-    /** @returns {Promise<Array<{symbol:string, qty:number, avgEntryPriceUsd:number|null, marketValueUsd:number|null, unrealizedPlUsd:number|null}>>} */
+    /**
+     * Normalized positions for stocks (long/short) and options.
+     * @returns {Promise<Array<object>>}
+     */
     async getPositions() {
       const raw = await request('/v2/positions');
       const rows = Array.isArray(raw) ? raw : [];
       return rows.map(mapPosition).filter(Boolean);
+    },
+
+    /**
+     * Asset permissions for the instrument gates (tradable/shortable/marginable).
+     * @param {string} symbol
+     * @returns {Promise<object>}
+     */
+    async getAsset(symbol) {
+      const ticker = String(symbol ?? '').trim().toUpperCase();
+      if (!ticker) fail('DATA_MISSING', 'getAsset requires a symbol');
+      const raw = await request(`/v2/assets/${encodeURIComponent(ticker)}`);
+      const asset = mapAsset(raw);
+      if (!asset) fail('DATA_MISSING', `Alpaca returned no asset for ${ticker}`, { symbol: ticker });
+      return asset;
     },
 
     /**
@@ -376,16 +569,148 @@ export function createBroker(config, options = {}) {
     },
 
     /**
-     * Submit an order. Supports fractional qty, notional orders, and
-     * client_order_id pass-through for fill attribution.
-     * @param {{symbol:string, side:'buy'|'sell', qty?:number, notional?:number, type?:string, limitPrice?:number,
-     *          clientOrderId?:string, timeInForce?:string, extendedHours?:boolean}} order
+     * One order by id (fill reconciliation; includes mleg legs).
+     * @param {string} id
+     * @returns {Promise<object|null>}
+     */
+    async getOrder(id) {
+      if (!id) fail('SPEC_INVALID', 'getOrder requires an order id');
+      const raw = await request(`/v2/orders/${encodeURIComponent(String(id))}`);
+      return mapOrder(raw);
+    },
+
+    /**
+     * Option contract chain (contracts endpoint on the trading host).
+     * @param {{underlying: string, type?: 'call'|'put'|'both', expirationGte?: string,
+     *          expirationLte?: string, strikeGte?: number, strikeLte?: number, limit?: number}} params
+     * @param {{nowMs?: number}} [opts] deterministic DTE injection point for tests
+     * @returns {Promise<Array<object>>} normalized contracts sorted by expiration, strike
+     */
+    async getOptionChain({ underlying, type = 'call', expirationGte, expirationLte, strikeGte, strikeLte, limit = 100 } = {}, { nowMs } = {}) {
+      const symbol = String(underlying ?? '').trim().toUpperCase();
+      if (!symbol) fail('DATA_MISSING', 'getOptionChain requires an underlying');
+      const optionType = String(type ?? '').toLowerCase();
+      const query = {
+        underlying_symbols: symbol,
+        status: 'active',
+        limit: Math.max(1, Math.min(10_000, Number(limit) || 100)),
+        expiration_date_gte: expirationGte,
+        expiration_date_lte: expirationLte,
+        strike_price_gte: strikeGte,
+        strike_price_lte: strikeLte,
+      };
+      if (optionType === 'call' || optionType === 'put') query.type = optionType;
+      const raw = await request('/v2/options/contracts', { query });
+      const rows = Array.isArray(raw?.option_contracts) ? raw.option_contracts : Array.isArray(raw) ? raw : [];
+      const effectiveNow = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+      return rows
+        .map((row) => mapOptionContract(row, effectiveNow))
+        .filter(Boolean)
+        .sort((left, right) => left.expiration.localeCompare(right.expiration) || left.strikeUsd - right.strikeUsd);
+    },
+
+    /**
+     * Latest option quote from the chain snapshot endpoint (indicative by default).
+     * The underlying chain snapshot is cached briefly so one execution cycle makes one
+     * request instead of one per contract/leg.
+     * @param {string} contractSymbol OCC symbol
+     * @param {{feed?: string, nowMs?: number, forceRefresh?: boolean}} [opts]
+     * @returns {Promise<object|null>} {symbol, underlying, type, strikeUsd, expiration, dte, multiplier, bid, ask, last, mark, ts}
+     */
+    async getOptionQuote(contractSymbol, { feed, nowMs, forceRefresh = false } = {}) {
+      const parsed = parseOccSymbol(contractSymbol);
+      if (!parsed) fail('DATA_MISSING', `not an OCC option symbol: ${contractSymbol}`, { symbol: contractSymbol });
+      const effectiveFeed = feed ?? config.instruments?.optionDataFeed ?? 'indicative';
+      const effectiveNow = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+      const cacheKey = `${parsed.underlying}:${effectiveFeed}`;
+      const cached = optionSnapshotCache.get(cacheKey);
+      const TTL_MS = 5_000;
+      let snapshot = null;
+      if (!forceRefresh && cached && Math.abs(effectiveNow - cached.at) < TTL_MS) {
+        snapshot = cached.snapshot;
+      } else {
+        const raw = await request(`/v1beta1/options/snapshots/${encodeURIComponent(parsed.underlying)}`, {
+          dataHost: true,
+          query: { limit: 1000, feed: effectiveFeed },
+        });
+        snapshot = raw?.snapshots && typeof raw.snapshots === 'object' ? raw.snapshots : {};
+        optionSnapshotCache.set(cacheKey, { at: effectiveNow, snapshot });
+      }
+      const entry = snapshot?.[parsed.symbol] ?? snapshot?.[String(contractSymbol).toUpperCase()] ?? null;
+      const quote = entry?.latestQuote && typeof entry.latestQuote === 'object' ? entry.latestQuote : {};
+      const trade = entry?.latestTrade && typeof entry.latestTrade === 'object' ? entry.latestTrade : {};
+      const daily = entry?.dailyBar && typeof entry.dailyBar === 'object' ? entry.dailyBar : {};
+      const bid = parseNumber(quote.bp, null);
+      const ask = parseNumber(quote.ap, null);
+      const last = parseNumber(trade.p, parseNumber(daily.c, null));
+      const mark = bid !== null && ask !== null ? roundQuotePrice((bid + ask) / 2) : last;
+      return {
+        symbol: parsed.symbol,
+        underlying: parsed.underlying,
+        type: parsed.type,
+        strikeUsd: parsed.strikeUsd,
+        expiration: parsed.expiration,
+        dte: daysToExpiration(parsed.expiration, effectiveNow),
+        multiplier: OPTION_MULTIPLIER,
+        bid,
+        ask,
+        last,
+        mark,
+        ts: parseTimestamp(quote.t ?? trade.t),
+        simulated: false,
+      };
+    },
+
+    /**
+     * Submit an order for stocks (long or short) or options (single leg or mleg).
+     *
+     * - stocks: fractional qty supported; a short sale is a plain `sell` (no intent field).
+     * - options: `qty` = integer contracts, `limitPrice` = premium per share; a
+     *   `positionIntent` (buy_to_open|sell_to_open|buy_to_close|sell_to_close) is sent.
+     * - multi-leg: `orderClass:'mleg'` + `legs:[{symbol, side, ratioQty, positionIntent}]`,
+     *   submitted as one limit order with a net `limitPrice` (no top-level symbol/qty).
+     *
+     * @param {{symbol?:string, assetClass?:string, side?:'buy'|'sell', qty?:number,
+     *   notional?:number, type?:string, limitPrice?:number, clientOrderId?:string,
+     *   timeInForce?:string, positionIntent?:string, orderClass?:'simple'|'mleg',
+     *   legs?:Array<{symbol:string, side:string, ratioQty?:number, positionIntent?:string,
+     *   limitPrice?:number}>, extendedHours?:boolean}} order
      * @returns {Promise<object>} mapped order
      */
     async submitOrder(order = {}) {
+      const isMleg = order.orderClass === 'mleg' || order.orderClass === 'multi_leg';
+      const isOption = String(order.assetClass ?? '').toLowerCase() === 'us_option'
+        || isOptionSymbol(order.symbol)
+        || isMleg;
+      const side = String(order.side ?? '').toLowerCase();
+      const type = order.type ?? (isOption || isMleg ? 'limit' : 'market');
+      const payload = { type, time_in_force: order.timeInForce ?? (isOption || isMleg ? 'day' : 'day') };
+      const limitPrice = parseNumber(order.limitPrice);
+      if (limitPrice !== null) payload.limit_price = String(limitPrice);
+      if (order.clientOrderId) payload.client_order_id = String(order.clientOrderId);
+
+      if (isMleg) {
+        const legs = Array.isArray(order.legs) ? order.legs : [];
+        if (legs.length < 2) fail('SPEC_INVALID', 'mleg order requires at least 2 legs', { legs: legs.length });
+        payload.order_class = 'mleg';
+        payload.legs = legs.map((leg) => {
+          const legSymbol = String(leg?.symbol ?? '').trim().toUpperCase();
+          if (!legSymbol) fail('SPEC_INVALID', 'mleg leg requires a symbol');
+          const legSide = String(leg?.side ?? '').toLowerCase();
+          if (legSide !== 'buy' && legSide !== 'sell') fail('SPEC_INVALID', 'mleg leg side must be buy or sell', { leg });
+          const ratioQty = Number.isFinite(Number(leg.ratioQty)) && Number(leg.ratioQty) > 0 ? Number(leg.ratioQty) : 1;
+          const mapped = { symbol: legSymbol, side: legSide, ratio_qty: String(ratioQty) };
+          if (leg.positionIntent) mapped.position_intent = String(leg.positionIntent);
+          return mapped;
+        });
+        // Alpaca requires a net limit price for mleg orders.
+        if (limitPrice === null) fail('SPEC_INVALID', 'mleg order requires limitPrice (net debit/credit)');
+        const raw = await request('/v2/orders', { method: 'POST', body: payload });
+        return mapOrder(raw);
+      }
+
       const symbol = String(order.symbol ?? '').trim().toUpperCase();
       if (!symbol) fail('SPEC_INVALID', 'submitOrder requires symbol');
-      const side = String(order.side ?? '').toLowerCase();
       if (side !== 'buy' && side !== 'sell') {
         fail('SPEC_INVALID', 'submitOrder side must be buy or sell', { side: order.side });
       }
@@ -394,17 +719,18 @@ export function createBroker(config, options = {}) {
       if (qty === null && notional === null) {
         fail('SPEC_INVALID', 'submitOrder requires qty or notional', { symbol });
       }
-      const payload = {
-        symbol,
-        side,
-        type: order.type ?? 'market',
-        time_in_force: order.timeInForce ?? 'day',
-      };
-      if (qty !== null) payload.qty = String(qty);
+      if (isOption && qty === null) fail('SPEC_INVALID', 'option orders require integer qty (contracts)', { symbol });
+      if (isOption && (!Number.isInteger(Number(qty)) || Number(qty) < 1)) {
+        fail('SPEC_INVALID', 'option qty must be a positive integer number of contracts', { symbol, qty });
+      }
+      const mappedAssetClass = isOption ? 'us_option' : String(order.assetClass ?? 'us_equity').toLowerCase();
+      payload.symbol = symbol;
+      payload.side = side;
+      payload.asset_class = mappedAssetClass;
+      if (qty !== null) payload.qty = String(isOption ? Math.trunc(Number(qty)) : qty);
       else payload.notional = String(notional);
-      const limitPrice = parseNumber(order.limitPrice);
-      if (limitPrice !== null) payload.limit_price = String(limitPrice);
-      if (order.clientOrderId) payload.client_order_id = String(order.clientOrderId);
+      if (isOption && order.positionIntent) payload.position_intent = String(order.positionIntent);
+      if (!isOption && order.positionIntent) payload.position_intent = String(order.positionIntent);
       if (order.extendedHours === true) payload.extended_hours = true;
       const raw = await request('/v2/orders', { method: 'POST', body: payload });
       return mapOrder(raw);
@@ -594,7 +920,18 @@ export function createBroker(config, options = {}) {
     /** Readonly endpoint summary for status/debug output (no key material). */
     describe() {
       const resolved = creds();
-      return { kind: 'alpaca', mode, baseUrl: resolved.baseUrl, dataBaseUrl: resolved.dataBaseUrl };
+      return {
+        kind: 'alpaca',
+        mode,
+        baseUrl: resolved.baseUrl,
+        dataBaseUrl: resolved.dataBaseUrl,
+        instruments: {
+          options: true,
+          shortStock: true,
+          margin: true,
+          optionDataFeed: config.instruments?.optionDataFeed ?? 'indicative',
+        },
+      };
     },
   };
 

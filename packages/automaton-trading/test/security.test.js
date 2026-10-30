@@ -16,7 +16,7 @@
  *     its kill is durable across a fresh load (no resurrection) and idempotent
  *   - death is one-way: there is no markAlive/revive path anywhere (D14)
  *   - the population cap is hard in the registry, the replicator, and the running engine (D10)
- *   - each of the 14 documented brakes denies with its stable code at a minimal constructed
+ *   - each of the 18 documented brakes (v3: D1-D18) denies with its stable code at a minimal constructed
  *     context (D7 and D12/D14 are enforced at their real sites: Treasurer death verdicts,
  *     absence of a control surface, one-way registry)
  *
@@ -56,7 +56,7 @@ import { createJournal } from '../src/journal.js';
 import * as registryModule from '../src/registry.js';
 import { createReplicator, MUTABLE_FIELDS } from '../src/replicator.js';
 import { createReaper } from '../src/reaper.js';
-import { createTreasurer } from '../src/treasurer.js';
+import { createTreasurer, deriveInstrumentPermissions } from '../src/treasurer.js';
 import { createAutomaton } from '../src/orchestrator.js';
 import { ENGINE_ENTRY, createEngine } from '../src/engine.js';
 import { apply, TOOL_NAMES } from '../index.js';
@@ -664,7 +664,12 @@ describe('broker safety surface (D1): no transfers, withdrawals, crypto or accou
       false,
       'money-movement endpoints must not exist in the client source',
     );
-    assert.equal((source.match(/method:\s*'POST'/g) ?? []).length, 1, 'exactly one POST call site (submitOrder)');
+    // v3: the client may have more than one order-submission call site (single-leg and
+    // multi-leg), but every write call site must be an order endpoint.
+    const postSites = (source.match(/method:\s*'POST'/g) ?? []).length;
+    const orderPostSites = (source.match(/\/v2\/orders'\s*,\s*\{\s*method:\s*'POST'/g) ?? []).length;
+    assert.ok(postSites >= 1, 'the client must be able to submit orders');
+    assert.equal(postSites, orderPostSites, 'every POST call site must be /v2/orders');
     assert.equal((source.match(/method:\s*'DELETE'/g) ?? []).length, 1, 'exactly one DELETE call site (cancelOrder)');
     assert.match(source, /APCA-API-KEY-ID/);
     assert.match(source, /APCA-API-SECRET-KEY/);
@@ -1153,16 +1158,19 @@ describe('population cap is hard (D10)', () => {
 // H. the 14 brakes deny at their real enforcement sites with stable codes
 // ===========================================================================
 
-describe('the 14 hard brakes deny with their documented codes (D1-D14)', () => {
-  it('the catalogue is exactly the 14 documented brakes with unique ids/codes', () => {
+describe('the 18 hard brakes deny with their documented codes (D1-D18)', () => {
+  it('the catalogue is exactly the 18 documented brakes with unique ids/codes', () => {
     const harness = brakeHarness(makeEnv(), makeClock());
-    assert.equal(BRAKES.length, 14);
+    assert.equal(BRAKES.length, 18);
     assert.deepEqual(BRAKES.map((brake) => brake.id), [
-      'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D10', 'D11', 'D12', 'D13', 'D14',
+      'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9',
+      'D10', 'D11', 'D12', 'D13', 'D14', 'D15', 'D16', 'D17', 'D18',
     ]);
-    assert.equal(new Set(BRAKES.map((brake) => brake.code)).size, 14);
+    assert.equal(new Set(BRAKES.map((brake) => brake.id)).size, 18);
+    assert.ok(BRAKES.every((brake) => typeof brake.code === 'string' && brake.code.length > 0));
     const described = harness.brakes.describe();
-    assert.equal(described.length, 14);
+    assert.equal(described.length, 18);
+    assert.deepEqual(described.map((rule) => rule.id), BRAKES.map((brake) => brake.id));
     for (const rule of described) {
       assert.match(rule.id, /^D\d+$/);
       assert.ok(typeof rule.code === 'string' && rule.code.length > 0);
@@ -1181,13 +1189,34 @@ describe('the 14 hard brakes deny with their documented codes (D1-D14)', () => {
     assert.equal(malformed.brakeId, 'D1');
   });
 
-  it('D2 MARGIN_FORBIDDEN: no shorting, margin, leverage or options', () => {
+  it('D2 INSTRUMENT_FORBIDDEN: the instrument-permission gate (v3 replaced the blanket ban)', () => {
     const harness = brakeHarness(makeEnv(), makeClock());
-    assert.equal(harness.check((input) => { input.order.side = 'sell'; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(harness.check((input) => { input.order.assetClass = 'option'; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(harness.check((input) => { input.order.symbol = 'AAPL240119C00150000'; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(harness.check((input) => { input.order.margin = true; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(harness.check((input) => { input.order.leverage = true; }).code, 'MARGIN_FORBIDDEN');
+    // a legacy mandate (no instruments) still grants long stock and nothing else
+    assert.equal(harness.check((input) => { input.order.side = 'sell'; }).code, 'SHORT_FORBIDDEN');
+    assert.equal(harness.check((input) => { input.order.assetClass = 'option'; }).code, 'OPTION_FORBIDDEN');
+    // unknown asset classes are refused by the gate itself
+    const unknown = harness.check((input) => { input.order.assetClass = 'us_future'; });
+    assert.equal(unknown.code, 'INSTRUMENT_FORBIDDEN');
+    assert.equal(unknown.brakeId, 'D2');
+    // an explicitly revoked long-stock permission is refused
+    const revoked = harness.check((input) => {
+      input.mandate.instruments = {
+        longStock: false,
+        shortStock: false,
+        longOptions: false,
+        shortOptions: false,
+        coveredCalls: false,
+        spreads: false,
+        margin: false,
+        allowedStructures: [],
+        maxShortNotionalUsd: 0,
+        maxOptionPremiumUsd: 0,
+        maxContracts: 0,
+        maxMarginUsd: 0,
+      };
+    });
+    assert.equal(revoked.code, 'INSTRUMENT_FORBIDDEN');
+    assert.equal(revoked.brakeId, 'D2');
   });
 
   it('D3 MARKET_CLOSED: no trading when the clock is closed or outside the session window', () => {
@@ -1420,5 +1449,635 @@ describe('the 14 hard brakes deny with their documented codes (D1-D14)', () => {
     registry.markDead('atm-one', { cause: 'insufficient_funds', at: clock.iso(), finalEquityUsd: 0 });
     expectCode(() => registry.markDead('atm-one', { cause: 'drawdown_limit', at: clock.iso(), finalEquityUsd: 0 }), 'AGENT_DEAD');
     expectCode(() => registry.update('atm-one', { status: 'alive' }), 'AGENT_DEAD');
+  });
+});
+
+// ===========================================================================
+// I. v3 instrument wall (D15-D18) — adversarial checks
+// ===========================================================================
+
+const SECURITY_V3_INSTRUMENTS = Object.freeze({
+  enabled: true,
+  allowMargin: true,
+  maxMarginPctEquity: 1,
+  maxMarginUsd: 0,
+  allowShort: true,
+  maxShortPctEquity: 1,
+  maxShortNotionalUsd: 25,
+  shortableOnly: true,
+  allowOptions: true,
+  allowCoveredCalls: true,
+  allowSpreads: true,
+  maxOptionPremiumPctEquity: 0.25,
+  maxOptionPremiumUsd: 25,
+  maxContracts: 3,
+  minDTE: 2,
+  maxDTE: 14,
+  autoCloseDTE: 1,
+  allowNakedShortOptions: false,
+  optionDataFeed: 'indicative',
+});
+
+/** OCC symbol helper for the v3 security checks (T0-relative expiry). */
+function occFor(underlying, strikeUsd, type, days) {
+  const isoDate = new Date(T0 + days * 24 * HOUR_MS).toISOString().slice(0, 10); // YYYY-MM-DD
+  const expiry = `${isoDate.slice(2, 4)}${isoDate.slice(5, 7)}${isoDate.slice(8, 10)}`; // YYMMDD
+  return `${underlying}${expiry}${type === 'put' ? 'P' : 'C'}${String(Math.round(strikeUsd * 1000)).padStart(8, '0')}`;
+}
+
+function occExpiry(days) {
+  return new Date(T0 + days * 24 * HOUR_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * Brake harness with the v3 instrument regime enabled and a mandate granting every
+ * instrument. Tests revoke permissions/flags to prove the wall fails closed.
+ */
+function v3BrakeHarness({ instruments = {}, mandateInstruments = {}, positions = [] } = {}) {
+  const env = makeEnv({ instruments: { ...SECURITY_V3_INSTRUMENTS, ...instruments } });
+  const clock = makeClock();
+  const brakes = createBrakes({ config: env.config, paths: env.paths, clock });
+  const base = () => ({
+    mode: env.config.mode,
+    now: clock.now(),
+    agentId: 'atm-1',
+    dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+    quote: { symbol: 'AAPL', bid: 100, ask: 100.1, ts: clock.now() },
+    order: { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100.05, notionalUsd: 100.05 },
+    equityUsd: 5000,
+    positions,
+    mandate: {
+      agentId: 'atm-1',
+      issuedAt: clock.iso(),
+      expiresAt: new Date(clock.now() + 10 * 60 * 1000).toISOString(),
+      state: 'STABLE',
+      sizeBudgetUsd: 1250,
+      maxOrderNotionalUsd: 1250,
+      maxDailyOrdersRemaining: 12,
+      allowedSymbols: ['AAPL', 'MSFT', 'NVDA', 'SPY', 'QQQ'],
+      allowExitOnly: false,
+      instruments: {
+        longStock: true,
+        shortStock: true,
+        longOptions: true,
+        shortOptions: true,
+        coveredCalls: true,
+        spreads: true,
+        margin: true,
+        allowedStructures: [
+          'long_call',
+          'long_put',
+          'covered_call',
+          'call_credit_spread',
+          'put_credit_spread',
+          'bull_call_spread',
+          'bear_put_spread',
+        ],
+        maxShortNotionalUsd: 1_000_000,
+        maxOptionPremiumUsd: 1_000_000,
+        maxContracts: 10,
+        maxMarginUsd: 1_000_000,
+        ...mandateInstruments,
+      },
+    },
+    spec: {
+      specId: 'spec-1',
+      proofRef: 'https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL',
+      proof: { observedAt: new Date(clock.now() - HOUR_MS).toISOString() },
+    },
+    accountEquityUsd: 100_000,
+    allocatedEquityUsd: 10_000,
+    spreadBps: 5,
+    marginDebtUsd: 0,
+  });
+  const check = (mutate, extra = {}) => {
+    const input = { ...base(), ...extra };
+    if (typeof mutate === 'function') mutate(input);
+    return brakes.checkOrder(input);
+  };
+  return { env, clock, brakes, base, check };
+}
+
+function optionOrderInput(input, { symbol, side, type, strikeUsd, days, premium, contracts = 1, structure = null, positionIntent = null }) {
+  input.order = {
+    symbol,
+    assetClass: 'us_option',
+    side,
+    qty: contracts,
+    priceUsd: premium,
+    notionalUsd: round2(contracts * premium * 100),
+    ...(structure ? { structure } : {}),
+    ...(positionIntent ? { positionIntent } : {}),
+    option: {
+      underlying: symbol.slice(0, symbol.search(/\d/)),
+      expiration: occExpiry(days),
+      type,
+      strikeUsd,
+      multiplier: 100,
+      ...(structure ? { structure } : {}),
+    },
+  };
+}
+
+describe('v3 instrument wall (D15-D18) is adversarial-safe', () => {
+  it('D15: illegal short sales are denied; a compliant short passes', () => {
+    const shortOrder = (mutate = () => {}) => (input) => {
+      input.order = {
+        symbol: 'AAPL',
+        side: 'sell',
+        qty: 2,
+        priceUsd: 10,
+        notionalUsd: 20,
+        asset: { shortable: true, marginable: true, tradable: true },
+      };
+      input.quote = { symbol: 'AAPL', bid: 10, ask: 10.02 };
+      mutate(input);
+    };
+    assert.equal(v3BrakeHarness().check(shortOrder()).decision, 'ALLOW');
+    assert.equal(
+      v3BrakeHarness({ instruments: { allowShort: false } }).check(shortOrder()).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      v3BrakeHarness({ mandateInstruments: { shortStock: false } }).check(shortOrder()).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      v3BrakeHarness().check(shortOrder((input) => {
+        input.order.asset = { shortable: false, marginable: true };
+      })).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      v3BrakeHarness().check(shortOrder((input) => { input.order.qty = 1.5; })).code,
+      'SHORT_FORBIDDEN',
+    );
+    // 30 USD notional > config maxShortNotionalUsd 25
+    assert.equal(
+      v3BrakeHarness().check(shortOrder((input) => {
+        input.order.qty = 3;
+        input.order.notionalUsd = 30;
+      })).code,
+      'SHORT_FORBIDDEN',
+    );
+  });
+
+  it('D16: naked short options are denied even with shortOptions granted; long options pass', () => {
+    const expiryDays = 11;
+    const call = occFor('AAPL', 150, 'call', expiryDays);
+    const put = occFor('AAPL', 145, 'put', expiryDays);
+    const harness = v3BrakeHarness();
+    const longCall = harness.check((input) => {
+      optionOrderInput(input, { symbol: call, side: 'buy', type: 'call', strikeUsd: 150, days: expiryDays, premium: 0.04 });
+    });
+    assert.equal(longCall.decision, 'ALLOW', JSON.stringify(longCall));
+    assert.equal(longCall.structure, 'long_call');
+
+    for (const [symbol, type, strike] of [[call, 'call', 150], [put, 'put', 145]]) {
+      const naked = harness.check((input) => {
+        optionOrderInput(input, { symbol, side: 'sell', type, strikeUsd: strike, days: expiryDays, premium: 0.04 });
+      });
+      assert.equal(naked.decision, 'DENY');
+      assert.equal(naked.code, 'OPTION_FORBIDDEN');
+      assert.equal(naked.brakeId, 'D16');
+      assert.match(naked.reason, /covered call requires|naked short options/i);
+    }
+    // covered calls need 100 long shares
+    const uncovered = harness.check((input) => {
+      optionOrderInput(input, {
+        symbol: call,
+        side: 'sell',
+        type: 'call',
+        strikeUsd: 150,
+        days: expiryDays,
+        premium: 0.04,
+        structure: 'covered_call',
+      });
+    });
+    assert.equal(uncovered.code, 'OPTION_FORBIDDEN');
+    assert.match(uncovered.reason, /covered call requires/i);
+    const covered = v3BrakeHarness({
+      positions: [{ symbol: 'AAPL', qty: 100, marketValueUsd: 10_000, avgEntryPriceUsd: 100 }],
+    });
+    assert.equal(
+      covered.check((input) => {
+        optionOrderInput(input, {
+          symbol: call,
+          side: 'sell',
+          type: 'call',
+          strikeUsd: 150,
+          days: expiryDays,
+          premium: 0.04,
+          structure: 'covered_call',
+        });
+      }).decision,
+      'ALLOW',
+    );
+    // options disabled in config: nothing option-shaped passes
+    assert.equal(
+      v3BrakeHarness({ instruments: { allowOptions: false } }).check((input) => {
+        optionOrderInput(input, { symbol: call, side: 'buy', type: 'call', strikeUsd: 150, days: expiryDays, premium: 0.04 });
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+  });
+
+  it('D16: spreads are only allowed when they are genuinely defined risk', () => {
+    const longCall = occFor('AAPL', 150, 'call', 11);
+    const shortCall = occFor('AAPL', 155, 'call', 11);
+    const spreadOrder = (a, b, structure = 'bull_call_spread') => (input) => {
+      input.order = {
+        symbol: a,
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.12,
+        notionalUsd: 12,
+        structure,
+        legs: [{ symbol: a, side: 'buy', ratioQty: 1 }, { symbol: b, side: 'sell', ratioQty: 1 }],
+      };
+      input.quote = { symbol: a, bid: 0.11, ask: 0.13 };
+    };
+    const harness = v3BrakeHarness();
+    const allowed = harness.check(spreadOrder(longCall, shortCall));
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+    assert.equal(allowed.maxLossUsd, 500);
+    // mixed expiry
+    assert.equal(harness.check(spreadOrder(longCall, occFor('AAPL', 155, 'call', 18))).code, 'OPTION_FORBIDDEN');
+    // cross-underlying
+    assert.equal(harness.check(spreadOrder(longCall, occFor('MSFT', 155, 'call', 11))).code, 'OPTION_FORBIDDEN');
+    // both legs on the same side is not a spread
+    assert.equal(
+      harness.check((input) => {
+        input.order = {
+          symbol: longCall,
+          side: 'buy',
+          qty: 1,
+          priceUsd: 0.12,
+          notionalUsd: 12,
+          legs: [{ symbol: longCall, side: 'buy' }, { symbol: shortCall, side: 'buy' }],
+        };
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+    // spreads disabled
+    assert.equal(
+      v3BrakeHarness({ instruments: { allowSpreads: false } }).check(spreadOrder(longCall, shortCall)).code,
+      'OPTION_FORBIDDEN',
+    );
+  });
+
+  it('D17: margin over the cap or without permission is denied; within cap passes', () => {
+    const over = v3BrakeHarness({ mandateInstruments: { maxMarginUsd: 100 } }).check((input) => {
+      input.order.marginRequiredUsd = 200;
+    });
+    assert.equal(over.code, 'MARGIN_LIMIT');
+    assert.equal(over.brakeId, 'D17');
+    assert.equal(
+      v3BrakeHarness({ instruments: { allowMargin: false } }).check((input) => {
+        input.order.marginRequiredUsd = 50;
+      }).code,
+      'MARGIN_LIMIT',
+    );
+    assert.equal(
+      v3BrakeHarness({ mandateInstruments: { margin: false } }).check((input) => {
+        input.order.marginRequiredUsd = 50;
+      }).code,
+      'MARGIN_LIMIT',
+    );
+    assert.equal(
+      v3BrakeHarness({ mandateInstruments: { maxMarginUsd: 100 } }).check((input) => {
+        input.order.marginRequiredUsd = 50;
+      }).decision,
+      'ALLOW',
+    );
+  });
+
+  it('D18: opening below minDTE is denied; sell-to-close always survives', () => {
+    const shortDte = v3BrakeHarness().check((input) => {
+      optionOrderInput(input, {
+        symbol: occFor('AAPL', 150, 'call', 1),
+        side: 'buy',
+        type: 'call',
+        strikeUsd: 150,
+        days: 1,
+        premium: 0.04,
+      });
+    });
+    assert.equal(shortDte.code, 'EXPIRY_GUARD');
+    assert.equal(shortDte.brakeId, 'D18');
+
+    const expiring = occFor('AAPL', 150, 'call', 0);
+    const closing = v3BrakeHarness({
+      positions: [{ symbol: expiring, qty: 1, assetClass: 'us_option', avgPriceUsd: 0.04, marketValueUsd: 4 }],
+    });
+    const closeDecision = closing.check((input) => {
+      optionOrderInput(input, {
+        symbol: expiring,
+        side: 'sell',
+        type: 'call',
+        strikeUsd: 150,
+        days: 0,
+        premium: 0.04,
+        positionIntent: 'sell_to_close',
+      });
+    });
+    assert.equal(closeDecision.decision, 'ALLOW', JSON.stringify(closeDecision));
+  });
+
+  it('a legacy mandate cannot be used to smuggle in shorts or options', () => {
+    const legacyHarness = v3BrakeHarness();
+    const strip = (input) => {
+      delete input.mandate.instruments;
+    };
+    assert.equal(
+      legacyHarness.check((input) => {
+        strip(input);
+        input.order = {
+          symbol: 'AAPL',
+          side: 'sell',
+          qty: 3,
+          priceUsd: 10,
+          notionalUsd: 30,
+          asset: { shortable: true, marginable: true },
+        };
+      }).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      legacyHarness.check((input) => {
+        strip(input);
+        optionOrderInput(input, {
+          symbol: occFor('AAPL', 150, 'call', 11),
+          side: 'buy',
+          type: 'call',
+          strikeUsd: 150,
+          days: 11,
+          premium: 0.04,
+        });
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+  });
+});
+
+// ===========================================================================
+// J. v3 security: config guards, whitelist, ledger margin, live gate, secrets
+// ===========================================================================
+
+describe('v3 security: instrument config guards, whitelist, margin and paper/live gates', () => {
+  it('config validation rejects naked short options and unsafe instrument limits', () => {
+    const broken = (mutate) => {
+      const config = defaultConfig();
+      mutate(config.instruments);
+      return () => validateConfig(config);
+    };
+    expectCode(broken((instruments) => { instruments.allowNakedShortOptions = true; }), 'CONFIG_INVALID', 'naked short options');
+    expectCode(broken((instruments) => { instruments.maxDTE = 1; }), 'CONFIG_INVALID', 'maxDTE < minDTE');
+    expectCode(broken((instruments) => { instruments.autoCloseDTE = 5; }), 'CONFIG_INVALID', 'autoCloseDTE > minDTE');
+    expectCode(broken((instruments) => { instruments.optionDataFeed = 'bloomberg'; }), 'CONFIG_INVALID', 'unknown option feed');
+    expectCode(broken((instruments) => { instruments.maxContracts = 0; }), 'CONFIG_INVALID', 'maxContracts < 1');
+    expectCode(
+      () => loadConfig({
+        env: {},
+        configFile: path.join(os.tmpdir(), 'no-such-naked-config.json'),
+        overrides: { instruments: { allowNakedShortOptions: true } },
+      }),
+      'CONFIG_INVALID',
+      'loadConfig refuses naked short options too',
+    );
+    assert.equal(defaultConfig().mode, 'paper');
+    assert.equal(defaultConfig().instruments.allowNakedShortOptions, false);
+  });
+
+  it('option and spread symbols cannot bypass the underlying whitelist (D4)', () => {
+    const harness = v3BrakeHarness();
+    const foreignOption = harness.check((input) => {
+      optionOrderInput(input, {
+        symbol: occFor('ZZZZ', 150, 'call', 11),
+        side: 'buy',
+        type: 'call',
+        strikeUsd: 150,
+        days: 11,
+        premium: 0.04,
+      });
+    });
+    assert.equal(foreignOption.code, 'INSTRUMENT_FORBIDDEN');
+    assert.equal(foreignOption.brakeId, 'D4');
+    assert.match(foreignOption.reason, /whitelist/i);
+
+    const foreignSpread = harness.check((input) => {
+      input.quote = { symbol: 'ZZZZ', bid: 0.2, ask: 0.22 };
+      input.order = {
+        symbol: 'ZZZZ',
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.2,
+        notionalUsd: 20,
+        structure: 'bull_call_spread',
+        legs: [
+          { symbol: occFor('ZZZZ', 150, 'call', 11), side: 'buy', ratioQty: 1 },
+          { symbol: occFor('ZZZZ', 155, 'call', 11), side: 'sell', ratioQty: 1 },
+        ],
+      };
+    });
+    assert.equal(foreignSpread.code, 'INSTRUMENT_FORBIDDEN');
+    assert.equal(foreignSpread.brakeId, 'D4');
+
+    // the same contract on a whitelisted underlying passes the instrument wall
+    const allowed = harness.check((input) => {
+      optionOrderInput(input, {
+        symbol: occFor('AAPL', 150, 'call', 11),
+        side: 'buy',
+        type: 'call',
+        strikeUsd: 150,
+        days: 11,
+        premium: 0.04,
+      });
+    });
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+  });
+
+  it('margin is never created without permission or beyond the cap, and refused fills move no money', () => {
+    const noMarginEnv = makeEnv({ instruments: { allowMargin: false } });
+    const clock = makeClock();
+    const noMargin = createLedger({ paths: noMarginEnv.paths, config: noMarginEnv.config, clock });
+    noMargin.ensureAgent('atm-margin', { endowmentUsd: 5000, at: clock.iso() });
+    noMargin.grant('atm-margin', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    const before = { cashUsd: noMargin.get('atm-margin').cashUsd, totalUsd: noMargin.pool().totalUsd };
+    assert.throws(
+      () => noMargin.applyFill('atm-margin', { symbol: 'META', side: 'buy', qty: 100, priceUsd: 100, at: T0 }),
+      (error) => error.code === 'MARGIN_LIMIT' && /no margin permission/i.test(error.message),
+      'without margin permission any borrowing is refused',
+    );
+    assert.equal(noMargin.get('atm-margin').cashUsd, before.cashUsd, 'a refused margin fill must not move cash');
+    assert.deepEqual(noMargin.book('atm-margin').positions, {}, 'a refused margin fill must not open a position');
+    assert.equal(noMargin.pool().totalUsd, before.totalUsd, 'a refused fill must not create money');
+
+    const cappedEnv = makeEnv({ instruments: { allowMargin: true, maxMarginPctEquity: 0.25 } });
+    const capped = createLedger({ paths: cappedEnv.paths, config: cappedEnv.config, clock });
+    capped.ensureAgent('atm-capped', { endowmentUsd: 5000, at: clock.iso() });
+    capped.grant('atm-capped', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    // 60 shares x $100 = $6,000 -> debt $1,000 <= 25% of the $5,000 equity
+    const allowed = capped.applyFill('atm-capped', { symbol: 'META', side: 'buy', qty: 60, priceUsd: 100, at: T0 });
+    assert.ok(allowed.cashUsd < 0);
+    assert.equal(allowed.marginDebtUsd, 1000);
+    assert.equal(capped.equity('atm-capped', { META: 100 }).equityUsd, 5000);
+    const state = { cashUsd: capped.get('atm-capped').cashUsd, qty: capped.book('atm-capped').positions.META.qtySigned };
+    assert.throws(
+      () => capped.applyFill('atm-capped', { symbol: 'META', side: 'buy', qty: 10, priceUsd: 100, at: T0 }),
+      (error) => error.code === 'MARGIN_LIMIT',
+      'debt beyond maxMarginPctEquity is refused',
+    );
+    assert.equal(capped.get('atm-capped').cashUsd, state.cashUsd);
+    assert.equal(capped.book('atm-capped').positions.META.qtySigned, state.qty);
+  });
+
+  it('the live-mode gate still applies to v3 instruments (no shortcut for shorts/options)', () => {
+    const harness = v3BrakeHarness();
+    const shortOrder = (input) => {
+      input.order = {
+        symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 100, notionalUsd: 200,
+        asset: { shortable: true, marginable: true },
+      };
+    };
+    const mismatch = harness.check((input) => {
+      input.mode = 'live';
+      shortOrder(input);
+    });
+    assert.equal(mismatch.code, 'MODE_FORBIDDEN');
+    assert.equal(mismatch.brakeId, 'D8');
+    const optionMismatch = harness.check((input) => {
+      input.mode = 'live';
+      optionOrderInput(input, {
+        symbol: occFor('AAPL', 150, 'call', 11), side: 'buy', type: 'call', strikeUsd: 150, days: 11, premium: 0.04,
+      });
+    });
+    assert.equal(optionMismatch.code, 'MODE_FORBIDDEN');
+    assert.equal(optionMismatch.brakeId, 'D8');
+
+    // live config with every instrument permission but no LIVE_ARMED: still refused
+    const liveEnv = makeEnv({ mode: 'live', allowLive: true, instruments: { ...SECURITY_V3_INSTRUMENTS } });
+    const liveClock = makeClock();
+    const liveBrakes = createBrakes({ config: liveEnv.config, paths: liveEnv.paths, clock: liveClock });
+    assert.equal(liveBrakes.isLiveArmed(), false);
+    const liveInput = (mutate) => {
+      const input = {
+        ...harness.base(),
+        mode: 'live',
+        now: liveClock.now(),
+        mandate: {
+          ...harness.base().mandate,
+          issuedAt: liveClock.iso(),
+          expiresAt: new Date(liveClock.now() + 10 * 60 * 1000).toISOString(),
+        },
+      };
+      mutate(input);
+      return liveBrakes.checkOrder(input);
+    };
+    const liveShort = liveInput(shortOrder);
+    assert.equal(liveShort.code, 'LIVE_NOT_ARMED');
+    assert.equal(liveShort.brakeId, 'D8');
+    const liveOption = liveInput((input) => {
+      optionOrderInput(input, {
+        symbol: occFor('AAPL', 150, 'call', 11), side: 'buy', type: 'call', strikeUsd: 150, days: 11, premium: 0.04,
+      });
+    });
+    assert.equal(liveOption.code, 'LIVE_NOT_ARMED');
+  });
+
+  it('ledger invariants hold after margin/short/option fills: equity = cash + signed marks, no money creation', () => {
+    const env = makeEnv({ instruments: { allowMargin: true, maxMarginPctEquity: 0.5 } });
+    const clock = makeClock();
+    const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+    ledger.ensureAgent('atm-inv', { endowmentUsd: 5000, at: clock.iso() });
+    ledger.grant('atm-inv', 5000, { reason: 'genesis-endowment', at: clock.iso() });
+    const startEquity = ledger.equity('atm-inv', {}).equityUsd;
+    assert.equal(startEquity, 5000);
+    const check = (prices, label) => {
+      const snapshot = ledger.snapshot('atm-inv');
+      const view = ledger.equity('atm-inv', prices);
+      let signedMarks = 0;
+      for (const position of snapshot.positionsList) {
+        const mark = Number(prices[position.symbol] ?? position.lastPriceUsd ?? position.avgPriceUsd) || 0;
+        signedMarks += position.qtySigned * mark * (position.multiplier || 1);
+      }
+      assert.equal(view.positionsValueUsd, round2(signedMarks), `${label}: positionsValue must be the sum of signed marks`);
+      assert.equal(view.equityUsd, round2(view.cashUsd + view.positionsValueUsd), `${label}: equity = cash + signed marks`);
+      assert.ok(view.cashUsd >= 0 || view.marginDebtUsd > 0, `${label}: negative cash is only margin debt`);
+      return { snapshot, view };
+    };
+
+    // short stock at its mark: converts cash into a negative mark without changing equity
+    const short = ledger.applyFill('atm-inv', { symbol: 'META', side: 'sell', qty: 10, priceUsd: 100, at: T0 });
+    assert.ok(short.cashUsd > 5000);
+    assert.equal(check({ META: 100 }, 'short stock').view.equityUsd, 5000);
+    // long option at its mark (premium x 100): debit premium, same mark -> equity unchanged
+    const occ = 'META260117C00030000';
+    ledger.applyFill('atm-inv', {
+      symbol: occ, assetClass: 'us_option', side: 'buy', qty: 1, priceUsd: 1.5,
+      option: { underlying: 'META', expiration: '2026-01-17', type: 'call', strikeUsd: 30, multiplier: 100 },
+      at: T0,
+    });
+    assert.equal(check({ META: 100, [occ]: 1.5 }, 'long option').view.equityUsd, 5000);
+    // margin stock buy at its mark: negative cash balances the larger signed mark
+    const marginBuy = ledger.applyFill('atm-inv', { symbol: 'META', side: 'buy', qty: 60, priceUsd: 100, at: T0 });
+    assert.ok(marginBuy.cashUsd < 0);
+    assert.equal(marginBuy.marginDebtUsd, round2(-marginBuy.cashUsd));
+    assert.equal(check({ META: 100, [occ]: 1.5 }, 'margin buy').view.equityUsd, 5000);
+    // closing everything at the same marks returns exactly the starting equity (no money creation)
+    ledger.applyFill('atm-inv', { symbol: 'META', side: 'sell', qty: 50, priceUsd: 100, at: T0 });
+    ledger.applyFill('atm-inv', {
+      symbol: occ, assetClass: 'us_option', side: 'sell', qty: 1, priceUsd: 1.5,
+      option: { underlying: 'META', expiration: '2026-01-17', type: 'call', strikeUsd: 30, multiplier: 100 },
+      at: T0,
+    });
+    const final = check({ META: 100, [occ]: 1.5 }, 'round trip at the same marks');
+    assert.deepEqual(final.snapshot.positionsList, []);
+    assert.equal(final.view.cashUsd, 5000);
+    assert.equal(final.snapshot.realizedPlUsd, 0);
+    const pool = ledger.pool();
+    assert.equal(pool.totalUsd, 5000, 'the virtual economy neither created nor destroyed money');
+  });
+
+  it('v3 broker additions expose no money movement and the status instruments stay secret-free', async () => {
+    const paperEnv = makeEnv({ mode: 'paper' });
+    const alpaca = createAlpacaBroker(paperEnv.config, {
+      secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' },
+      fetchImpl: stubFetch(defaultFetchHandler),
+    });
+    const simEnv = makeEnv({ mode: 'sim' });
+    const sim = createSimBroker(simEnv.config, { seed: 7, accountEquityUsd: 100000 });
+    for (const [label, broker] of [['alpaca', alpaca], ['sim', sim]]) {
+      assertNoForbiddenBrokerMethods(broker, label);
+      for (const method of ['getAsset', 'getOptionChain', 'getOptionQuote']) {
+        assert.equal(typeof broker[method], 'function', `${label}.${method}() must exist`);
+      }
+    }
+
+    const keyId = 'AKIA-V3-STATUS-KEY';
+    const token = 'v3-status-secret-token';
+    const engine = createLeakyFakeEngine({ keyId, secretKey: 'v3-status-secret-value', token });
+    const originalStatus = engine.status.bind(engine);
+    engine.status = async () => {
+      const status = await originalStatus();
+      status.engine.instruments = {
+        enabled: true,
+        caps: { minDTE: 2, maxDTE: 14, maxContracts: 3 },
+        account: { shortingEnabled: true, optionsTradingLevel: 3, apiKeyId: keyId, token },
+      };
+      return status;
+    };
+    const fake = applyPlugin(engine);
+    const toolResult = await fake.tools.get('automaton_status').execute({}, {});
+    const toolText = JSON.stringify(toolResult);
+    for (const secret of [keyId, 'v3-status-secret-value', token]) {
+      assert.equal(toolText.includes(secret), false, `automaton_status leaked ${secret}`);
+    }
+    const res = fakeResponse();
+    await fake.routes[0].handler(fakeRequest('GET'), res);
+    assert.equal(res.statusCode, 200);
+    for (const secret of [keyId, 'v3-status-secret-value', token]) {
+      assert.equal(res.body.includes(secret), false, `/automaton/state leaked ${secret}`);
+    }
   });
 });

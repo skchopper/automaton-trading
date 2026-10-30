@@ -151,7 +151,7 @@ export function explainAgentPlan({ agent, spec = null, book = null, prices = {},
     `${agent.name ?? agent.id} is a ${familyLabel.toLowerCase()} bot${rules.symbol ? ` trading ${rules.symbol}` : ''}.`,
     `Genome: ${agent?.genome?.family ?? rules.family}/${agent?.genome?.symbol ?? rules.symbol ?? 'n/a'}`,
     spec ? `; compiled spec: ${rules.family}/${rules.symbol} (lookback ${rules.lookback}, entryZ ${round(rules.entryZ, 2)}, exitZ ${round(rules.exitZ, 2)}, stop ${pct(rules.stopPct)}, target ${pct(rules.targetPct)}).` : '.',
-    ` Position size ≈ ${pct(rules.sizePct)} of its mandate budget, inside the hard caps and the 14-brake wall.`,
+    ` Position size ≈ ${pct(rules.sizePct)} of its mandate budget, inside the hard caps and the 18-brake wall.`,
     researchNote,
   ].join(' ');
 
@@ -163,7 +163,7 @@ export function explainAgentPlan({ agent, spec = null, book = null, prices = {},
     summary,
     entryRule: describeEntry(rules.family, rules.symbol, rules),
     exitRules: describeExits(rules.family, rules),
-    riskRule: `Size ≈ ${pct(rules.sizePct)} of mandate; stop loss ${pct(rules.stopPct)} below entry; max order/position/daily caps and the session window (${rules.sessionFilter}) apply; every order passes the 14 hard brakes; deaths at the $1 floor or 20% drawdown.`,
+    riskRule: `Size ≈ ${pct(rules.sizePct)} of mandate; stop loss ${pct(rules.stopPct)} below entry; max order/position/daily caps and the session window (${rules.sessionFilter}) apply; every order passes the 18 hard brakes (D1–D18, incl. instrument gates); deaths at the $1 floor or 20% drawdown.`,
     nextStep,
     triggers: {
       family: rules.family,

@@ -207,6 +207,54 @@ window.__ModuleLoader__.load({
       watchlist: 'Watch',
       thesis: 'Thesis',
       reviewInterval: 'Review interval',
+      instruments: 'Instruments',
+      instrumentsOff: 'multi-instrument paper disabled',
+      instrumentsUnavailable: 'instrument status not reported yet',
+      badgeStock: 'Stk',
+      badgeShort: 'Short',
+      badgeOptions: 'Opt',
+      badgeSpreads: 'Spreads',
+      badgeMargin: 'Margin',
+      optionsLevel: 'Options',
+      shortEnabled: 'Short',
+      marginEnabled: 'Margin',
+      caps: 'caps',
+      capOptionsPct: 'options ≤',
+      capShortPct: 'short ≤',
+      dteRange: 'DTE',
+      optionsBP: 'Options BP',
+      buyingPower: 'Buying power',
+      marginDebt: 'Margin debt',
+      grossExposure: 'Gross exposure',
+      netExposure: 'Net exposure',
+      instrumentPlaybook: 'Instrument playbook',
+      playbookFamily: 'Family',
+      playbookBullish: 'Bullish',
+      playbookBearish: 'Bearish',
+      playbookNeutral: 'Neutral',
+      playbookStructures: 'Structures',
+      playbookEmpty: 'no instrument playbook for this strategy yet',
+      instrumentPlan: 'Instrument plan',
+      prefer: 'Prefer',
+      maxPremium: 'Max premium',
+      maxContracts: 'Max contracts',
+      dteWindow: 'DTE window',
+      autoSelect: 'Auto',
+      permissions: 'Permissions',
+      allowedStructures: 'Allowed structures',
+      instrumentsEmpty: 'no instrument permissions yet',
+      sideLabel: 'Side',
+      contracts: 'Contracts',
+      strike: 'Strike',
+      expiry: 'Expiry',
+      dte: 'DTE',
+      group: 'Group',
+      spreadGroup: 'Spread group',
+      positionTotals: 'Totals',
+      longPos: 'LONG',
+      shortPos: 'SHORT',
+      callPos: 'CALL',
+      putPos: 'PUT',
       mode: 'Mode',
       loop: 'Loop',
       account: 'Account equity',
@@ -478,6 +526,54 @@ window.__ModuleLoader__.load({
       watchlist: '关注',
       thesis: '观点',
       reviewInterval: '复盘间隔',
+      instruments: '交易品种',
+      instrumentsOff: '多品种纸面交易已关闭',
+      instrumentsUnavailable: '暂无交易品种状态',
+      badgeStock: '股票',
+      badgeShort: '做空',
+      badgeOptions: '期权',
+      badgeSpreads: '价差',
+      badgeMargin: '保证金',
+      optionsLevel: '期权',
+      shortEnabled: '做空',
+      marginEnabled: '保证金',
+      caps: '上限',
+      capOptionsPct: '期权 ≤',
+      capShortPct: '做空 ≤',
+      dteRange: 'DTE',
+      optionsBP: '期权购买力',
+      buyingPower: '购买力',
+      marginDebt: '保证金负债',
+      grossExposure: '总敞口',
+      netExposure: '净敞口',
+      instrumentPlaybook: '品种策略',
+      playbookFamily: '族',
+      playbookBullish: '看涨',
+      playbookBearish: '看跌',
+      playbookNeutral: '中性',
+      playbookStructures: '结构',
+      playbookEmpty: '该策略暂无品种策略',
+      instrumentPlan: '品种计划',
+      prefer: '偏好',
+      maxPremium: '最大权利金',
+      maxContracts: '最大合约数',
+      dteWindow: 'DTE 窗口',
+      autoSelect: '自动',
+      permissions: '权限',
+      allowedStructures: '允许结构',
+      instrumentsEmpty: '暂无品种权限',
+      sideLabel: '方向',
+      contracts: '合约数',
+      strike: '行权价',
+      expiry: '到期日',
+      dte: 'DTE',
+      group: '组',
+      spreadGroup: '价差组',
+      positionTotals: '合计',
+      longPos: '多头',
+      shortPos: '空头',
+      callPos: '看涨',
+      putPos: '看跌',
       mode: '模式',
       loop: '循环',
       account: '账户权益',
@@ -1435,6 +1531,7 @@ window.__ModuleLoader__.load({
         stale: raw.stale === true,
         reviewCount: toNumber(raw.reviewCount),
         nextReviewAt: raw.nextReviewAt ?? null,
+        instrument: instrumentPolicyMapping(raw.instrument),
       };
     }
 
@@ -1492,6 +1589,367 @@ window.__ModuleLoader__.load({
       return list.filter((row) => row?.strategy?.category === category);
     }
 
+    // -----------------------------------------------------------------------
+    // multi-instrument mapping (v3.0: margin / short selling / options)
+    // -----------------------------------------------------------------------
+
+    /** Human labels for the v1 option structures (unknown keys are rendered raw). */
+    const INSTRUMENT_STRUCTURE_LABELS = Object.freeze({
+      long_stock: 'Long stock',
+      short_stock: 'Short stock',
+      long_call: 'Long call',
+      long_put: 'Long put',
+      covered_call: 'Covered call',
+      call_credit_spread: 'Call credit spread',
+      put_credit_spread: 'Put credit spread',
+      bull_call_spread: 'Bull call spread',
+      bear_put_spread: 'Bear put spread',
+      hold: 'Hold',
+      auto: 'Auto',
+    });
+
+    function instrumentStructureLabel(key) {
+      const text = String(key ?? '');
+      if (text === '') return '—';
+      return INSTRUMENT_STRUCTURE_LABELS[text] ?? text;
+    }
+
+    /** Normalize a structure field (string | string[] | {key}[] | {structure:true}) to [{key,label}]. */
+    function structureList(value) {
+      const out = [];
+      const push = (item) => {
+        if (item === null || item === undefined || item === '') return;
+        const key = typeof item === 'string'
+          ? item
+          : typeof item?.key === 'string'
+            ? item.key
+            : typeof item?.structure === 'string'
+              ? item.structure
+              : typeof item?.name === 'string'
+                ? item.name
+                : null;
+        if (!key || out.some((entry) => entry.key === key)) return;
+        out.push({ key, label: instrumentStructureLabel(key) });
+      };
+      if (Array.isArray(value)) value.forEach(push);
+      else if (typeof value === 'string') push(value);
+      else if (value && typeof value === 'object') {
+        for (const [key, flag] of Object.entries(value)) if (flag === true) push(key);
+        if (Array.isArray(value.structures)) value.structures.forEach(push);
+        push(value.structure);
+      }
+      return out;
+    }
+
+    /** Per-agent instrument permissions (`instrumentPermissions` or `instruments`). */
+    function instrumentPermissionsMapping(permissions) {
+      const raw = plainObject(permissions);
+      if (Object.keys(raw).length === 0) {
+        return {
+          available: false,
+          longStock: null,
+          shortStock: null,
+          longOptions: null,
+          shortOptions: null,
+          coveredCalls: null,
+          spreads: null,
+          margin: null,
+          allowedStructures: [],
+          badges: [],
+          tooltip: '',
+        };
+      }
+      const structures = structureList(raw.allowedStructures);
+      const flag = (name) => (raw[name] === true ? true : raw[name] === false ? false : null);
+      const flags = {
+        longStock: flag('longStock'),
+        shortStock: flag('shortStock'),
+        longOptions: flag('longOptions'),
+        shortOptions: flag('shortOptions'),
+        coveredCalls: flag('coveredCalls'),
+        spreads: flag('spreads'),
+        margin: flag('margin'),
+      };
+      if (structures.length > 0) {
+        const has = (pattern) => structures.some((structure) => pattern.test(structure.key));
+        const derived = {
+          longStock: has(/long_stock/),
+          shortStock: has(/short_stock/),
+          longOptions: has(/long_call|long_put/),
+          shortOptions: has(/covered_call|credit_spread/),
+          coveredCalls: has(/covered_call/),
+          spreads: has(/spread/),
+          margin: flags.margin,
+        };
+        for (const key of Object.keys(flags)) {
+          if (flags[key] === null && derived[key] !== null) flags[key] = derived[key];
+        }
+      }
+      const badges = [];
+      if (flags.longStock !== false) badges.push({ key: 'stock', labelKey: 'badgeStock', label: 'Stk' });
+      if (flags.shortStock === true) badges.push({ key: 'short', labelKey: 'badgeShort', label: 'Short' });
+      if (flags.longOptions === true || flags.coveredCalls === true || flags.spreads === true) {
+        badges.push({ key: 'options', labelKey: 'badgeOptions', label: 'Opt' });
+      }
+      if (flags.spreads === true) badges.push({ key: 'spreads', labelKey: 'badgeSpreads', label: 'Spreads' });
+      if (flags.margin === true) badges.push({ key: 'margin', labelKey: 'badgeMargin', label: 'Margin' });
+      return {
+        available: true,
+        ...flags,
+        allowedStructures: structures,
+        badges,
+        tooltip: structures.map((structure) => structure.label).join(' · '),
+      };
+    }
+
+    /** Compact instruments badge projection for the agent table (accepts permissions or an agent). */
+    function instrumentBadges(source) {
+      const candidate = plainObject(source);
+      const looksLikeAgent = Boolean(
+        candidate.id !== undefined
+        || candidate.name !== undefined
+        || candidate.genome !== undefined
+        || candidate.strategy !== undefined
+        || candidate.status !== undefined,
+      );
+      const permissionsSource = Object.keys(plainObject(candidate.instrumentPermissions)).length > 0
+        ? candidate.instrumentPermissions
+        : Object.keys(plainObject(candidate.instruments)).length > 0
+          ? candidate.instruments
+          : looksLikeAgent
+            ? {}
+            : candidate;
+      const permissions = instrumentPermissionsMapping(permissionsSource);
+      const playbook = playbookMapping(candidate.playbook);
+      const playbookHint = playbook.available
+        ? structureList(playbook.bullish).map((structure) => `↑ ${structure.label}`).join(', ')
+        : null;
+      return {
+        available: permissions.available,
+        badges: permissions.badges,
+        tooltip: permissions.tooltip,
+        allowedStructures: permissions.allowedStructures,
+        permissions,
+        playbookHint,
+      };
+    }
+
+    /** Underlying ticker parsed from an OCC option symbol (or null). */
+    function occUnderlying(symbol) {
+      const match = /^([A-Z]{1,6})\d{6}[CP]\d{8}$/.exec(String(symbol ?? ''));
+      return match ? match[1] : null;
+    }
+
+    /** Normalize position rows: long/short stock and CALL/PUT options with DTE + group tags. */
+    function positionRows(positions) {
+      const list = Array.isArray(positions) ? positions : [];
+      return list.filter((position) => position && typeof position === 'object').map((position, index) => {
+        const option = plainObject(position.option);
+        const assetClass = typeof position.assetClass === 'string'
+          ? position.assetClass
+          : Object.keys(option).length > 0
+            ? 'us_option'
+            : 'us_equity';
+        const isOption = assetClass === 'us_option';
+        const qtySigned = toNumber(position.qtySigned) ?? toNumber(position.qty) ?? toNumber(position.qtyText);
+        const avgPrice = toNumber(position.avgPriceUsd) ?? toNumber(position.avgEntryPriceUsd);
+        const lastPrice = toNumber(position.lastPriceUsd) ?? toNumber(position.markPriceUsd);
+        const multiplier = toNumber(position.multiplier) ?? toNumber(option.multiplier) ?? (isOption ? 100 : 1);
+        const sideRaw = String(position.side ?? '').toUpperCase();
+        let side;
+        if (isOption) {
+          const type = String(option.type ?? sideRaw).toUpperCase();
+          side = type === 'CALL' || type === 'PUT' ? type : (qtySigned !== null && qtySigned < 0 ? 'SHORT' : 'LONG');
+        } else {
+          side = sideRaw === 'SHORT' || (qtySigned !== null && qtySigned < 0) ? 'SHORT' : 'LONG';
+        }
+        const contracts = isOption && qtySigned !== null ? Math.abs(qtySigned) : null;
+        const marketValue = toNumber(position.marketValueUsd)
+          ?? (qtySigned !== null && lastPrice !== null ? round2(qtySigned * lastPrice * multiplier) : null);
+        const unrealized = toNumber(position.unrealizedPlUsd)
+          ?? (qtySigned !== null && avgPrice !== null && lastPrice !== null ? round2((lastPrice - avgPrice) * qtySigned * multiplier) : null);
+        const expiration = option.expiration ?? position.expiration ?? null;
+        const dte = toNumber(option.dte) ?? toNumber(position.dte);
+        const strikeUsd = toNumber(option.strikeUsd) ?? toNumber(position.strikeUsd);
+        const groupId = position.groupId ?? option.groupId ?? null;
+        const underlying = option.underlying ?? position.underlying ?? (isOption ? occUnderlying(position.symbol) : null);
+        return {
+          key: `${position.symbol ?? 'position'}-${index}`,
+          symbol: position.symbol ?? '—',
+          assetClass,
+          isOption,
+          isStock: !isOption,
+          isShort: side === 'SHORT' || ((side === 'CALL' || side === 'PUT') && qtySigned !== null && qtySigned < 0),
+          side,
+          typeLabel: isOption ? side : side === 'SHORT' ? 'SHORT' : 'LONG',
+          qtySigned,
+          qtyText: isOption ? `${fmtNum(contracts ?? 0)} ct` : fmtQty(qtySigned),
+          contracts,
+          avgPriceUsd: avgPrice,
+          lastPriceUsd: lastPrice,
+          marketValueUsd: marketValue,
+          unrealizedPlUsd: unrealized,
+          multiplier,
+          openedAt: position.openedAt ?? null,
+          option: isOption
+            ? {
+              underlying,
+              strikeUsd,
+              expiration,
+              dte,
+              type: side === 'CALL' || side === 'PUT' ? side : (option.type ?? null),
+              expiryLabel: typeof expiration === 'string' ? expiration.slice(0, 10) : null,
+              dteLabel: dte === null ? null : `${dte}d`,
+              multiplier,
+            }
+            : null,
+          groupId,
+          groupShort: groupId ? shortId(groupId) : null,
+          structure: position.structure ?? option.structure ?? null,
+        };
+      });
+    }
+
+    /** Aggregate a set of normalized position rows (counts + exposure). */
+    function positionSummary(rows, agent) {
+      const list = Array.isArray(rows) ? rows : [];
+      const safeAgent = plainObject(agent);
+      const groups = new Set();
+      const summary = {
+        count: list.length,
+        stock: { long: 0, short: 0 },
+        options: { calls: 0, puts: 0, long: 0, short: 0 },
+        spreadGroups: 0,
+        grossExposureUsd: 0,
+        netExposureUsd: 0,
+        marginDebtUsd: toNumber(safeAgent.marginDebtUsd),
+        hasExposure: false,
+      };
+      for (const row of list) {
+        if (row.isOption) {
+          if (row.side === 'CALL') summary.options.calls += 1;
+          if (row.side === 'PUT') summary.options.puts += 1;
+          if (row.isShort) summary.options.short += 1;
+          else summary.options.long += 1;
+        } else if (row.isShort) summary.stock.short += 1;
+        else summary.stock.long += 1;
+        if (row.groupId) groups.add(String(row.groupId));
+        if (row.marketValueUsd !== null) {
+          summary.hasExposure = true;
+          summary.grossExposureUsd += Math.abs(row.marketValueUsd);
+          summary.netExposureUsd += row.marketValueUsd;
+        }
+      }
+      summary.spreadGroups = groups.size;
+      summary.grossExposureUsd = toNumber(safeAgent.grossExposureUsd) ?? round2(summary.grossExposureUsd);
+      summary.netExposureUsd = toNumber(safeAgent.netExposureUsd) ?? round2(summary.netExposureUsd);
+      return summary;
+    }
+
+    /** Family strategy instrument playbook (`agent.playbook` / status.instruments.playbooks). */
+    function playbookMapping(playbook) {
+      const raw = plainObject(playbook);
+      const bullish = structureList(raw.bullish);
+      const bearish = structureList(raw.bearish);
+      const neutral = structureList(raw.neutral);
+      const structures = structureList(raw.structures);
+      const family = typeof raw.family === 'string' ? raw.family : (structures.length > 0 ? null : null);
+      const hasContent = bullish.length + bearish.length + neutral.length + structures.length > 0;
+      return {
+        available: Object.keys(raw).length > 0 && hasContent,
+        family,
+        familyLabel: family ? familyLabel(family) : null,
+        bullish,
+        bearish,
+        neutral,
+        structures,
+        tier: typeof raw.tier === 'string' ? raw.tier : null,
+        hasContent,
+      };
+    }
+
+    /** Bot-agent policy instrument plan (`policy.instrument`). */
+    function instrumentPolicyMapping(instrument) {
+      const raw = plainObject(instrument);
+      if (Object.keys(raw).length === 0) return null;
+      const prefer = typeof raw.prefer === 'string' ? raw.prefer : null;
+      const maxPremiumUsd = toNumber(raw.maxPremiumUsd);
+      const maxContracts = toNumber(raw.maxContracts);
+      const dteMin = toNumber(raw.dteMin);
+      const dteMax = toNumber(raw.dteMax);
+      return {
+        available: true,
+        prefer,
+        preferLabel: prefer ? instrumentStructureLabel(prefer) : null,
+        maxPremiumUsd,
+        maxContracts,
+        dteMin,
+        dteMax,
+        hasCaps: maxPremiumUsd !== null || maxContracts !== null || dteMin !== null || dteMax !== null,
+        auto: prefer === null || prefer === 'auto',
+      };
+    }
+
+    /** Engine-header instruments projection (`status.instruments` + account exposure fields). */
+    function instrumentsHeader(instruments, account) {
+      const raw = plainObject(instruments);
+      const nestedAccount = plainObject(raw.account);
+      const accountRaw = { ...nestedAccount, ...plainObject(account) };
+      const accountFields = {
+        buyingPowerUsd: toNumber(accountRaw.buyingPowerUsd),
+        optionsBuyingPowerUsd: toNumber(accountRaw.optionsBuyingPowerUsd),
+        marginMultiplier: toNumber(accountRaw.marginMultiplier),
+        shortingEnabled: accountRaw.shortingEnabled === true ? true : accountRaw.shortingEnabled === false ? false : null,
+        optionsTradingLevel: toNumber(accountRaw.optionsTradingLevel),
+        marginDebtUsd: toNumber(accountRaw.marginDebtUsd),
+        grossExposureUsd: toNumber(accountRaw.grossExposureUsd),
+        netExposureUsd: toNumber(accountRaw.netExposureUsd),
+      };
+      const hasAccount = Object.values(accountFields).some((value) => value !== null);
+      if (Object.keys(raw).length === 0 && !hasAccount) {
+        return {
+          available: false,
+          enabled: null,
+          allowMargin: null,
+          allowShort: null,
+          allowOptions: null,
+          allowCoveredCalls: null,
+          allowSpreads: null,
+          caps: { maxOptionPremiumPctEquity: null, maxShortPctEquity: null, maxMarginPctEquity: null, maxContracts: null, minDTE: null, maxDTE: null, autoCloseDTE: null },
+          optionDataFeed: null,
+          account: accountFields,
+          hasAccount: false,
+          playbookCount: 0,
+          playbooks: {},
+        };
+      }
+      const booleanOrNull = (value) => (value === true ? true : value === false ? false : null);
+      const playbooks = plainObject(raw.playbooks);
+      return {
+        available: true,
+        enabled: booleanOrNull(raw.enabled),
+        allowMargin: booleanOrNull(raw.allowMargin),
+        allowShort: booleanOrNull(raw.allowShort),
+        allowOptions: booleanOrNull(raw.allowOptions),
+        allowCoveredCalls: booleanOrNull(raw.allowCoveredCalls),
+        allowSpreads: booleanOrNull(raw.allowSpreads),
+        caps: {
+          maxOptionPremiumPctEquity: toNumber(raw.maxOptionPremiumPctEquity),
+          maxShortPctEquity: toNumber(raw.maxShortPctEquity),
+          maxMarginPctEquity: toNumber(raw.maxMarginPctEquity),
+          maxContracts: toNumber(raw.maxContracts),
+          minDTE: toNumber(raw.minDTE),
+          maxDTE: toNumber(raw.maxDTE),
+          autoCloseDTE: toNumber(raw.autoCloseDTE),
+        },
+        optionDataFeed: typeof raw.optionDataFeed === 'string' ? raw.optionDataFeed : null,
+        account: accountFields,
+        hasAccount,
+        playbookCount: Object.keys(playbooks).length,
+        playbooks,
+      };
+    }
+
 
     /**
      * Turn one status payload into table/detail rows. Pure: no DOM, no fetch, no mutation
@@ -1521,6 +1979,12 @@ window.__ModuleLoader__.load({
           : toNumber(safeAgent.netPlUsd);
         const pnlPct = pnlUsd !== null && endowment !== null && endowment > 0 ? (pnlUsd / endowment) * 100 : null;
         const positions = buildHoldingsRows(safeAgent.positions);
+        const instrumentPositions = positionRows(safeAgent.positions);
+        const exposure = positionSummary(instrumentPositions, safeAgent);
+        const instrumentPermissions = instrumentPermissionsMapping(safeAgent.instrumentPermissions ?? safeAgent.instruments);
+        const instrumentBadgeInfo = instrumentBadges(safeAgent);
+        const playbook = playbookMapping(safeAgent.playbook);
+        const instrumentPolicy = instrumentPolicyMapping(plainObject(safeAgent.policy).instrument);
         const activity = buildActivityRows(safeAgent.recentTrades);
         const roleCosts = roleCostRows(safeAgent.roleCosts);
         const roleCostsTotal = round2(roleCosts.reduce((total, entry) => total + entry.amountUsd, 0));
@@ -1580,7 +2044,17 @@ window.__ModuleLoader__.load({
           runwayHours: toNumber(safeAgent.runwayHours),
           treasuryState: safeAgent.treasuryState ?? null,
           positions,
+          positionRows: instrumentPositions,
           positionCount: positions.length,
+          positionSummary: exposure,
+          grossExposureUsd: exposure.grossExposureUsd,
+          netExposureUsd: exposure.netExposureUsd,
+          marginDebtUsd: exposure.marginDebtUsd,
+          instrumentPermissions,
+          instrumentBadges: instrumentBadgeInfo.badges,
+          instrumentTooltip: instrumentBadgeInfo.tooltip || instrumentBadgeInfo.playbookHint || '',
+          playbook,
+          instrumentPolicy,
           activity,
           tradesCount: toNumber(safeAgent.tradesCount) ?? activity.length,
           research,
@@ -1665,6 +2139,7 @@ window.__ModuleLoader__.load({
         rankings: status?.rankings ?? null,
         strategyMix: status?.strategyMix ?? null,
         engineAgents: botAgentEngineStatus(engine.agents ?? status?.engine?.agents),
+        instruments: instrumentsHeader(status?.instruments, status?.account ?? status?.instruments?.account ?? null),
         control: status?.control ?? null,
       };
     }
@@ -2042,6 +2517,26 @@ window.__ModuleLoader__.load({
 .atm-research-list li{margin:0}
 .atm-source-link{color:var(--dsw-alias-state-business-primary,inherit);text-decoration:underline;overflow-wrap:anywhere}
 .atm-research-summary{margin:0;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit);overflow-wrap:anywhere}
+.atm-instr-badges{display:inline-flex;gap:3px;flex-wrap:nowrap;align-items:baseline}
+.atm-instr-badge{display:inline-flex;align-items:baseline;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:999px;padding:0 5px;font-size:9.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-instr-badge[data-kind="short"],.atm-instr-badge[data-kind="margin"]{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-primary,inherit));border-color:currentColor}
+.atm-instr-badge[data-kind="options"],.atm-instr-badge[data-kind="spreads"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-instr-empty{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-side-chip{display:inline-flex;align-items:center;border-radius:4px;padding:0 5px;font-size:10px;line-height:16px;font-weight:600;letter-spacing:.02em;border:.5px solid var(--dsw-alias-border-l2,currentColor);color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-side-chip[data-side="LONG"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-side-chip[data-side="SHORT"],.atm-side-chip[data-side="PUT"]{color:var(--dsw-alias-state-error-primary,inherit);border-color:currentColor}
+.atm-side-chip[data-side="CALL"]{color:var(--dsw-alias-state-business-primary,inherit);border-color:currentColor}
+.atm-option-meta{display:flex;flex-direction:column;gap:1px;font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;font-variant-numeric:tabular-nums}
+.atm-option-meta b{color:var(--dsw-alias-label-primary,inherit);font-weight:600}
+.atm-group-tag{display:inline-flex;align-items:center;border:.5px dashed var(--dsw-alias-border-l2,currentColor);border-radius:4px;padding:0 4px;font-size:9.5px;line-height:14px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}
+.atm-exposure-line{display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
+.atm-exposure-line b{color:var(--dsw-alias-label-primary,inherit);font-weight:600;font-variant-numeric:tabular-nums}
+.atm-playbook-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}
+.atm-playbook-card{display:flex;flex-direction:column;gap:3px;min-width:0;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-radius:8px;padding:6px 8px}
+.atm-playbook-card[data-side="bullish"]{border-left:3px solid var(--dsw-alias-state-business-primary,currentColor)}
+.atm-playbook-card[data-side="bearish"]{border-left:3px solid var(--dsw-alias-state-error-primary,currentColor)}
+.atm-playbook-card[data-side="neutral"]{border-left:3px solid var(--dsw-alias-label-tertiary,currentColor)}
+.atm-cap-list{display:flex;gap:6px;flex-wrap:wrap;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary,inherit)}
 .atm-type-chip{display:inline-flex;align-items:baseline;gap:3px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:.5px solid var(--dsw-alias-border-l2,currentColor);border-left-width:3px;border-radius:999px;padding:0 7px;font-size:10.5px;line-height:17px;color:var(--dsw-alias-label-primary,inherit)}
 .atm-type-chip[data-category="swing"]{border-left-color:var(--dsw-alias-state-business-primary,currentColor)}
 .atm-type-chip[data-category="day"]{border-left-color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-tertiary,currentColor))}
@@ -2799,6 +3294,79 @@ window.__ModuleLoader__.load({
       return h('p', { className: 'atm-bridge-line' }, parts);
     }
 
+    /** Compact instruments badges (table row + detail header). */
+    function InstrumentBadgeList({ t, badges, tooltip, emptyLabel }) {
+      const list = Array.isArray(badges) ? badges : [];
+      if (list.length === 0) {
+        return h('span', { className: 'atm-instr-empty', title: tooltip ?? '' }, emptyLabel ?? t('instrumentsEmpty'));
+      }
+      const titles = tooltip && tooltip.length > 0 ? [t('allowedStructures'), tooltip] : [t('instruments')];
+      return h('span', { className: 'atm-instr-badges', title: titles.join(' — ') }, list.map((badge) => h('span', {
+        key: badge.key,
+        className: 'atm-instr-badge',
+        'data-kind': badge.key,
+      }, t(badge.labelKey) ?? badge.label)));
+    }
+
+    /** Engine-header instruments / exposure line (`status.instruments` + account fields). */
+    function InstrumentsLine({ t, instruments }) {
+      if (!instruments || instruments.available !== true) {
+        return h('p', { className: 'atm-bridge-line' }, t('instrumentsUnavailable'));
+      }
+      if (instruments.enabled === false) {
+        return h('p', { className: 'atm-bridge-line' }, [h('b', { key: 'title' }, t('instruments')), h('span', { key: 'off' }, t('instrumentsOff'))]);
+      }
+      const caps = instruments.caps ?? {};
+      const parts = [h('b', { key: 'title' }, t('instruments'))];
+      if (instruments.account.optionsTradingLevel !== null) parts.push(h('span', { key: 'level' }, `${t('optionsLevel')} L${fmtNum(instruments.account.optionsTradingLevel)}`));
+      if (instruments.allowShort === true) parts.push(h('span', { key: 'short' }, t('shortEnabled')));
+      if (instruments.account.marginMultiplier !== null) parts.push(h('span', { key: 'margin' }, `${t('marginEnabled')} ${fmtNum(instruments.account.marginMultiplier)}x`));
+      const capParts = [];
+      if (caps.maxOptionPremiumPctEquity !== null) capParts.push(`${t('capOptionsPct')}${fmtPercentPoints(caps.maxOptionPremiumPctEquity * 100)} eq`);
+      if (caps.maxShortPctEquity !== null) capParts.push(`${t('capShortPct')}${fmtPercentPoints(caps.maxShortPctEquity * 100)} eq`);
+      if (caps.maxContracts !== null) capParts.push(`${t('maxContracts')} ${fmtNum(caps.maxContracts)}`);
+      if (caps.minDTE !== null && caps.maxDTE !== null) capParts.push(`${t('dteRange')} ${fmtNum(caps.minDTE)}–${fmtNum(caps.maxDTE)}`);
+      if (capParts.length > 0) parts.push(h('span', { key: 'caps' }, `${t('caps')}: ${capParts.join(' · ')}`));
+      if (instruments.optionDataFeed) parts.push(h('span', { key: 'feed', className: 'atm-muted' }, instruments.optionDataFeed));
+      const exposure = [];
+      if (instruments.account.optionsBuyingPowerUsd !== null) exposure.push(`${t('optionsBP')} ${fmtUsd(instruments.account.optionsBuyingPowerUsd)}`);
+      if (instruments.account.marginDebtUsd !== null) exposure.push(`${t('marginDebt')} ${fmtUsd(instruments.account.marginDebtUsd)}`);
+      if (instruments.account.grossExposureUsd !== null) exposure.push(`${t('grossExposure')} ${fmtUsd(instruments.account.grossExposureUsd)}`);
+      if (instruments.account.netExposureUsd !== null) exposure.push(`${t('netExposure')} ${fmtUsd(instruments.account.netExposureUsd)}`);
+      if (exposure.length > 0) parts.push(h('span', { key: 'exposure', className: 'atm-exposure-line' }, exposure.join(' · ')));
+      return h('p', { className: 'atm-bridge-line' }, parts);
+    }
+
+    /** "Instrument playbook" block: family + bullish/bearish/neutral structures. */
+    function InstrumentPlaybookSection({ t, playbook }) {
+      if (!playbook || playbook.available !== true) {
+        return h('div', { className: 'atm-section' }, [
+          h('h4', { className: 'atm-detail-title', key: 'title' }, t('instrumentPlaybook')),
+          h('p', { className: 'atm-empty', key: 'empty' }, t('playbookEmpty')),
+        ]);
+      }
+      const cards = [
+        { key: 'bullish', labelKey: 'playbookBullish', items: playbook.bullish },
+        { key: 'bearish', labelKey: 'playbookBearish', items: playbook.bearish },
+        { key: 'neutral', labelKey: 'playbookNeutral', items: playbook.neutral },
+      ].filter((card) => card.items.length > 0);
+      if (playbook.structures.length > 0) {
+        cards.push({ key: 'structures', labelKey: 'playbookStructures', items: playbook.structures });
+      }
+      return h('div', { className: 'atm-section' }, [
+        h('h4', { className: 'atm-detail-title', key: 'title' }, t('instrumentPlaybook'),
+          playbook.familyLabel ? h('span', { key: 'family', className: 'atm-muted' }, ` · ${t('playbookFamily')} ${playbook.familyLabel}`) : null),
+        h('div', { className: 'atm-playbook-grid', key: 'grid' }, cards.map((card) => h('div', {
+          key: card.key,
+          className: 'atm-playbook-card',
+          'data-side': card.key,
+        }, [
+          h('span', { className: 'atm-plan-label', key: 'label' }, t(card.labelKey)),
+          h('div', { className: 'atm-chips', key: 'items' }, card.items.map((item) => h('span', { className: 'atm-param', key: item.key }, item.label))),
+        ]))),
+      ]);
+    }
+
     /** "Bot agent" policy section: the bot's own isolated brain decision. */
     function BotAgentSection({ t, policy }) {
       if (!policy || policy.available !== true) {
@@ -2849,6 +3417,23 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'atm-botagent-card', key: 'watch' }, [
               h('span', { className: 'atm-plan-label', key: 'label' }, t('watchlist')),
               h('div', { className: 'atm-chips', key: 'chips' }, policy.watch.map((symbol) => h('span', { className: 'atm-param', key: symbol }, symbol))),
+            ])
+            : null,
+          policy.instrument
+            ? h('div', { className: 'atm-botagent-card', key: 'instrument' }, [
+              h('span', { className: 'atm-plan-label', key: 'label' }, t('instrumentPlan')),
+              h('div', { className: 'atm-botagent-metrics', key: 'values' }, [
+                h('span', { className: 'atm-botagent-metric', key: 'prefer' }, `${t('prefer')} `, h('b', null, policy.instrument.auto ? t('autoSelect') : policy.instrument.preferLabel ?? '—')),
+                policy.instrument.maxPremiumUsd !== null
+                  ? h('span', { className: 'atm-botagent-metric', key: 'premium' }, `${t('maxPremium')} `, h('b', null, fmtUsd(policy.instrument.maxPremiumUsd)))
+                  : null,
+                policy.instrument.maxContracts !== null
+                  ? h('span', { className: 'atm-botagent-metric', key: 'contracts' }, `${t('maxContracts')} `, h('b', null, fmtNum(policy.instrument.maxContracts)))
+                  : null,
+                policy.instrument.dteMin !== null || policy.instrument.dteMax !== null
+                  ? h('span', { className: 'atm-botagent-metric', key: 'dte' }, `${t('dteWindow')} `, h('b', null, `${fmtNum(policy.instrument.dteMin)}–${fmtNum(policy.instrument.dteMax)}`))
+                  : null,
+              ]),
             ])
             : null,
         ]),
@@ -2973,6 +3558,7 @@ window.__ModuleLoader__.load({
       { key: 'generation', labelKey: 'gen', sortable: true },
       { key: 'strategyType', labelKey: 'strategyType', sortable: false },
       { key: 'estInterval', labelKey: 'estInterval', sortable: false },
+      { key: 'instruments', labelKey: 'instruments', sortable: false },
       { key: 'genome', labelKey: 'genome', sortable: false },
       { key: 'trading', labelKey: 'trading', sortable: false },
       { key: 'research', labelKey: 'research', sortable: false },
@@ -3078,6 +3664,12 @@ window.__ModuleLoader__.load({
                 h('td', { key: 'gen', className: 'atm-mono' }, fmtNum(row.generation)),
                 h('td', { key: 'strategyType' }, h(StrategyTypeChip, { t, strategy: row.strategy })),
                 h('td', { key: 'estInterval', className: 'atm-interval', title: row.strategy?.timeframe ?? '' }, row.intervalLabel),
+                h('td', { key: 'instruments', title: row.instrumentTooltip ?? '' }, h(InstrumentBadgeList, {
+                  t,
+                  badges: row.instrumentBadges,
+                  tooltip: row.instrumentTooltip,
+                  emptyLabel: t('instrumentsEmpty'),
+                })),
                 h('td', { key: 'genome', title: row.genomeParamsText }, row.genomeText),
                 h('td', { key: 'trading', title: row.specParamsText }, [
                   h('span', { key: 'spec' }, row.specText ?? t('none')),
@@ -3119,22 +3711,48 @@ window.__ModuleLoader__.load({
     }
 
     function HoldingsTable({ t, row }) {
-      if (row.positionCount === 0) return h('p', { className: 'atm-empty' }, t('noPositions'));
-      return h('table', { className: 'atm-detail-table' }, [
+      const positions = Array.isArray(row.positionRows) ? row.positionRows : [];
+      if (positions.length === 0) return h('p', { className: 'atm-empty' }, t('noPositions'));
+      const summary = row.positionSummary ?? {};
+      const totals = [];
+      if (summary.stock) totals.push(`${t('badgeStock')} ${fmtNum(summary.stock.long)} ${t('longPos')} / ${fmtNum(summary.stock.short)} ${t('shortPos')}`);
+      if (summary.options) totals.push(`${t('badgeOptions')} ${fmtNum(summary.options.calls + summary.options.puts)} (${fmtNum(summary.options.calls)} ${t('callPos')} / ${fmtNum(summary.options.puts)} ${t('putPos')})`);
+      if (summary.spreadGroups > 0) totals.push(`${t('badgeSpreads')} ${fmtNum(summary.spreadGroups)}`);
+      if (row.grossExposureUsd !== null && row.grossExposureUsd !== undefined) totals.push(`${t('grossExposure')} ${fmtUsd(row.grossExposureUsd)}`);
+      if (row.netExposureUsd !== null && row.netExposureUsd !== undefined) totals.push(`${t('netExposure')} ${fmtUsd(row.netExposureUsd)}`);
+      if (row.marginDebtUsd !== null && row.marginDebtUsd !== undefined) totals.push(`${t('marginDebt')} ${fmtUsd(row.marginDebtUsd)}`);
+      return h('div', { className: 'atm-table-wrap' }, h('table', { className: 'atm-detail-table' }, [
         h('thead', { key: 'head' }, h('tr', null, [
           h('th', { key: 'symbol' }, t('symbol')),
+          h('th', { key: 'side' }, t('sideLabel')),
           h('th', { key: 'qty' }, t('qty')),
           h('th', { key: 'avg' }, t('avgPrice')),
-          h('th', { key: 'last' }, t('lastPrice')),
           h('th', { key: 'mv' }, t('marketValue')),
           h('th', { key: 'unrl' }, t('unrealized')),
           h('th', { key: 'opened' }, t('openedAt')),
         ])),
-        h('tbody', { key: 'body' }, row.positions.map((position) => h('tr', { key: position.key }, [
-          h('td', { key: 'symbol', className: 'atm-mono' }, position.symbol),
+        h('tbody', { key: 'body' }, positions.map((position) => h('tr', {
+          key: position.key,
+          'data-side': position.side,
+        }, [
+          h('td', { key: 'symbol' }, [
+            h('div', { key: 'sym', className: 'atm-mono', title: position.symbol }, position.isOption ? (position.option?.underlying ?? position.symbol) : position.symbol),
+            position.isOption
+              ? h('div', { key: 'opt', className: 'atm-option-meta' }, [
+                h('span', { key: 's' }, `${t('strike')} `, h('b', null, fmtUsd(position.option.strikeUsd))),
+                h('span', { key: 'exp' }, `${t('expiry')} `, h('b', null, position.option.expiryLabel ?? '—'), ` · ${t('dte')} `, h('b', null, position.option.dteLabel ?? '—')),
+                position.groupShort ? h('span', { key: 'grp', className: 'atm-group-tag', title: position.groupId }, `${t('spreadGroup')} ${position.groupShort}`) : null,
+              ])
+              : null,
+          ]),
+          h('td', { key: 'side' }, h('span', {
+            key: 'chip',
+            className: 'atm-side-chip',
+            'data-side': position.side,
+            title: position.structure ? instrumentStructureLabel(position.structure) : position.side,
+          }, position.side)),
           h('td', { key: 'qty', className: 'atm-mono' }, position.qtyText),
           h('td', { key: 'avg', className: 'atm-mono' }, fmtUsd(position.avgPriceUsd)),
-          h('td', { key: 'last', className: 'atm-mono' }, fmtUsd(position.lastPriceUsd)),
           h('td', { key: 'mv', className: 'atm-mono' }, fmtUsd(position.marketValueUsd)),
           h('td', {
             key: 'unrl',
@@ -3142,7 +3760,10 @@ window.__ModuleLoader__.load({
           }, fmtSignedUsd(position.unrealizedPlUsd)),
           h('td', { key: 'opened', className: 'atm-muted', title: fmtDateTime(position.openedAt) }, fmtAgo(position.openedAt)),
         ]))),
-      ]);
+        totals.length > 0
+          ? h('tfoot', { key: 'foot' }, h('tr', null, h('td', { colSpan: 7, className: 'atm-exposure-line' }, `${t('positionTotals')}: ${totals.join(' · ')}`)))
+          : null,
+      ]));
     }
 
     function ActivityFeed({ t, row }) {
@@ -3216,6 +3837,15 @@ window.__ModuleLoader__.load({
             { key: 'netPnl', label: t('pnl'), value: fmtSignedUsd(row.pnl.netUsd) },
           ]
           : []),
+        ...(row.grossExposureUsd !== null && row.grossExposureUsd !== undefined
+          ? [{ key: 'gross', label: t('grossExposure'), value: fmtUsd(row.grossExposureUsd) }]
+          : []),
+        ...(row.netExposureUsd !== null && row.netExposureUsd !== undefined
+          ? [{ key: 'net', label: t('netExposure'), value: fmtUsd(row.netExposureUsd) }]
+          : []),
+        ...(row.marginDebtUsd !== null && row.marginDebtUsd !== undefined
+          ? [{ key: 'debt', label: t('marginDebt'), value: fmtUsd(row.marginDebtUsd) }]
+          : []),
       ];
 
       return h('aside', { className: 'atm-detail', 'aria-label': `${t('detailTitle')}: ${row.name}` }, [
@@ -3229,6 +3859,7 @@ window.__ModuleLoader__.load({
               row.strategy ? h('span', { key: 'category', className: 'atm-muted', title: row.strategy.description }, row.categoryLabel) : null,
               h(StrategyTypeChip, { key: 'type', t, strategy: row.strategy }),
               h('span', { className: 'atm-muted', key: 'interval' }, `${t('estInterval')} ${row.intervalLabel}`),
+              h(InstrumentBadgeList, { key: 'instruments', t, badges: row.instrumentBadges, tooltip: row.instrumentTooltip, emptyLabel: t('instrumentsEmpty') }),
               h(RankingBadges, { key: 'ranks', t, row }),
             ]),
           ]),
@@ -3248,6 +3879,7 @@ window.__ModuleLoader__.load({
         ]) : null,
         h(StrategyPlanSection, { key: 'plan', t, plan: row.plan }),
         h(BotAgentSection, { key: 'bot-agent', t, policy: row.policy }),
+        h(InstrumentPlaybookSection, { key: 'instrument-playbook', t, playbook: row.playbook }),
         h('div', { key: 'holdings' }, [
           h('h4', { className: 'atm-detail-title', key: 'title' }, `${t('holdings')} · ${fmtNum(row.positionCount)}`),
           h(HoldingsTable, { key: 'table', t, row }),
@@ -3356,6 +3988,7 @@ window.__ModuleLoader__.load({
           : null,
         h(HeaderStats, { key: 'stats', t, summary }),
         h(BotAgentBridgeLine, { key: 'bot-agents', t, engineAgents: summary.engineAgents }),
+        h(InstrumentsLine, { key: 'instruments', t, instruments: summary.instruments }),
         h(ReaperRow, { key: 'reaper', t, summary, controlState, runControl }),
         h(ControlBar, { key: 'controls', t, summary: { ...summary, paused: snapshot.paused }, controlState, runControl }),
         h(OperatorPanel, {
@@ -3551,6 +4184,14 @@ window.__ModuleLoader__.load({
         botAgentPolicyMapping,
         stanceBadge,
         botAgentEngineStatus,
+        instrumentBadges,
+        instrumentPermissionsMapping,
+        instrumentStructureLabel,
+        positionRows,
+        positionSummary,
+        playbookMapping,
+        instrumentPolicyMapping,
+        instrumentsHeader,
         describeReaper,
         mapResearchBriefing,
         researchBadge,

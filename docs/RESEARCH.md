@@ -198,5 +198,5 @@ newsCount, ...briefing }` appended to `state/research/<agentId>.jsonl`, latest c
 - ~$0.001 per agent-hour (~$0.72/day for 30 agents if all research hourly) charged to the agents,
   raising their burn exactly like a real inference bill.
 - Research is advisory: no new dangerous capability. The executor still passes every order through the
-  14 brakes; the research analyst has no order tool, no wallet access, and no shared memory.
+  18 hard brakes; the research analyst has no order tool, no wallet access, and no shared memory.
 - If the LLM is unavailable, trading continues deterministically; briefings go stale and are ignored.

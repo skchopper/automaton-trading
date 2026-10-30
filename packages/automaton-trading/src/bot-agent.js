@@ -11,7 +11,7 @@
  *
  * This is the Harness-backed "agent" of a bot: isolated prompt + isolated journal + isolated policy,
  * on the same LLM seam (Harness llm bridge / CLI DeepSeek fallback). The engine keeps execution and
- * the 14 brakes deterministic so fast reactions never wait on a model turn.
+ * the 18 hard brakes deterministic so fast reactions never wait on a model turn.
  */
 
 import fsp from 'node:fs/promises';
@@ -19,6 +19,13 @@ import path from 'node:path';
 import { statePaths } from './config.js';
 import { extractJsonObject } from './research.js';
 import { strategyTypeForFamily } from './strategy-types.js';
+import {
+  agentInstrumentPermissions,
+  normalizeInstrumentPolicy,
+  optionPremiumBudget,
+  playbookForFamily,
+  resolveInstrumentPermissions,
+} from './instruments.js';
 import {
   appendJsonl,
   createLogger,
@@ -47,6 +54,10 @@ const SYSTEM_PROMPT = [
   'mention them. You do not place orders and cannot change your budget; a deterministic executor',
   'applies your policy inside a hard brake wall. Human capital is at risk: be conservative when the',
   'evidence is weak.',
+  'You may choose HOW this bot expresses its edge: long or short stock, a long call/put, a covered',
+  'call (only if the bot owns 100+ shares), or a defined-risk vertical spread. Use the instrument',
+  'that best fits the setup and is affordable in the provided INSTRUMENT CONTEXT; prefer options or',
+  'short stock when they materially improve the risk/reward, otherwise stock or "auto".',
   'Return ONE strict JSON object and nothing else:',
   '{"stance":"trade"|"cautious"|"stand_down",',
   ' "sizeMultiplier": number 0.2..1 (fraction of normal entry size; never above 1),',
@@ -55,10 +66,14 @@ const SYSTEM_PROMPT = [
   ' "confidence": number 0..1,',
   ' "thesis": string <=300 characters explaining your read of this bot\'s setup,',
   ' "plan": [up to 4 short strings: what you intend over the next review window],',
-  ' "watch": [up to 4 symbols from the provided context you want to watch]}',
+  ' "watch": [up to 4 symbols from the provided context you want to watch],',
+  ' "instrument": {"prefer": "auto"|"long_stock"|"short_stock"|one of the provided structures,',
+  '   "maxPremiumUsd": number<=cap or null, "maxContracts": integer<=cap or null,',
+  '   "dteMin": integer within provided window or null, "dteMax": integer within window or null}}',
   'Rules: stand_down = do not open new positions (risk-reducing; exits still allowed);',
   'cautious = reduce size and prefer capital preservation; trade = normal execution.',
-  'If the market is closed, prefer a cautious/trade stance without forcing action.',
+  'Use "auto" to let the deterministic family playbook choose. Never invent structures that were',
+  'not offered. If the market is closed, prefer a cautious/trade stance without forcing action.',
 ].join(' ');
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -78,7 +93,7 @@ function stringArray(value, max, maxLength = 200) {
     .slice(0, max);
 }
 
-export function normalizePolicy(raw, { nowMs, reviewSec } = {}) {
+export function normalizePolicy(raw, { nowMs, reviewSec, config, permissions, agent } = {}) {
   if (!isPlainObject(raw)) throw new Error('policy is not an object');
   const stance = String(raw.stance ?? '').trim().toLowerCase();
   if (!STANCES.includes(stance)) throw new Error(`policy stance must be one of ${STANCES.join('|')}`);
@@ -86,6 +101,7 @@ export function normalizePolicy(raw, { nowMs, reviewSec } = {}) {
   if (confidence === null) throw new Error('policy requires numeric confidence');
   const sizeRaw = numberOrNull(raw.sizeMultiplier);
   const exitPressure = String(raw.exitPressure ?? 'none').trim().toLowerCase() === 'exit' ? 'exit' : 'none';
+  const resolvedPermissions = permissions ?? (config ? agentInstrumentPermissions(config, agent) : resolveInstrumentPermissions({}));
   return {
     stance,
     sizeMultiplier: round4(clamp(sizeRaw === null ? 1 : sizeRaw, 0.2, 1)),
@@ -95,6 +111,7 @@ export function normalizePolicy(raw, { nowMs, reviewSec } = {}) {
     thesis: String(raw.thesis ?? '').trim().slice(0, MAX_THESIS),
     plan: stringArray(raw.plan, MAX_PLAN),
     watch: stringArray(raw.watch, MAX_WATCH, 12).map((symbol) => symbol.toUpperCase()),
+    instrument: normalizeInstrumentPolicy(raw.instrument, { config: config ?? { instruments: {} }, permissions: resolvedPermissions }),
     atMs: nowMs,
     at: new Date(nowMs).toISOString(),
     reviewSec: Math.max(60, Number(reviewSec) || 300),
@@ -223,11 +240,28 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
     const marketView = isPlainObject(market) ? market : {};
     const quote = marketView.quotes?.[symbol] ?? null;
     const price = numberOrNull(marketView.prices?.[symbol]);
+    const permissions = agentInstrumentPermissions(config, agent);
+    const playbook = playbookForFamily(agent?.genome?.family);
+    const equityUsd = numberOrNull(snapshot?.equityUsd);
+    const premiumBudget = optionPremiumBudget({ config, equityUsd, mandateMaxUsd: null });
+    const instrumentContext = {
+      enabled: permissions.enabled,
+      allowedStructures: permissions.allowedStructures,
+      shortStock: permissions.shortStock,
+      margin: permissions.margin,
+      coveredCalls: permissions.coveredCalls,
+      spreads: permissions.spreads,
+      optionBudgetUsd: premiumBudget,
+      maxContracts: config?.instruments?.maxContracts ?? null,
+      dteWindow: [config?.instruments?.minDTE ?? 2, config?.instruments?.maxDTE ?? 14],
+      playbook: { bullish: playbook.bullish, bearish: playbook.bearish, neutral: playbook.neutral, summary: playbook.summary },
+    };
     const sections = [
       `BOT: ${agent.name ?? agent.id} (id ${agent.id}, generation ${agent.generation ?? 0}, tier ${agent.tier ?? type.category})`,
       `STRATEGY: ${type.typeLabel} on ${symbol || 'n/a'} (family ${agent?.genome?.family ?? 'unknown'})`,
       `GENOME: ${JSON.stringify(agent?.genome ?? {})}`,
       spec ? `ACTIVE_SPEC: ${JSON.stringify({ symbol: spec.symbol, family: spec.family, params: spec.params ?? {} })}` : 'ACTIVE_SPEC: none compiled yet',
+      `INSTRUMENT_CONTEXT: ${JSON.stringify(instrumentContext)}`,
       `BOOK: ${JSON.stringify({
         cashUsd: snapshot ? round2(snapshot.cashUsd) : null,
         positions: snapshot?.positions ?? {},
@@ -235,6 +269,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
         realizedPlUsd: snapshot ? round2(snapshot.realizedPlUsd) : 0,
         unrealizedPlUsd: snapshot ? round2(snapshot.unrealizedPlUsd ?? 0) : 0,
         equityUsd: snapshot?.equityUsd ?? null,
+        marginDebtUsd: snapshot?.marginDebtUsd ?? 0,
       })}`,
       `MARKET: ${JSON.stringify({
         marketOpen: marketView.marketOpen ?? null,
@@ -296,7 +331,13 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
         usage = generated?.usage ?? null;
         lastProvider = generated?.provider ?? lastProvider;
         lastModel = generated?.model ?? lastModel;
-        policy = normalizePolicy(extractJsonObject(text), { nowMs, reviewSec });
+        policy = normalizePolicy(extractJsonObject(text), {
+          nowMs,
+          reviewSec,
+          config,
+          permissions: agentInstrumentPermissions(config, agent),
+          agent,
+        });
         lastFailure = null;
         break;
       } catch (error) {
@@ -432,6 +473,7 @@ export function createBotAgents({ config, paths, clock, registry, ledger, broker
       thesis: entry.policy.thesis,
       plan: entry.policy.plan,
       watch: entry.policy.watch,
+      instrument: entry.policy.instrument ?? null,
       atMs: entry.policy.atMs,
       at: entry.policy.at,
       reviewSec: entry.policy.reviewSec,

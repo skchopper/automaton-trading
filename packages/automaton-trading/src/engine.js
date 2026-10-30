@@ -414,6 +414,7 @@ export function createEngine(options = {}) {
         liveArmed: liveArmed(state.config),
         research: null,
         agents: null,
+        instruments: null,
       },
       account: null,
       treasury: null,

@@ -34,7 +34,9 @@ export function defaultConfig() {
       allocationCapPct: 0.8,
       reconciliationTolerancePct: 0.02,
     },
-    symbols: ['AAPL', 'MSFT', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'TSLA', 'SPY', 'QQQ'],
+    // Core liquid names plus affordable underlyings: cheap stocks make whole-share shorts, margin
+    // and sub-$25 option contracts realistic for $50 bots (docs/INSTRUMENTS.md).
+    symbols: ['AAPL', 'MSFT', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'TSLA', 'SPY', 'QQQ', 'F', 'SOFI', 'BAC', 'INTC'],
     timeZone: 'America/New_York',
     cycleIntervalSec: 300,
     reaperIntervalSec: 30,
@@ -135,6 +137,28 @@ export function defaultConfig() {
       maxInputChars: 8000,
       maxOutputTokens: 700,
       errorCooldownSec: 900,
+    },
+    // Multi-instrument paper trading (docs/INSTRUMENTS.md): margin, short stock, long options,
+    // defined-risk vertical spreads and covered calls. Risk caps are enforced again by brakes.
+    instruments: {
+      enabled: true,
+      allowMargin: true,
+      maxMarginPctEquity: 1,
+      allowShort: true,
+      maxShortPctEquity: 1,
+      maxShortNotionalUsd: 25,
+      shortableOnly: true,
+      allowOptions: true,
+      allowCoveredCalls: true,
+      allowSpreads: true,
+      maxOptionPremiumPctEquity: 0.25,
+      maxOptionPremiumUsd: 25,
+      maxContracts: 3,
+      minDTE: 2,
+      maxDTE: 14,
+      autoCloseDTE: 1,
+      allowNakedShortOptions: false,
+      optionDataFeed: 'indicative',
     },
     paths: {
       stateDir: path.join(WORKSPACE_DEFAULT, 'automaton-data'),
@@ -487,6 +511,32 @@ export function validateConfig(config) {
   assertNumber(agentsCfg.maxOutputTokens, 'agents.maxOutputTokens', { min: 128, max: 4000 });
   assertNumber(agentsCfg.errorCooldownSec, 'agents.errorCooldownSec', { min: 60, max: 86_400 });
 
+  // Multi-instrument paper trading (docs/INSTRUMENTS.md). Naked short options are never allowed.
+  const inst = config.instruments;
+  if (!inst || typeof inst !== 'object') fail('CONFIG_INVALID', 'instruments config object is required');
+  for (const key of ['enabled', 'allowMargin', 'allowShort', 'allowOptions', 'allowCoveredCalls', 'allowSpreads', 'shortableOnly']) {
+    if (typeof inst[key] !== 'boolean') fail('CONFIG_INVALID', `instruments.${key} must be boolean`);
+  }
+  assertNumber(inst.maxMarginPctEquity, 'instruments.maxMarginPctEquity', { min: 0, max: 3 });
+  assertNumber(inst.maxShortPctEquity, 'instruments.maxShortPctEquity', { min: 0, max: 3 });
+  assertNumber(inst.maxShortNotionalUsd, 'instruments.maxShortNotionalUsd', { min: 0, max: 1_000_000 });
+  assertNumber(inst.maxOptionPremiumPctEquity, 'instruments.maxOptionPremiumPctEquity', { min: 0, max: 1 });
+  assertNumber(inst.maxOptionPremiumUsd, 'instruments.maxOptionPremiumUsd', { min: 0, max: 1_000_000 });
+  assertNumber(inst.maxContracts, 'instruments.maxContracts', { min: 1, max: 100 });
+  assertNumber(inst.minDTE, 'instruments.minDTE', { min: 1, max: 90 });
+  assertNumber(inst.maxDTE, 'instruments.maxDTE', { min: 1, max: 365 });
+  assertNumber(inst.autoCloseDTE, 'instruments.autoCloseDTE', { min: 0, max: 30 });
+  if (inst.maxDTE < inst.minDTE) fail('CONFIG_INVALID', 'instruments.maxDTE must be >= instruments.minDTE');
+  if (inst.autoCloseDTE > inst.minDTE) {
+    fail('CONFIG_INVALID', 'instruments.autoCloseDTE must be <= instruments.minDTE');
+  }
+  if (inst.allowNakedShortOptions === true) {
+    fail('CONFIG_INVALID', 'naked short options are not supported; use covered calls or defined-risk spreads');
+  }
+  if (!['indicative', 'opra'].includes(inst.optionDataFeed)) {
+    fail('CONFIG_INVALID', 'instruments.optionDataFeed must be indicative|opra');
+  }
+
   if (typeof config.paths.stateDir !== 'string' || config.paths.stateDir.length === 0) {
     fail('CONFIG_INVALID', 'paths.stateDir is required');
   }
@@ -671,6 +721,24 @@ export function configSummary(config) {
       maxAgeSec: config.agents.maxAgeSec,
     },
     cadence: config.cadence,
+    instruments: {
+      enabled: config.instruments.enabled,
+      allowMargin: config.instruments.allowMargin,
+      allowShort: config.instruments.allowShort,
+      allowOptions: config.instruments.allowOptions,
+      allowCoveredCalls: config.instruments.allowCoveredCalls,
+      allowSpreads: config.instruments.allowSpreads,
+      maxMarginPctEquity: config.instruments.maxMarginPctEquity,
+      maxShortPctEquity: config.instruments.maxShortPctEquity,
+      maxShortNotionalUsd: config.instruments.maxShortNotionalUsd,
+      maxOptionPremiumPctEquity: config.instruments.maxOptionPremiumPctEquity,
+      maxOptionPremiumUsd: config.instruments.maxOptionPremiumUsd,
+      maxContracts: config.instruments.maxContracts,
+      minDTE: config.instruments.minDTE,
+      maxDTE: config.instruments.maxDTE,
+      autoCloseDTE: config.instruments.autoCloseDTE,
+      optionDataFeed: config.instruments.optionDataFeed,
+    },
     tradingHoursOnly: config.engine?.tradingHoursOnly === true,
     stateDir: config.paths.stateDir,
     envFile: config.paths.envFile,

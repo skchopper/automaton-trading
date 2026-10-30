@@ -34,6 +34,94 @@ import { createReaper } from '../src/reaper.js';
 
 const T0 = Date.UTC(2026, 0, 5, 15, 0, 0); // Mon 10:00 America/New_York (inside 09:35-15:50)
 
+/**
+ * Deterministic instrument regimes for tests. The default v3.0 config shipped by the
+ * Lead enables short/options/margin; tests pin both regimes so behaviour never depends
+ * on which config layer happens to be merged in.
+ */
+const LEGACY_INSTRUMENTS = Object.freeze({
+  enabled: true,
+  allowMargin: false,
+  maxMarginPctEquity: 1,
+  maxMarginUsd: 0,
+  allowShort: false,
+  maxShortPctEquity: 1,
+  maxShortNotionalUsd: 0,
+  shortableOnly: true,
+  allowOptions: false,
+  allowCoveredCalls: false,
+  allowSpreads: false,
+  maxOptionPremiumPctEquity: 0.25,
+  maxOptionPremiumUsd: 0,
+  maxContracts: 3,
+  minDTE: 2,
+  maxDTE: 14,
+  autoCloseDTE: 1,
+  allowNakedShortOptions: false,
+  optionDataFeed: 'indicative',
+});
+
+const V3_INSTRUMENTS = Object.freeze({
+  enabled: true,
+  allowMargin: true,
+  maxMarginPctEquity: 1,
+  maxMarginUsd: 0,
+  allowShort: true,
+  maxShortPctEquity: 1,
+  maxShortNotionalUsd: 25,
+  shortableOnly: true,
+  allowOptions: true,
+  allowCoveredCalls: true,
+  allowSpreads: true,
+  maxOptionPremiumPctEquity: 0.25,
+  maxOptionPremiumUsd: 25,
+  maxContracts: 3,
+  minDTE: 2,
+  maxDTE: 14,
+  autoCloseDTE: 1,
+  allowNakedShortOptions: false,
+  optionDataFeed: 'indicative',
+});
+
+/** Bump a "YYYY-MM-DD" date by N days (test helper for option expiries). */
+function datePlusDays(days) {
+  return new Date(T0 + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+/** Build an OCC option symbol for underlying/strike/type/expiry. */
+function occSymbol(underlying, strikeUsd, type, expirationIso) {
+  const compact = expirationIso.slice(2).replace(/-/g, '');
+  const strike = String(Math.round(strikeUsd * 1000)).padStart(8, '0');
+  return `${underlying}${compact}${type === 'put' ? 'P' : 'C'}${strike}`;
+}
+
+/** Full v3 instrument permissions (what the Treasurer derives when everything is on). */
+function fullInstrumentPermissions(overrides = {}) {
+  return {
+    longStock: true,
+    shortStock: true,
+    longOptions: true,
+    shortOptions: true,
+    coveredCalls: true,
+    spreads: true,
+    margin: true,
+    allowedStructures: [
+      'long_call',
+      'long_put',
+      'covered_call',
+      'call_credit_spread',
+      'put_credit_spread',
+      'bull_call_spread',
+      'bear_put_spread',
+    ],
+    maxShortNotionalUsd: 1_000_000,
+    maxOptionPremiumUsd: 1_000_000,
+    maxContracts: 10,
+    maxMarginUsd: 1_000_000,
+    ...overrides,
+  };
+}
+
 const createdDirs = [];
 
 after(() => {
@@ -57,6 +145,8 @@ function makeEnv(overrides = {}) {
     overrides: {
       mode: 'paper',
       paths: { stateDir: path.join(dir, 'state'), envFile: path.join(dir, '.env') },
+      // v2-safe default: the pre-v3 wall. Feature tests override with V3_INSTRUMENTS.
+      instruments: LEGACY_INSTRUMENTS,
       ...overrides,
     },
   });
@@ -173,13 +263,25 @@ function createFakeBroker(options = {}) {
       state.submitted.push({ ...order });
       const position = state.positions.find((entry) => entry.symbol === order.symbol);
       let fillPrice = 0;
-      if (position && Number(position.qty) > 0) {
-        const heldQty = Number(position.qty);
-        fillPrice = Number(position.marketValueUsd) / heldQty;
-        const soldQty = Math.min(heldQty, Number(order.qty));
-        position.marketValueUsd = round2(Math.max(0, Number(position.marketValueUsd) - soldQty * fillPrice));
-        position.qty = round4(heldQty - soldQty);
-        if (position.qty <= 0) state.positions = state.positions.filter((entry) => entry !== position);
+      if (position) {
+        const heldQty = Number(position.qtySigned ?? position.qty) || 0;
+        const multiplier = Number(position.multiplier) > 0
+          ? Number(position.multiplier)
+          : position.assetClass === 'us_option'
+            ? 100
+            : 1;
+        const marketValue = Number(position.marketValueUsd);
+        if (Number.isFinite(marketValue) && marketValue !== 0 && heldQty !== 0) {
+          fillPrice = Math.abs(marketValue) / (Math.abs(heldQty) * multiplier);
+        } else {
+          fillPrice = Number(position.avgEntryPriceUsd ?? position.avgPriceUsd) || Number(order.priceUsd) || 0;
+        }
+        const delta = order.side === 'buy' ? Number(order.qty) : -Number(order.qty);
+        const nextQty = round4(heldQty + delta);
+        position.qtySigned = nextQty;
+        position.qty = nextQty;
+        position.marketValueUsd = round2(nextQty * fillPrice * multiplier);
+        if (nextQty === 0) state.positions = state.positions.filter((entry) => entry !== position);
       }
       return {
         id: `ord-${state.submitted.length}`,
@@ -430,7 +532,7 @@ describe('ledger.js — virtual USD book', () => {
     assert.equal(round2(after.cashUsd + after.positionsValueUsd), after.equityUsd);
   });
 
-  it('never allows negative cash or an uncovered short (D2)', () => {
+  it('refuses borrowing when margin is disabled (no negative cash by default)', () => {
     const env = makeEnv();
     const clock = makeClock();
     const ledger = createLedger({ paths: env.paths, config: env.config, clock });
@@ -438,18 +540,11 @@ describe('ledger.js — virtual USD book', () => {
     ledger.grant('atm-1', 1000, { reason: 'genesis', at: clock.iso() });
     assert.throws(
       () => ledger.applyFill('atm-1', { symbol: 'AAPL', side: 'buy', qty: 100, priceUsd: 100, at: clock.iso() }),
-      (error) => error.code === 'INSUFFICIENT_CASH',
+      (error) => error.code === 'MARGIN_LIMIT',
     );
     assert.equal(ledger.snapshot('atm-1').cashUsd, 1000);
-    assert.throws(
-      () => ledger.applyFill('atm-1', { symbol: 'AAPL', side: 'sell', qty: 1, priceUsd: 100, at: clock.iso() }),
-      (error) => error.code === 'BRAKE_DENIED',
-    );
-    ledger.applyFill('atm-1', { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100, at: clock.iso() });
-    assert.throws(
-      () => ledger.applyFill('atm-1', { symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 100, at: clock.iso() }),
-      (error) => error.code === 'BRAKE_DENIED',
-    );
+    assert.equal(ledger.snapshot('atm-1').positionsValueUsd, 0);
+    assert.equal(ledger.snapshot('atm-1').marginDebtUsd, 0);
   });
 
   it('attributes costs by role and refuses costs it cannot pay', () => {
@@ -545,6 +640,239 @@ describe('ledger.js — virtual USD book', () => {
 // ---------------------------------------------------------------------------
 // registry.js
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ledger.js v3 — shorts, options, spreads, margin
+// ---------------------------------------------------------------------------
+
+function makeV3Ledger({ cashUsd = 50, instruments = {} } = {}) {
+  const env = makeEnv({ instruments: { ...V3_INSTRUMENTS, ...instruments } });
+  const clock = makeClock();
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  ledger.ensureAgent('atm-v3', { endowmentUsd: cashUsd, at: clock.iso() });
+  ledger.grant('atm-v3', cashUsd, { reason: 'genesis', at: clock.iso() });
+  return { env, clock, ledger };
+}
+
+describe('ledger.js — v3 multi-instrument book', () => {
+  it('opens and covers a short stock: signed qty, cash, realized P&L', () => {
+    const { clock, ledger } = makeV3Ledger();
+    const short = ledger.applyFill('atm-v3', {
+      symbol: 'AAPL',
+      side: 'sell',
+      qty: 2,
+      priceUsd: 10,
+      at: clock.iso(),
+    });
+    assert.equal(short.realizedPlUsd, 0);
+    assert.equal(short.position.qty, -2);
+    assert.equal(short.position.side, 'SHORT');
+    assert.equal(ledger.snapshot('atm-v3').cashUsd, 70); // 50 + 20 proceeds
+    const marked = ledger.equity('atm-v3', { AAPL: 10 });
+    assert.equal(marked.equityUsd, 50);
+    assert.equal(marked.netExposureUsd, -20);
+    assert.equal(marked.grossExposureUsd, 20);
+
+    const cover = ledger.applyFill('atm-v3', {
+      symbol: 'AAPL',
+      side: 'buy',
+      qty: 2,
+      priceUsd: 8,
+      at: clock.iso(),
+    });
+    assert.equal(cover.realizedPlUsd, 4); // short 10, covered 8
+    assert.equal(cover.position, null);
+    assert.equal(ledger.snapshot('atm-v3').cashUsd, 54);
+    assert.equal(ledger.snapshot('atm-v3').realizedPlUsd, 4);
+    assert.equal(ledger.equity('atm-v3', { AAPL: 8 }).equityUsd, 54);
+
+    // fractional shorts are not allowed (whole shares required)
+    assert.throws(
+      () => ledger.applyFill('atm-v3', { symbol: 'AAPL', side: 'sell', qty: 1.5, priceUsd: 10, at: clock.iso() }),
+      (error) => error.code === 'CONFIG_INVALID',
+    );
+  });
+
+  it('trades options with the 100x multiplier: debit, credit and realized P&L', () => {
+    const { clock, ledger } = makeV3Ledger();
+    const contract = occSymbol('AAPL', 150, 'call', datePlusDays(11));
+    const buy = ledger.applyFill('atm-v3', {
+      symbol: contract,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      priceUsd: 0.4,
+      at: clock.iso(),
+    });
+    assert.equal(buy.realizedPlUsd, 0);
+    assert.equal(buy.position.qty, 1);
+    assert.equal(buy.position.assetClass, 'us_option');
+    assert.equal(buy.position.multiplier, 100);
+    assert.equal(buy.position.option.underlying, 'AAPL');
+    assert.equal(buy.position.option.type, 'call');
+    assert.equal(buy.position.option.strikeUsd, 150);
+    assert.equal(buy.position.side, 'CALL');
+    assert.equal(ledger.snapshot('atm-v3').cashUsd, 10); // 50 - 1*0.4*100
+
+    const marked = ledger.equity('atm-v3', { [contract]: 0.9 });
+    assert.equal(marked.positionsValueUsd, 90);
+    assert.equal(marked.equityUsd, 100);
+    assert.equal(marked.unrealizedPlUsd, 50);
+
+    const sell = ledger.applyFill('atm-v3', {
+      symbol: contract,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      priceUsd: 0.9,
+      at: clock.iso(),
+    });
+    assert.equal(sell.realizedPlUsd, 50); // (0.9 - 0.4) * 1 * 100
+    assert.equal(ledger.snapshot('atm-v3').cashUsd, 100);
+    assert.equal(ledger.snapshot('atm-v3').realizedPlUsd, 50);
+    assert.equal(ledger.snapshot('atm-v3').positionsValueUsd, 0);
+
+    // whole contracts only
+    assert.throws(
+      () => ledger.applyFill('atm-v3', { symbol: contract, assetClass: 'us_option', side: 'buy', qty: 1.5, priceUsd: 0.4, at: clock.iso() }),
+      (error) => error.code === 'CONFIG_INVALID',
+    );
+  });
+
+  it('links spread legs by groupId and reports per-group P&L', () => {
+    const { clock, ledger } = makeV3Ledger();
+    const longLeg = occSymbol('AAPL', 150, 'call', datePlusDays(11));
+    const shortLeg = occSymbol('AAPL', 155, 'call', datePlusDays(11));
+    ledger.applyFill('atm-v3', {
+      symbol: longLeg,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      priceUsd: 0.5,
+      groupId: 'spread-1',
+      structure: 'bull_call_spread',
+      at: clock.iso(),
+    });
+    ledger.applyFill('atm-v3', {
+      symbol: shortLeg,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      priceUsd: 0.2,
+      groupId: 'spread-1',
+      structure: 'bull_call_spread',
+      at: clock.iso(),
+    });
+    assert.equal(ledger.snapshot('atm-v3').cashUsd, 20); // 50 - 50 + 20
+    let groups = ledger.groups('atm-v3');
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].groupId, 'spread-1');
+    assert.equal(groups[0].structure, 'bull_call_spread');
+    assert.deepEqual([...groups[0].legs].sort(), [longLeg, shortLeg].sort());
+    assert.equal(groups[0].openContracts, 2);
+
+    // close both legs: +0.2 on the long, +0.1 on the short → +30 realized
+    ledger.applyFill('atm-v3', {
+      symbol: longLeg,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      priceUsd: 0.7,
+      groupId: 'spread-1',
+      at: clock.iso(),
+    });
+    ledger.applyFill('atm-v3', {
+      symbol: shortLeg,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      priceUsd: 0.1,
+      groupId: 'spread-1',
+      at: clock.iso(),
+    });
+    groups = ledger.groups('atm-v3');
+    assert.equal(groups[0].realizedPlUsd, 30);
+    assert.equal(groups[0].openContracts, 0);
+    const snapshot = ledger.snapshot('atm-v3');
+    assert.equal(snapshot.realizedPlUsd, 30);
+    assert.equal(snapshot.cashUsd, 80);
+    assert.equal(snapshot.groups[0].realizedPlUsd, 30);
+  });
+
+  it('allows margin within the cap and refuses debt beyond it (MARGIN_LIMIT)', () => {
+    const { clock, ledger } = makeV3Ledger({ cashUsd: 50 });
+    ledger.applyFill('atm-v3', { symbol: 'AAPL', side: 'buy', qty: 6, priceUsd: 10, at: clock.iso() });
+    const after = ledger.snapshot('atm-v3');
+    assert.equal(after.cashUsd, -10);
+    assert.equal(after.marginDebtUsd, 10);
+    assert.equal(after.positionsValueUsd, 60);
+    assert.equal(ledger.equity('atm-v3', { AAPL: 10 }).equityUsd, 50);
+    assert.throws(
+      () => ledger.applyFill('atm-v3', { symbol: 'AAPL', side: 'buy', qty: 40, priceUsd: 10, at: clock.iso() }),
+      (error) => error.code === 'MARGIN_LIMIT',
+    );
+
+    // margin disabled: even a small borrowing is refused
+    const legacy = makeEnv();
+    const legacyClock = makeClock();
+    const legacyLedger = createLedger({ paths: legacy.paths, config: legacy.config, clock: legacyClock });
+    legacyLedger.ensureAgent('atm-legacy', { endowmentUsd: 50, at: legacyClock.iso() });
+    legacyLedger.grant('atm-legacy', 50, { reason: 'genesis', at: legacyClock.iso() });
+    assert.throws(
+      () => legacyLedger.applyFill('atm-legacy', { symbol: 'AAPL', side: 'buy', qty: 6, priceUsd: 10, at: legacyClock.iso() }),
+      (error) => error.code === 'MARGIN_LIMIT',
+    );
+  });
+
+  it('snapshot marks long/short/option positions with side, assetClass, DTE and exposure', () => {
+    const { env, clock, ledger } = makeV3Ledger({ cashUsd: 500 });
+    const contract = occSymbol('AAPL', 150, 'put', datePlusDays(7));
+    ledger.applyFill('atm-v3', {
+      symbol: 'MSFT',
+      side: 'sell',
+      qty: 2,
+      priceUsd: 50,
+      at: clock.iso(),
+    }); // short 2 MSFT
+    ledger.applyFill('atm-v3', {
+      symbol: contract,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      priceUsd: 0.5,
+      option: { underlying: 'AAPL', expiration: datePlusDays(7), type: 'put', strikeUsd: 150, dte: 7 },
+      at: clock.iso(),
+    });
+    assert.ok(env.config.instruments.allowShort);
+    const snapshot = ledger.snapshot('atm-v3');
+    const stock = snapshot.positionsList.find((position) => position.symbol === 'MSFT');
+    const option = snapshot.positionsList.find((position) => position.assetClass === 'us_option');
+    assert.equal(stock.side, 'SHORT');
+    assert.equal(stock.assetClass, 'us_equity');
+    assert.equal(option.side, 'PUT');
+    assert.equal(option.direction, 'LONG');
+    assert.equal(option.multiplier, 100);
+    assert.equal(option.option.strikeUsd, 150);
+    assert.equal(option.option.dte, 7);
+    assert.equal(snapshot.longShares.MSFT, 0);
+    assert.equal(ledger.longSharesOf('atm-v3', 'MSFT'), 0);
+    assert.ok(snapshot.grossExposureUsd > 0);
+    assert.equal(snapshot.netExposureUsd, round2(-100 + 50)); // short MSFT 2*50, long put 1*0.5*100
+    assert.equal(ledger.optionContractsOf('atm-v3', contract), 1);
+  });
+
+  it('credit() is a one-time capital top-up that is not trading P&L', () => {
+    const { env, clock, ledger } = makeV3Ledger({ cashUsd: 20 });
+    ledger.credit('atm-v3', 30, { category: 'capital', reason: 'v3-migration', at: clock.iso() });
+    const snapshot = ledger.snapshot('atm-v3');
+    assert.equal(snapshot.cashUsd, 50);
+    assert.equal(snapshot.creditsUsd, 30);
+    assert.equal(snapshot.realizedPlUsd, 0);
+    assert.equal(snapshot.net7dUsd, 0);
+    assert.ok(env.config.instruments.allowMargin);
+    ledger.save();
+  });
+});
 
 describe('registry.js — population and the one-way door', () => {
   it('registers agents, reports population, and serves defensive copies', () => {
@@ -707,12 +1035,66 @@ function makeBrakeHarness(overrides = {}) {
   return { env, clock, brakes, base, check };
 }
 
-describe('brakes.js — the D1-D14 order wall', () => {
-  it('describes all fourteen brakes and allows a clean mandate order', () => {
+/**
+ * Brake harness with the v3 instrument regime fully enabled and a mandate that grants
+ * every instrument. Individual tests revoke permissions/config flags to probe denials.
+ */
+function makeV3BrakeHarness(overrides = {}) {
+  const env = makeEnv({ instruments: { ...V3_INSTRUMENTS, ...(overrides.instruments ?? {}) } });
+  const clock = makeClock();
+  const brakes = createBrakes({ config: env.config, paths: env.paths, clock });
+  const base = () => ({
+    mode: env.config.mode,
+    now: clock.now(),
+    agentId: 'atm-1',
+    dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+    quote: { symbol: 'AAPL', bid: 100, ask: 100.1, ts: clock.now() },
+    order: { symbol: 'AAPL', side: 'buy', qty: 1, priceUsd: 100.05, notionalUsd: 100.05 },
+    equityUsd: 5000,
+    positions: overrides.positions ?? [],
+    mandate: {
+      agentId: 'atm-1',
+      issuedAt: clock.iso(),
+      expiresAt: new Date(clock.now() + 10 * 60 * 1000).toISOString(),
+      state: 'STABLE',
+      sizeBudgetUsd: 1250,
+      maxOrderNotionalUsd: 1250,
+      maxDailyOrdersRemaining: 12,
+      allowedSymbols: ['AAPL', 'MSFT', 'NVDA', 'SPY', 'QQQ'],
+      allowExitOnly: false,
+      instruments: fullInstrumentPermissions(overrides.mandateInstruments ?? {}),
+    },
+    spec: {
+      specId: 'spec-1',
+      proofRef: 'https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL',
+      proof: { observedAt: new Date(clock.now() - HOUR_MS).toISOString() },
+    },
+    accountEquityUsd: 100_000,
+    allocatedEquityUsd: 10_000,
+    spreadBps: 5,
+    marginDebtUsd: 0,
+  });
+  const check = (mutate, extra = {}) => {
+    const input = { ...base(), ...extra };
+    if (typeof mutate === 'function') mutate(input);
+    return brakes.checkOrder(input);
+  };
+  return { env, clock, brakes, base, check };
+}
+
+describe('brakes.js — the hard order wall (D1-D18)', () => {
+  it('describes the full D1-D18 catalogue and allows a clean mandate order', () => {
     const { brakes, check } = makeBrakeHarness();
     const catalogue = brakes.describe();
-    assert.equal(catalogue.length, BRAKES.length);
-    assert.deepEqual(catalogue.map((row) => row.id), BRAKES.map((row) => row.id));
+    assert.equal(catalogue.length, 18);
+    const ids = catalogue.map((row) => row.id);
+    assert.deepEqual(ids, ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D10', 'D11', 'D12', 'D13', 'D14', 'D15', 'D16', 'D17', 'D18']);
+    assert.deepEqual(ids, BRAKES.map((brake) => brake.id));
+    assert.equal(new Set(ids).size, 18);
+    for (const rule of catalogue) {
+      assert.ok(typeof rule.code === 'string' && rule.code.length > 0);
+      assert.ok(typeof rule.enforcement === 'string' && rule.enforcement.length > 0);
+    }
     assert.equal(brakes.isLiveArmed(), false);
     assert.equal(brakes.isKillSwitchActive(), false);
     const decision = check();
@@ -729,11 +1111,23 @@ describe('brakes.js — the D1-D14 order wall', () => {
     assert.equal(decision.code, 'TRANSFER_FORBIDDEN');
   });
 
-  it('D2 denies margin, shorting and options', () => {
+  it('D2 is the instrument-permission gate (unknown asset class / revoked long stock)', () => {
     const { check } = makeBrakeHarness();
-    assert.equal(check((input) => { input.order.side = 'sell'; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(check((input) => { input.order.assetClass = 'option'; }).code, 'MARGIN_FORBIDDEN');
-    assert.equal(check((input) => { input.order.margin = true; }).code, 'MARGIN_FORBIDDEN');
+    assert.equal(check((input) => { input.order.assetClass = 'us_future'; }).code, 'INSTRUMENT_FORBIDDEN');
+    const revoked = check((input) => {
+      input.mandate.instruments = fullInstrumentPermissions({
+        longStock: false,
+        shortStock: false,
+        longOptions: false,
+        shortOptions: false,
+        coveredCalls: false,
+        spreads: false,
+        margin: false,
+      });
+    });
+    assert.equal(revoked.decision, 'DENY');
+    assert.equal(revoked.code, 'INSTRUMENT_FORBIDDEN');
+    assert.equal(revoked.brakeId, 'D2');
   });
 
   it('D3 denies a closed market, outside-window clocks and extended hours', () => {
@@ -865,6 +1259,294 @@ describe('brakes.js — the D1-D14 order wall', () => {
   });
 });
 
+describe('brakes.js — v3 instrument wall (D15-D18)', () => {
+  const asset = { shortable: true, marginable: true, tradable: true };
+
+  it('D15 permits a compliant short and denies every illegal short sale', () => {
+    const harness = makeV3BrakeHarness();
+    const shortOrder = (mutate = () => {}) => (input) => {
+      input.order = { symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 10, notionalUsd: 20, asset };
+      input.quote = { symbol: 'AAPL', bid: 10, ask: 10.02 };
+      mutate(input);
+    };
+    const allowed = harness.check(shortOrder());
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+    assert.equal(allowed.shortNotionalUsd, 20);
+
+    const disabled = makeV3BrakeHarness({ instruments: { allowShort: false } });
+    assert.equal(disabled.check(shortOrder()).code, 'SHORT_FORBIDDEN');
+    assert.equal(
+      harness.check(shortOrder((input) => {
+        input.mandate.instruments = fullInstrumentPermissions({ shortStock: false });
+      })).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      harness.check(shortOrder((input) => { input.order.asset = { shortable: false, marginable: true }; })).code,
+      'SHORT_FORBIDDEN',
+    );
+    assert.equal(
+      harness.check(shortOrder((input) => { input.order.qty = 1.5; })).code,
+      'SHORT_FORBIDDEN',
+    );
+    // config short cap is 25 USD; a 30 USD short is refused
+    assert.equal(
+      harness.check(shortOrder((input) => { input.order.qty = 3; input.order.notionalUsd = 30; })).code,
+      'SHORT_FORBIDDEN',
+    );
+
+    // selling only what is held is an exit, not a short
+    const covered = harness.check((input) => {
+      input.order = { symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 100.05, notionalUsd: 200.1 };
+      input.positions = [{ symbol: 'AAPL', qty: 2, marketValueUsd: 200.1, avgEntryPriceUsd: 100 }];
+    });
+    assert.equal(covered.decision, 'ALLOW', JSON.stringify(covered));
+  });
+
+  it('D16 permits long options and covered calls but always denies naked short options', () => {
+    const call = occSymbol('AAPL', 150, 'call', datePlusDays(11));
+    const put = occSymbol('AAPL', 145, 'put', datePlusDays(11));
+    const optionMeta = (type, strike) => ({
+      underlying: 'AAPL',
+      expiration: datePlusDays(11),
+      type,
+      strikeUsd: strike,
+      multiplier: 100,
+    });
+    const longCall = (input) => {
+      input.order = {
+        symbol: call,
+        assetClass: 'us_option',
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        option: optionMeta('call', 150),
+      };
+      input.quote = { symbol: call, bid: 0.03, ask: 0.05 };
+    };
+    const harness = makeV3BrakeHarness();
+    const allowed = harness.check(longCall);
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+    assert.equal(allowed.structure, 'long_call');
+    assert.equal(allowed.premiumNotionalUsd, 4);
+    assert.equal(allowed.contracts, 1);
+    assert.equal(allowed.dte, 11);
+
+    const noOptions = makeV3BrakeHarness({ instruments: { allowOptions: false } });
+    assert.equal(noOptions.check(longCall).code, 'OPTION_FORBIDDEN');
+    assert.equal(
+      harness.check((input) => {
+        longCall(input);
+        input.mandate.instruments = fullInstrumentPermissions({ longOptions: false });
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+    // contracts cap (config maxContracts = 3)
+    assert.equal(
+      harness.check((input) => { longCall(input); input.order.qty = 4; input.order.notionalUsd = 16; }).code,
+      'OPTION_FORBIDDEN',
+    );
+    // whole contracts only
+    assert.equal(
+      harness.check((input) => { longCall(input); input.order.qty = 1.5; }).code,
+      'OPTION_FORBIDDEN',
+    );
+
+    // naked short options are always denied, even with shortOptions granted
+    const nakedCall = harness.check((input) => {
+      input.order = {
+        symbol: call,
+        assetClass: 'us_option',
+        side: 'sell',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        option: optionMeta('call', 150),
+      };
+    });
+    assert.equal(nakedCall.code, 'OPTION_FORBIDDEN');
+    assert.match(nakedCall.reason, /covered call requires|naked short options/i);
+    const nakedPut = harness.check((input) => {
+      input.order = {
+        symbol: put,
+        assetClass: 'us_option',
+        side: 'sell',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        option: optionMeta('put', 145),
+      };
+    });
+    assert.equal(nakedPut.code, 'OPTION_FORBIDDEN');
+    assert.match(nakedPut.reason, /naked short options/i);
+
+    // covered call requires 100 long shares at order time
+    const coveredOrder = (input) => {
+      input.order = {
+        symbol: call,
+        assetClass: 'us_option',
+        side: 'sell',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        structure: 'covered_call',
+        option: optionMeta('call', 150),
+      };
+      input.quote = { symbol: call, bid: 0.03, ask: 0.05 };
+    };
+    const uncovered = harness.check(coveredOrder);
+    assert.equal(uncovered.code, 'OPTION_FORBIDDEN');
+    assert.match(uncovered.reason, /covered call requires/i);
+
+    const covered = makeV3BrakeHarness({
+      positions: [{ symbol: 'AAPL', qty: 100, marketValueUsd: 10_000, avgEntryPriceUsd: 100 }],
+    });
+    const coveredAllowed = covered.check(coveredOrder);
+    assert.equal(coveredAllowed.decision, 'ALLOW', JSON.stringify(coveredAllowed));
+    assert.equal(coveredAllowed.structure, 'covered_call');
+
+    // premium cap by the agent's equity (25% of 5000 = 1250; mandate/config cap 25 USD)
+    assert.equal(
+      harness.check((input) => { longCall(input); input.order.notionalUsd = 40; }).code,
+      'OPTION_FORBIDDEN',
+    );
+  });
+
+  it('D16 spread rules: defined-risk 2-leg verticals pass; mixed expiry, same-side and unknown structures fail', () => {
+    const harness = makeV3BrakeHarness();
+    const longCall = occSymbol('AAPL', 150, 'call', datePlusDays(11));
+    const shortCall = occSymbol('AAPL', 155, 'call', datePlusDays(11));
+    const spread = (a, b, structure = 'bull_call_spread') => (input) => {
+      input.order = {
+        symbol: a,
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.12,
+        notionalUsd: 12,
+        structure,
+        legs: [{ symbol: a, side: 'buy', ratioQty: 1 }, { symbol: b, side: 'sell', ratioQty: 1 }],
+      };
+      input.quote = { symbol: a, bid: 0.11, ask: 0.13 };
+    };
+    const allowed = harness.check(spread(longCall, shortCall));
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+    assert.equal(allowed.structure, 'bull_call_spread');
+    assert.equal(allowed.maxLossUsd, 500); // width 5 × 100 × 1
+    assert.equal(allowed.contracts, 1);
+
+    // mixed expiry: not defined risk
+    assert.equal(harness.check(spread(longCall, occSymbol('AAPL', 155, 'call', datePlusDays(18)))).code, 'OPTION_FORBIDDEN');
+    // different underlying
+    assert.equal(harness.check(spread(longCall, occSymbol('MSFT', 155, 'call', datePlusDays(11)))).code, 'OPTION_FORBIDDEN');
+    // both legs long = not a defined-risk vertical
+    assert.equal(
+      harness.check((input) => {
+        input.order = {
+          symbol: longCall,
+          side: 'buy',
+          qty: 1,
+          priceUsd: 0.12,
+          notionalUsd: 12,
+          legs: [{ symbol: longCall, side: 'buy' }, { symbol: shortCall, side: 'buy' }],
+        };
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+    // unknown structure
+    assert.equal(harness.check(spread(longCall, shortCall, 'iron_condor')).code, 'OPTION_FORBIDDEN');
+    // spreads disabled in config
+    const noSpreads = makeV3BrakeHarness({ instruments: { allowSpreads: false } });
+    assert.equal(noSpreads.check(spread(longCall, shortCall)).code, 'OPTION_FORBIDDEN');
+    // spreads not granted by the mandate
+    assert.equal(
+      harness.check((input) => {
+        spread(longCall, shortCall)(input);
+        input.mandate.instruments = fullInstrumentPermissions({ spreads: false, shortOptions: false });
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+  });
+
+  it('D17 caps margin debt and refuses margin when disabled', () => {
+    const harness = makeV3BrakeHarness();
+    const over = harness.check((input) => {
+      input.order.marginRequiredUsd = 200;
+      input.mandate.instruments = fullInstrumentPermissions({ maxMarginUsd: 100 });
+    });
+    assert.equal(over.code, 'MARGIN_LIMIT');
+    assert.equal(over.brakeId, 'D17');
+
+    const within = harness.check((input) => {
+      input.order.marginRequiredUsd = 50;
+      input.mandate.instruments = fullInstrumentPermissions({ maxMarginUsd: 100 });
+    });
+    assert.equal(within.decision, 'ALLOW', JSON.stringify(within));
+
+    const noMargin = makeV3BrakeHarness({ instruments: { allowMargin: false } });
+    assert.equal(noMargin.check((input) => { input.order.marginRequiredUsd = 50; }).code, 'MARGIN_LIMIT');
+
+    const noMandateMargin = harness.check((input) => {
+      input.order.marginRequiredUsd = 50;
+      input.mandate.instruments = fullInstrumentPermissions({ margin: false });
+    });
+    assert.equal(noMandateMargin.code, 'MARGIN_LIMIT');
+  });
+
+  it('D18 expiry guard blocks short-DTE openings but sell-to-close is always allowed', () => {
+    const harness = makeV3BrakeHarness();
+    const soon = occSymbol('AAPL', 150, 'call', datePlusDays(1));
+    const shortDte = harness.check((input) => {
+      input.order = {
+        symbol: soon,
+        assetClass: 'us_option',
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        option: { underlying: 'AAPL', expiration: datePlusDays(1), type: 'call', strikeUsd: 150, multiplier: 100 },
+      };
+    });
+    assert.equal(shortDte.code, 'EXPIRY_GUARD');
+    assert.equal(shortDte.brakeId, 'D18');
+    assert.equal(shortDte.dte, 1);
+
+    const far = occSymbol('AAPL', 150, 'call', datePlusDays(20));
+    assert.equal(
+      harness.check((input) => {
+        input.order = {
+          symbol: far,
+          assetClass: 'us_option',
+          side: 'buy',
+          qty: 1,
+          priceUsd: 0.04,
+          notionalUsd: 4,
+          option: { underlying: 'AAPL', expiration: datePlusDays(20), type: 'call', strikeUsd: 150, multiplier: 100 },
+        };
+      }).code,
+      'OPTION_FORBIDDEN',
+    );
+
+    const expiring = occSymbol('AAPL', 150, 'call', datePlusDays(0));
+    const closing = makeV3BrakeHarness({
+      positions: [{ symbol: expiring, qty: 1, assetClass: 'us_option', avgPriceUsd: 0.04, marketValueUsd: 4 }],
+    });
+    const allowed = closing.check((input) => {
+      input.order = {
+        symbol: expiring,
+        assetClass: 'us_option',
+        side: 'sell',
+        qty: 1,
+        priceUsd: 0.04,
+        notionalUsd: 4,
+        positionIntent: 'sell_to_close',
+        option: { underlying: 'AAPL', expiration: datePlusDays(0), type: 'call', strikeUsd: 150, multiplier: 100 },
+      };
+    });
+    assert.equal(allowed.decision, 'ALLOW', JSON.stringify(allowed));
+  });
+});
+
 // ---------------------------------------------------------------------------
 // treasurer.js
 // ---------------------------------------------------------------------------
@@ -916,6 +1598,45 @@ describe('treasurer.js — metabolism, runway and death verdicts', () => {
     assert.equal(tick.surplus7dUsd, 0);
     assert.equal(tick.populationCapRemaining, world.env.config.population.cap - 2);
     assert.equal(tick.halted, false);
+  });
+
+  it('issues per-agent instrument mandates derived from config.instruments + equity', async () => {
+    const v3Env = makeEnv({ instruments: { ...V3_INSTRUMENTS } });
+    const v3World = makeTreasuryWorld({ env: v3Env });
+    const tick = await v3World.treasurer.tick({ prices: {} });
+    const mandate = tick.mandates['atm-a'];
+    assert.equal(mandate.instruments.longStock, true);
+    assert.equal(mandate.instruments.shortStock, true);
+    assert.equal(mandate.instruments.longOptions, true);
+    assert.equal(mandate.instruments.shortOptions, true);
+    assert.equal(mandate.instruments.coveredCalls, true);
+    assert.equal(mandate.instruments.spreads, true);
+    assert.equal(mandate.instruments.margin, true);
+    assert.ok(mandate.instruments.allowedStructures.includes('bull_call_spread'));
+    assert.equal(mandate.instruments.maxContracts, 3);
+    assert.equal(mandate.instruments.maxShortNotionalUsd, 25); // min(config 25, 1.0 × 5000 equity)
+    assert.equal(mandate.instruments.maxOptionPremiumUsd, 25); // min(config 25, 0.25 × 5000 equity)
+    assert.equal(mandate.equityUsd, 5000);
+    const view = tick.agentViews.find((agentView) => agentView.agentId === 'atm-a');
+    assert.equal(view.instruments.shortStock, true);
+    assert.equal(view.marginDebtUsd, 0);
+    assert.equal(view.grossExposureUsd, 0);
+    assert.equal(tick.instruments.allowOptions, true);
+    assert.equal(tick.instruments.minDTE, 2);
+    assert.equal(tick.instruments.autoCloseDTE, 1);
+    assert.equal(tick.marginDebtUsd, 0);
+    assert.equal(tick.grossExposureUsd, 0);
+
+    // legacy config keeps the v2 wall: no short/options/margin permissions are issued
+    const legacyWorld = makeTreasuryWorld();
+    const legacyTick = await legacyWorld.treasurer.tick({ prices: {} });
+    const legacyMandate = legacyTick.mandates['atm-a'];
+    assert.equal(legacyMandate.instruments.longStock, true);
+    assert.equal(legacyMandate.instruments.shortStock, false);
+    assert.equal(legacyMandate.instruments.longOptions, false);
+    assert.equal(legacyMandate.instruments.margin, false);
+    assert.equal(legacyMandate.instruments.maxContracts, 0);
+    assert.equal(legacyTick.instruments.allowOptions, false);
   });
 
   it('computes runway from (equity - death floor) / burn, never raw balance', async () => {
@@ -1534,6 +2255,184 @@ describe('reaper.js — independent death execution', () => {
     assert.equal(result.checked, 0);
     assert.equal(world.registry.get(world.agentId).status, 'alive');
     assert.match(result.skipped[0].reason, /broker_unavailable/);
+  });
+
+  it('liquidates a short stock position on death (buy-to-cover, not a long-only sell)', async () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const { registry, ledger } = seedPopulation({
+      env,
+      clock,
+      agents: [
+        {
+          id: 'atm-short',
+          endowmentUsd: 5000,
+          bornAt: new Date(T0 - 3 * HOUR_MS).toISOString(),
+          genome: { symbol: 'AAPL', family: 'momentum' },
+        },
+      ],
+    });
+    ledger.applyFill('atm-short', { symbol: 'AAPL', side: 'sell', qty: 10, priceUsd: 100, at: clock.iso() });
+    ledger.charge('atm-short', 4800, { category: 'inference', role: 'executor', at: clock.iso() });
+    // cash 1200, short 10 @ mark 100 → equity 200 <= death floor 250
+    const broker = createFakeBroker({
+      equityUsd: 50_000,
+      positions: [
+        {
+          symbol: 'AAPL',
+          assetClass: 'us_equity',
+          qtySigned: -10,
+          qty: -10,
+          avgEntryPriceUsd: 100,
+          marketValueUsd: -1000,
+        },
+      ],
+    });
+    const journal = createJournal({ paths: env.paths, config: env.config });
+    const reaper = createReaper({ broker, registry, ledger, journal, config: env.config, paths: env.paths, clock });
+
+    const result = await reaper.sweep({});
+    assert.equal(result.killed.length, 1);
+    assert.equal(result.killed[0].cause, 'insufficient_funds');
+    assert.equal(result.killed[0].finalEquityUsd, 200);
+    // the liquidation order is a BUY to cover — not a sell
+    assert.equal(broker.state.submitted.length, 1);
+    assert.equal(broker.state.submitted[0].side, 'buy');
+    assert.equal(broker.state.submitted[0].assetClass, 'us_equity');
+    assert.equal(broker.state.submitted[0].qty, 10);
+    assert.deepEqual(ledger.book('atm-short').positions, {});
+    assert.equal(ledger.snapshot('atm-short').cashUsd, 0);
+    assert.equal(ledger.pool().poolUsd, 200);
+    assert.equal(registry.get('atm-short').status, 'dead');
+    assert.equal(journal.count(), 1);
+    const obituary = journal.list()[0];
+    assert.equal(validateObituary(obituary).agentId, 'atm-short');
+    assert.equal(obituary.finalEquityUsd, 200);
+    assert.equal(obituary.netPlUsd, -4800);
+
+    // idempotent: a second sweep neither re-liquidates nor duplicates the obituary
+    const second = await reaper.sweep({});
+    assert.equal(second.killed.length, 0);
+    assert.equal(broker.state.submitted.length, 1);
+    assert.equal(journal.count(), 1);
+  });
+
+  it('liquidates long options and a defined-risk spread group on death, booking realized P&L', async () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const { registry, ledger } = seedPopulation({
+      env,
+      clock,
+      agents: [
+        {
+          id: 'atm-optional',
+          endowmentUsd: 500,
+          bornAt: new Date(T0 - 3 * HOUR_MS).toISOString(),
+          genome: { symbol: 'AAPL', family: 'momentum' },
+        },
+      ],
+    });
+    const longCall = occSymbol('AAPL', 150, 'call', datePlusDays(11));
+    const spreadLong = occSymbol('AAPL', 160, 'call', datePlusDays(11));
+    const spreadShort = occSymbol('AAPL', 165, 'call', datePlusDays(11));
+    const longPut = occSymbol('AAPL', 145, 'put', datePlusDays(11));
+    ledger.applyFill('atm-optional', { symbol: longCall, assetClass: 'us_option', side: 'buy', qty: 1, priceUsd: 0.4, at: clock.iso() });
+    ledger.applyFill('atm-optional', {
+      symbol: spreadLong,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      priceUsd: 0.5,
+      groupId: 'spread-g1',
+      structure: 'bull_call_spread',
+      at: clock.iso(),
+    });
+    ledger.applyFill('atm-optional', {
+      symbol: spreadShort,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      priceUsd: 0.2,
+      groupId: 'spread-g1',
+      structure: 'bull_call_spread',
+      at: clock.iso(),
+    });
+    ledger.applyFill('atm-optional', { symbol: longPut, assetClass: 'us_option', side: 'buy', qty: 1, priceUsd: 0.3, at: clock.iso() });
+    // cash after debits/credits: 500 - 40 - 50 + 20 - 30 = 400
+    ledger.charge('atm-optional', 320, { category: 'inference', role: 'executor', at: clock.iso() });
+    // broker marks: 0.60 / 0.70 / 0.10 / 0.35 → equity 235 <= floor 250
+    const broker = createFakeBroker({
+      equityUsd: 50_000,
+      positions: [
+        { symbol: longCall, assetClass: 'us_option', qtySigned: 1, multiplier: 100, avgEntryPriceUsd: 0.4, marketValueUsd: 60 },
+        { symbol: spreadLong, assetClass: 'us_option', qtySigned: 1, multiplier: 100, avgEntryPriceUsd: 0.5, marketValueUsd: 70 },
+        { symbol: spreadShort, assetClass: 'us_option', qtySigned: -1, multiplier: 100, avgEntryPriceUsd: 0.2, marketValueUsd: -10 },
+        { symbol: longPut, assetClass: 'us_option', qtySigned: 1, multiplier: 100, avgEntryPriceUsd: 0.3, marketValueUsd: 35 },
+      ],
+    });
+    const journal = createJournal({ paths: env.paths, config: env.config });
+    const reaper = createReaper({ broker, registry, ledger, journal, config: env.config, paths: env.paths, clock });
+
+    const result = await reaper.sweep({});
+    assert.equal(result.killed.length, 1);
+    assert.equal(result.killed[0].finalEquityUsd, 235);
+    // four close orders: long legs sell_to_close, the short spread leg buy_to_close
+    assert.equal(broker.state.submitted.length, 4);
+    const intents = broker.state.submitted.map((order) => `${order.assetClass}:${order.side}:${order.positionIntent}`);
+    assert.deepEqual(intents.sort(), [
+      'us_option:buy:buy_to_close',
+      'us_option:sell:sell_to_close',
+      'us_option:sell:sell_to_close',
+      'us_option:sell:sell_to_close',
+    ]);
+    assert.deepEqual(ledger.book('atm-optional').positions, {});
+    assert.equal(ledger.snapshot('atm-optional').cashUsd, 0);
+    assert.equal(ledger.pool().poolUsd, 235);
+    // realized P&L booked on the closes: +20 +20 +10 +5 = 55 (actual marks vs cost)
+    assert.equal(ledger.snapshot('atm-optional').realizedPlUsd, 55);
+    // both spread legs were opened and then closed under the same internal groupId
+    const groupFills = ledger.history('atm-optional', { limit: 10 }).filter((fill) => fill.groupId === 'spread-g1');
+    assert.equal(groupFills.length, 4); // 2 opening legs + 2 closing legs
+    assert.equal(groupFills.filter((fill) => fill.realizedPlUsd !== 0).length, 2);
+    assert.equal(journal.count(), 1);
+    assert.equal(validateObituary(journal.list()[0]).agentId, 'atm-optional');
+    assert.equal(journal.list()[0].finalEquityUsd, 235);
+
+    const second = await reaper.sweep({});
+    assert.equal(second.killed.length, 0);
+    assert.equal(broker.state.submitted.length, 4);
+    assert.equal(journal.count(), 1);
+  });
+
+  it('recovery settles a dead agent holding a short position (no phantom position survives)', async () => {
+    const env = makeEnv();
+    const clock = makeClock();
+    const { registry, ledger } = seedPopulation({
+      env,
+      clock,
+      agents: [{ id: 'atm-half', endowmentUsd: 50 }],
+    });
+    ledger.applyFill('atm-half', { symbol: 'AAPL', side: 'sell', qty: 2, priceUsd: 10, at: clock.iso() });
+    ledger.charge('atm-half', 20, { category: 'inference', role: 'executor', at: clock.iso() });
+    registry.markDead('atm-half', { cause: 'risk_breach', at: clock.iso(), finalEquityUsd: 50 });
+    const broker = createFakeBroker({
+      equityUsd: 50_000,
+      positions: [
+        { symbol: 'AAPL', assetClass: 'us_equity', qtySigned: -2, qty: -2, avgEntryPriceUsd: 10, marketValueUsd: -20 },
+      ],
+    });
+    const journal = createJournal({ paths: env.paths, config: env.config });
+    const reaper = createReaper({ broker, registry, ledger, journal, config: env.config, paths: env.paths, clock });
+
+    const result = await reaper.sweep({});
+    assert.equal(result.killed.length, 0);
+    assert.deepEqual(ledger.book('atm-half').positions, {});
+    assert.equal(ledger.snapshot('atm-half').cashUsd, 0);
+    assert.equal(journal.count(), 1);
+    assert.equal(journal.list()[0].cause, 'risk_breach');
+    assert.equal(broker.state.submitted.length, 1);
+    assert.equal(broker.state.submitted[0].side, 'buy');
+    assert.ok(result.skipped.some((entry) => entry.agentId === 'atm-half'));
   });
 });
 

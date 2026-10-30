@@ -106,14 +106,16 @@ the operating config).
 
 ## Safety
 
-- 14 hard denials enforced in code, before the broker client sees an order: no transfers/
-  withdrawals/ACH/wires/crypto/account changes (the methods do not exist), no margin,
-  leverage, shorting, or options, no off-session trading, symbol/size/spread caps, daily
-  order caps, daily-loss and drawdown deaths, live-mode arming, proof-required trades,
-  replication gates, kill switch, allocation cap, one-way death.
-- Paper is default. Live needs `mode=live` **and** `allowLive=true` **and** an operator
-  `LIVE_ARMED` marker (`automaton arm-live --confirm "ARM LIVE"`). Keys are read only from
-  `.env`; tool output and the status route are redacted.
+- **18 hard denials enforced in code**, before the broker client sees an order: no transfers/
+  withdrawals/ACH/wires/crypto/account changes (the methods do not exist), off-session trading,
+  symbol/size/spread caps, daily order caps, daily-loss and drawdown deaths, live-mode arming,
+  proof-required trades, replication gates, kill switch, allocation cap, one-way death — plus the
+  v3.0 instrument gates **D2/D15–D18**: short sales, options structures (never naked short options),
+  covered-call coverage, defined-risk spreads, margin debt and the option expiry guard.
+- Paper is default. **Multi-instrument trading (margin, short stock, options, spreads) is a
+  paper-mode capability expansion under hard caps**; live needs `mode=live` **and**
+  `allowLive=true` **and** an operator `LIVE_ARMED` marker (`automaton arm-live --confirm "ARM LIVE"`).
+  Keys are read only from `.env`; tool output and the status route are redacted.
 - **Per-agent isolated research sidecar**: each living agent gets its own hourly LLM news
   briefing about its own book/symbols (Alpaca News API) with a private journal; the briefing
   can veto entries, shrink size or force exits, and the agent pays for it from its own ledger
@@ -145,17 +147,29 @@ the operating config).
   (breakout / gap-fade, 1-minute lane); genesis mixes them ~50/50 and existing populations rebalance
   once on first start. The panel groups agents by category and shows each bot's strategy type,
   estimated trading interval, and its latest agent thesis/plan. Contract: `docs/BOT-AGENTS.md`.
+- **Multi-instrument paper trading (v3.0):** bots may use **margin, short selling, long calls/puts,
+  covered calls and defined-risk vertical spreads**, actively chosen by the bot's agent or its family
+  playbook (option premium sized to 25% of equity / $25 per order, DTE 2–14, auto-close at 1 DTE;
+  short stock whole shares within the short cap; covered calls only with 100+ owned shares; **naked
+  short options are never allowed**). The paper account was topped up to **$50/bot** (one-time +$30
+  from account cash) and part of the population now trades affordable underlyings (F/SOFI/BAC/INTC)
+  so whole-share shorts and cheap option contracts are usable. New hard brakes D2/D15–D18 gate every
+  order; death liquidates signed stock and option positions before settling the estate. The panel
+  renders LONG/SHORT/CALL/PUT positions with strike/expiry/DTE, margin/exposure totals, instrument
+  badges, playbooks and the bot's instrument plan. Contract: `docs/INSTRUMENTS.md`; ops:
+  `docs/RUNBOOK.md` §8d.
 
 ## Status (this build)
 
-- 9 test suites: mortality 55, market 34, plugin 41, independent integration 21, security 41,
-  research 13, rankings 16, control 15 and bot-agent 8 — **244 tests, 244 pass, 0 fail**. Run each
-  file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox `spawn EPERM`.
+- 10 test suites: mortality 70, market 43, plugin 42, independent integration 34, security 53,
+  research 13, rankings 16, control 16, bot-agent 8 and instruments 7 — **302 tests, 302 pass,
+  0 fail**. Run each file directly, e.g. `node test/mortality.test.js`; `node --test` hits a sandbox
+  `spawn EPERM`.
 - Control-panel engine verified in `test/control.test.js` (research cadence windows + live
   reconfigure + settings-overlay persistence/rollback; strategy plan/transactions; daily/weekly/
   monthly leaderboards; period-boundary rewards with cap scaling, once-per-period and live reward
   reconfigure) and in `test/rankings.test.js` (16 tests). Host control actions and every dashboard
-  mapping are covered by the plugin suite (40 tests). Live UI verification follows the next Host
+  mapping are covered by the plugin suite (42 tests). Live UI verification follows the next Host
   restart.
 - Research sidecar verified end-to-end: `test/research.test.js` (isolation, schema clamp,
   malformed-reply containment, per-agent charging, hourly scheduling, stale expiry) plus

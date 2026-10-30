@@ -36,6 +36,7 @@ import { createReplicator } from './replicator.js';
 import { createProspector } from './prospector.js';
 import { createBuilder } from './builder.js';
 import { createExecutor } from './executor.js';
+import { liquidatePositions } from './reaper.js';
 import {
   createClock,
   HOUR_MS,
@@ -327,39 +328,19 @@ export async function runSimulation({
       const agent = registry.get(verdict.agentId);
       if (!agent || agent.status === 'dead') return;
       const finalEquityUsd = numberOrZero(verdict.finalEquityUsd) || equityOf(ledgerRole, agent.id, prices);
-      // Liquidate anything still held, at the current mark.
-      const book = (() => {
-        try {
-          return ledgerRole.book(agent.id);
-        } catch {
-          return { positions: {} };
-        }
-      })();
-      for (const [symbol, position] of Object.entries(book?.positions ?? {})) {
-        const qty = round4(numberOrZero(position?.qty));
-        if (!(qty > 0)) continue;
-        try {
-          const quote = await broker.getLatestQuote(symbol);
-          const order = await broker.submitOrder({
-            symbol,
-            side: 'sell',
-            qty,
-            type: 'market',
-            clientOrderId: `atm:${agent.id}:reaper:${symbol}`,
-            timeInForce: 'day',
-          });
-          await ledgerRole.applyFill(agent.id, {
-            symbol,
-            side: 'sell',
-            qty: round4(numberOrZero(order?.filledQty) || qty),
-            priceUsd: numberOrZero(order?.avgFillPriceUsd) || numberOrZero(quote?.bid) || numberOrZero(quote?.last),
-            at: clock.iso(),
-            orderId: order?.id ?? null,
-          });
-        } catch (error) {
-          errors.push({ role: 'sim-reaper', agentId: agent.id, code: error?.code ?? 'ERROR', message: error?.message ?? String(error) });
-        }
-      }
+      // Close every position the v3 ledger can hold: long/short stock and option legs
+      // (incl. spread legs) via the same signed/option liquidation helper the Reaper uses.
+      await liquidatePositions({
+        broker,
+        ledger: ledgerRole,
+        agentId: agent.id,
+        marks: prices ?? {},
+        at: clock.iso(),
+        marketOpen: true,
+        clientOrderIdPrefix: `atm:${agent.id}:sim-reaper`,
+        errors,
+        bookOnFailure: true, // simulation has no external truth: always clear the book
+      });
       const afterLiquidation = equityOf(ledgerRole, agent.id, prices);
       await registry.markDead(agent.id, {
         cause: verdict.cause,
@@ -379,12 +360,20 @@ export async function runSimulation({
       } catch (error) {
         errors.push({ role: 'journal', agentId: agent.id, code: error?.code ?? 'ERROR', message: error?.message ?? String(error) });
       }
-      // Sweep residual virtual cash to the treasury pool.
+      // Sweep residual virtual cash to the treasury pool; a margined estate's debt is
+      // absorbed by the pool so the dead book does not keep a negative balance.
       try {
-        const residual = Math.max(0, round2(afterLiquidation || finalEquityUsd));
-        await ledgerRole.transfer(agent.id, '__treasury__', residual, { reason: 'death', at: clock.now() });
+        const exactCashUsd = numberOrZero(ledgerRole.get?.(agent.id)?.cashUsd);
+        if (exactCashUsd > 0) {
+          await ledgerRole.transfer(agent.id, '__treasury__', exactCashUsd, { reason: 'death', at: clock.now() });
+        } else if (exactCashUsd < 0) {
+          await ledgerRole.transfer('__treasury__', agent.id, -exactCashUsd, {
+            reason: 'death_debt_absorb',
+            at: clock.now(),
+          });
+        }
       } catch {
-        /* a zero/negative residual is not transferable; death still stands */
+        /* a zero residual is not transferable; death still stands */
       }
       deaths.push(obituary);
       causes[obituary.cause] = (causes[obituary.cause] ?? 0) + 1;

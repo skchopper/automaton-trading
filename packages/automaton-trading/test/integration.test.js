@@ -35,7 +35,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadConfig, statePaths } from '../src/config.js';
+import { loadConfig, statePaths, defaultConfig } from '../src/config.js';
 import { createBroker as createSimBroker } from '../src/broker-sim.js';
 import { createAutomaton, genesisGenome } from '../src/orchestrator.js';
 import { createReaper } from '../src/reaper.js';
@@ -44,10 +44,14 @@ import { createJournal } from '../src/journal.js';
 import { createLedger } from '../src/ledger.js';
 import { createRegistry } from '../src/registry.js';
 import { OBITUARY_FIELDS, validateObituary } from '../src/journal.js';
-import { burnPerHour } from '../src/treasurer.js';
+import { burnPerHour, createTreasurer, deriveInstrumentPermissions } from '../src/treasurer.js';
+import { createBrakes } from '../src/brakes.js';
+import { createExecutor } from '../src/executor.js';
 import { MUTABLE_FIELDS } from '../src/replicator.js';
 import { createClock, round2 } from '../src/util.js';
 import { targetFamilyForIndex } from '../src/strategy-types.js';
+import { resolveInstrumentPermissions } from '../src/instruments.js';
+import { DEATH_CAUSES } from '../src/contracts.js';
 
 const PKG_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const T0 = Date.UTC(2026, 0, 5, 15, 0, 0); // Mon 10:00 America/New_York (inside 09:35-15:50)
@@ -694,9 +698,10 @@ describe('end-to-end (mode=sim): population, metabolism, orders, demo death, per
       assert.equal(/reaper|killswitch|kill-switch/i.test(key), false, `engine exposes "${key}"`);
     }
     const brakesView = automaton.brakesView();
-    assert.equal(brakesView.rules.length, 14);
+    // v3.0: the wall is now D1-D18 (D15 short sale, D16 options, D17 margin, D18 expiry guard).
+    assert.equal(brakesView.rules.length, 18);
     assert.deepEqual(brakesView.rules.map((rule) => rule.id), [
-      'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D10', 'D11', 'D12', 'D13', 'D14',
+      'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'D10', 'D11', 'D12', 'D13', 'D14', 'D15', 'D16', 'D17', 'D18',
     ]);
   });
 });
@@ -939,7 +944,7 @@ describe('engine.js facade: read-only views, no secrets, never auto-starts tradi
     assertNoSecrets(configView, secrets, 'engine.configView()');
 
     const brakesView = await engine.brakesView();
-    assert.equal(brakesView.rules.length, 14);
+    assert.equal(brakesView.rules.length, 18);
     assert.equal(brakesView.killSwitch, false);
     assert.equal(brakesView.liveArmed, false);
     assert.equal(brakesView.mode, 'sim');
@@ -1020,5 +1025,1212 @@ describe('engine.js facade: read-only views, no secrets, never auto-starts tradi
     assert.equal(cleared.killSwitch, false);
     assert.equal(fs.existsSync(simPaths.killSwitch), false);
     assert.equal(engine.isRunning(), false);
+  });
+});
+
+// ===========================================================================
+// v3.0 multi-instrument: real brakes + real executor + deterministic sim broker
+// ===========================================================================
+
+/**
+ * Multi-instrument test world: real brakes/executor/ledger/registry and the sim broker,
+ * which implements getAsset/getOptionChain/getOptionQuote, short stock and mleg orders.
+ * The broker shares the test clock so its synthetic expiries line up with ledger DTE.
+ */
+function makeInstrumentWorld({ seed = 7, symbol = 'META', endowmentUsd = 5000, overrides = {} } = {}) {
+  const env = makeEnv({
+    population: { initial: 0, cap: 10 },
+    endowmentUsd,
+    replication: {
+      childEndowmentUsd: Math.max(1, Math.floor(endowmentUsd / 2)),
+      surplus7dUsd: 150,
+      minRunwayHours: 72,
+    },
+    instruments: {
+      maxOptionPremiumPctEquity: 0.5,
+      maxOptionPremiumUsd: 2500,
+      maxShortNotionalUsd: 2500,
+      maxMarginPctEquity: 0.5,
+    },
+    risk: { maxOrderPctOfEquity: 0.5, maxOrderNotionalUsd: 2500, maxOpenPositions: 8, maxPositionPct: 0.8 },
+    ...overrides,
+  });
+  const clock = makeClock(T0);
+  const broker = createSimBroker(env.config, { seed, accountEquityUsd: 100000, clock });
+  const registry = createRegistry({ paths: env.paths, config: env.config, clock });
+  const ledger = createLedger({ paths: env.paths, config: env.config, clock });
+  const brakes = createBrakes({ config: env.config, paths: env.paths, clock });
+  const executor = createExecutor({ broker, brakes, ledger, config: env.config, clock });
+  const id = 'atm-0000beef';
+  registry.register({
+    id,
+    generation: 0,
+    bornAt: clock.iso(),
+    status: 'alive',
+    endowmentUsd,
+    genome: { symbol, family: 'momentum' },
+    mutation: null,
+    specId: 'spec-v3',
+    notes: [],
+  });
+  ledger.ensureAgent(id, { endowmentUsd, at: clock.iso() });
+  ledger.grant(id, endowmentUsd, { reason: 'genesis-endowment', at: clock.iso() });
+  ledger.anchorToBrokerEquity(100000);
+  const permissions = deriveInstrumentPermissions(env.config, endowmentUsd);
+  const mandate = {
+    agentId: id,
+    issuedAt: clock.iso(),
+    expiresAt: new Date(T0 + 10 * 60 * 1000).toISOString(),
+    state: 'STABLE',
+    sizeBudgetUsd: 2500,
+    maxOrderNotionalUsd: 2500,
+    maxDailyOrdersRemaining: 12,
+    allowedSymbols: [...env.config.symbols],
+    allowExitOnly: false,
+    instruments: permissions,
+    accountEquityUsd: 100000,
+    allocatedEquityUsd: endowmentUsd,
+    buyingPowerUsd: 100000,
+  };
+  return {
+    env,
+    config: env.config,
+    paths: env.paths,
+    clock,
+    broker,
+    registry,
+    ledger,
+    brakes,
+    executor,
+    id,
+    symbol,
+    endowmentUsd,
+    permissions,
+    mandate,
+    quote: broker.getLatestQuote(symbol),
+  };
+}
+
+function instrumentSpec(world, overrides = {}) {
+  return {
+    specId: 'spec-deadbeef',
+    hypothesisId: 'hyp-v3',
+    agentId: world.id,
+    symbol: world.symbol,
+    family: 'momentum',
+    createdAt: world.clock.iso(),
+    proofRef: 'https://data.alpaca.markets/v2/stocks/bars?symbols=' + world.symbol,
+    proof: { observedAt: new Date(world.clock.now() - 60 * 60 * 1000).toISOString(), sampleSize: 20 },
+    params: {
+      lookback: 60,
+      entryZ: 1,
+      exitZ: 0.5,
+      stopPct: 0.02,
+      targetPct: 0.04,
+      maxHoldBars: 12,
+      sizePct: 0.2,
+      sessionFilter: 'any',
+    },
+    ...overrides,
+  };
+}
+
+function instrumentPolicy(world, prefer, extra = {}) {
+  return {
+    stance: 'trade',
+    atMs: world.clock.now(),
+    sizeMultiplier: 1,
+    instrument: { prefer },
+    ...extra,
+  };
+}
+
+/** 35 flat bars then a 5-bar trend: momentum z is strongly bullish (dir=1) or bearish (dir=-1). */
+function instrumentBars(last, direction = 1) {
+  const bars = [];
+  for (let i = 0; i < 35; i += 1) {
+    const c = last * 0.97;
+    bars.push({ t: T0 - (40 - i) * 60 * 60 * 1000, o: c, h: c * 1.005, l: c * 0.995, c, v: 1000 });
+  }
+  for (let i = 35; i < 40; i += 1) {
+    const c = last * (1 + direction * 0.01 * (i - 34));
+    bars.push({ t: T0 - (40 - i) * 60 * 60 * 1000, o: c, h: c * 1.005, l: c * 0.995, c, v: 1000 });
+  }
+  return bars;
+}
+
+async function runInstrumentExecutor(world, { policy = null, direction = 1, dayStats = null, spec = null, bars = null } = {}) {
+  const quote = world.broker.getLatestQuote(world.symbol);
+  return world.executor.run({
+    agent: world.registry.get(world.id),
+    spec: spec ?? instrumentSpec(world),
+    mandate: {
+      ...world.mandate,
+      issuedAt: world.clock.iso(),
+      expiresAt: new Date(world.clock.now() + 10 * 60 * 1000).toISOString(),
+    },
+    quotes: { [world.symbol]: quote },
+    bars: { [world.symbol]: bars ?? instrumentBars(quote.last, direction) },
+    dayStats: dayStats ?? { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 },
+    now: world.clock.now(),
+    policy,
+  });
+}
+
+/** Submit one order through the sim broker and mirror the fill into the virtual ledger. */
+function brokerFill(world, { side, symbol = world.symbol, assetClass = 'us_equity', qty = 1, option = null, groupId = null, structure = null, positionIntent = null }) {
+  const quote = assetClass === 'us_option' ? world.broker.getOptionQuote(symbol) : world.broker.getLatestQuote(symbol);
+  assert.ok(quote, `sim broker must quote ${symbol}`);
+  const price = side === 'buy' ? quote.ask : quote.bid;
+  const order = world.broker.submitOrder({
+    symbol,
+    assetClass,
+    side,
+    qty,
+    type: assetClass === 'us_option' ? 'limit' : 'market',
+    ...(assetClass === 'us_option' ? { limitPrice: price, positionIntent: positionIntent ?? undefined } : {}),
+  });
+  world.ledger.applyFill(world.id, {
+    symbol,
+    assetClass,
+    side,
+    qty: order.filledQty,
+    priceUsd: order.avgFillPriceUsd,
+    multiplier: assetClass === 'us_option' ? 100 : 1,
+    option,
+    groupId,
+    structure,
+    at: world.clock.now(),
+    orderId: order.id,
+  });
+  return order;
+}
+
+/** Real brake wall with the world's mandate; mutate() builds the order context. */
+function instrumentBrakeCheck(world, mutate) {
+  const quote = world.broker.getLatestQuote(world.symbol);
+  const input = {
+    mode: world.config.mode,
+    now: world.clock.now(),
+    agentId: world.id,
+    dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: world.endowmentUsd, pnlUsd: 0 },
+    quote,
+    order: { symbol: world.symbol, side: 'buy', qty: 1, priceUsd: quote.ask, notionalUsd: round2(quote.ask) },
+    equityUsd: world.endowmentUsd,
+    positions: [],
+    mandate: JSON.parse(JSON.stringify(world.mandate)),
+    spec: instrumentSpec(world),
+    accountEquityUsd: 100000,
+    allocatedEquityUsd: world.endowmentUsd,
+    marginDebtUsd: 0,
+    buyingPowerUsd: 100000,
+    spreadBps: 2,
+  };
+  if (typeof mutate === 'function') mutate(input);
+  return world.brakes.checkOrder(input);
+}
+
+/** Synthetic OCC option symbol for an expiry `days` after T0. */
+function testOcc(underlying, strikeUsd, type, days) {
+  const iso = new Date(T0 + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const datePart = `${iso.slice(2, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}`;
+  return `${underlying}${datePart}${type === 'put' ? 'P' : 'C'}${String(Math.round(strikeUsd * 1000)).padStart(8, '0')}`;
+}
+
+function optionContract(world, { type = 'call', days = null } = {}) {
+  const chain = world.broker.getOptionChain({ underlying: world.symbol, type, limit: 250 });
+  assert.ok(chain.length > 0, 'sim option chain must not be empty');
+  const inWindow = chain.filter((c) => c.dte >= world.config.instruments.minDTE && c.dte <= world.config.instruments.maxDTE);
+  const pool = days === null ? (inWindow.length > 0 ? inWindow : chain) : chain.filter((c) => c.expiration === new Date(T0 + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
+  const sorted = [...pool].sort((a, b) => a.strikeUsd - b.strikeUsd);
+  assert.ok(sorted.length > 0, 'no contracts in the requested expiry/window');
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function optionMeta(world, contract, { groupId = null, structure = null } = {}) {
+  return {
+    underlying: world.symbol,
+    expiration: contract.expiration,
+    type: contract.type,
+    strikeUsd: contract.strikeUsd,
+    multiplier: 100,
+    groupId,
+    structure,
+  };
+}
+
+describe('v3.0 multi-instrument: broker surface, short stock, long options, spreads, margin, DTE, death', () => {
+  it('sim broker v3 surface: assets, deterministic option chain/quotes, short stock and option positions', () => {
+    const world = makeInstrumentWorld();
+    const asset = world.broker.getAsset(world.symbol);
+    assert.equal(asset.tradable, true);
+    assert.equal(asset.shortable, true);
+    assert.equal(asset.marginable, true);
+
+    const chain = world.broker.getOptionChain({ underlying: world.symbol, type: 'call', limit: 250 });
+    assert.ok(chain.length >= 4, 'the deterministic chain must offer contracts');
+    for (const contract of chain) {
+      assert.match(contract.symbol, /^[A-Z]{1,6}\d{6}[CP]\d{8}$/, 'contracts use OCC symbols');
+      assert.equal(contract.underlying, world.symbol);
+      assert.equal(contract.type, 'call');
+      assert.equal(contract.multiplier, 100, 'one contract covers 100 shares');
+      assert.ok(contract.strikeUsd > 0);
+      assert.ok(Number.isFinite(contract.dte) && contract.dte >= 0);
+      assert.ok(contract.closePriceUsd > 0);
+    }
+    const inWindow = chain.filter(
+      (contract) => contract.dte >= world.config.instruments.minDTE && contract.dte <= world.config.instruments.maxDTE,
+    );
+    assert.ok(inWindow.length > 0, 'chain contains contracts inside minDTE..maxDTE');
+    const contract = inWindow[0];
+    const quote = world.broker.getOptionQuote(contract.symbol);
+    assert.ok(quote.bid > 0 && quote.ask >= quote.bid && quote.mark > 0);
+    assert.equal(quote.multiplier, 100);
+
+    // signed stock: short sell and buy-to-cover through the broker
+    const short = world.broker.submitOrder({ symbol: world.symbol, side: 'sell', qty: 2, type: 'market' });
+    assert.equal(short.status, 'filled');
+    let positions = world.broker.getPositions();
+    assert.equal(positions.find((position) => position.symbol === world.symbol).qtySigned, -2);
+    assert.equal(positions.find((position) => position.symbol === world.symbol).side, 'SHORT');
+    world.broker.submitOrder({ symbol: world.symbol, side: 'buy', qty: 2, type: 'market' });
+    positions = world.broker.getPositions();
+    assert.equal(positions.some((position) => position.symbol === world.symbol), false);
+
+    // option contract buy and sell-to-close through the broker
+    const buy = world.broker.submitOrder({
+      symbol: contract.symbol,
+      assetClass: 'us_option',
+      side: 'buy',
+      qty: 1,
+      type: 'limit',
+      limitPrice: quote.ask,
+      positionIntent: 'buy_to_open',
+    });
+    assert.equal(buy.status, 'filled');
+    const optionPosition = world.broker.getPositions().find((position) => position.symbol === contract.symbol);
+    assert.equal(optionPosition.assetClass, 'us_option');
+    assert.equal(optionPosition.qtySigned, 1);
+    assert.equal(optionPosition.multiplier, 100);
+    assert.equal(optionPosition.option.type, 'call');
+    assert.equal(optionPosition.option.strikeUsd, contract.strikeUsd);
+    const sell = world.broker.submitOrder({
+      symbol: contract.symbol,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      type: 'limit',
+      limitPrice: quote.bid,
+      positionIntent: 'sell_to_close',
+    });
+    assert.equal(sell.status, 'filled');
+    assert.equal(world.broker.getPositions().some((position) => position.symbol === contract.symbol), false);
+
+    const account = world.broker.getAccount();
+    assert.equal(account.shortingEnabled, true);
+    assert.equal(account.optionsTradingLevel, 3);
+    assert.ok(Number(account.marginMultiplier) >= 1);
+    assert.equal(world.broker.describe().instruments.options, true);
+  });
+
+  it('short-stock round trip through the executor and the real brake wall: open, mark, cover, realized P&L', async () => {
+    const world = makeInstrumentWorld();
+    const open = await runInstrumentExecutor(world, {
+      policy: instrumentPolicy(world, 'short_stock'),
+      direction: -1,
+    });
+    assert.deepEqual(open.denied, [], 'a compliant short must pass D1-D18');
+    assert.equal(open.orders.length, 1);
+    const shortOrder = open.orders[0];
+    assert.equal(shortOrder.side, 'sell');
+    assert.equal(shortOrder.assetClass, 'us_equity');
+    assert.equal(shortOrder.status, 'filled');
+    assert.ok(shortOrder.filledQty > 0 && Number.isInteger(shortOrder.filledQty), 'short stock is whole shares');
+    assert.equal(open.actions.some((action) => action.type === 'entry' && action.side === 'sell'), true);
+
+    const position = world.ledger.snapshot(world.id).positionsList.find((entry) => entry.symbol === world.symbol);
+    assert.ok(position, 'the short must be booked in the virtual ledger');
+    assert.ok(position.qtySigned < 0);
+    assert.equal(position.side, 'SHORT');
+    const brokerPosition = world.broker.getPositions().find((entry) => entry.symbol === world.symbol);
+    assert.equal(brokerPosition.qtySigned, position.qtySigned);
+    const cashAfterOpen = world.ledger.snapshot(world.id).cashUsd;
+    assert.equal(round2(cashAfterOpen), round2(world.endowmentUsd + shortOrder.notionalUsd));
+    const mark = world.broker.getLatestQuote(world.symbol).last;
+    const marked = world.ledger.equity(world.id, { [world.symbol]: mark });
+    assert.equal(marked.positionsValueUsd, round2(position.qtySigned * mark));
+    assert.equal(marked.equityUsd, round2(cashAfterOpen + marked.positionsValueUsd));
+    assert.equal(marked.marginDebtUsd, 0);
+
+    const cover = await runInstrumentExecutor(world, {
+      policy: { stance: 'trade', atMs: world.clock.now(), exitPressure: 'exit' },
+      direction: -1,
+    });
+    assert.deepEqual(cover.denied, []);
+    assert.equal(cover.orders.length, 1);
+    const coverOrder = cover.orders[0];
+    assert.equal(coverOrder.side, 'buy');
+    assert.equal(coverOrder.filledQty, shortOrder.filledQty);
+    const realized = world.ledger.snapshot(world.id).realizedPlUsd;
+    assert.equal(realized, round2((shortOrder.avgFillPriceUsd - coverOrder.avgFillPriceUsd) * shortOrder.filledQty));
+    assert.deepEqual(world.ledger.snapshot(world.id).positionsList, []);
+    assert.equal(round2(world.ledger.snapshot(world.id).cashUsd), round2(world.endowmentUsd + realized));
+    assert.equal(world.ledger.equity(world.id, {}).equityUsd, world.ledger.snapshot(world.id).cashUsd);
+    assert.equal(world.broker.getPositions().some((entry) => entry.symbol === world.symbol), false);
+    for (const order of [shortOrder, coverOrder]) {
+      assert.match(String(order.clientOrderId), /^atm:atm-[0-9a-f]{8}:spec-[0-9a-f]{8}:\d+$/);
+    }
+  });
+
+  it('long-call round trip through the executor: multiplier 100, premium cash flow, realized P&L (D-V3-1 regression)', async () => {
+    const world = makeInstrumentWorld();
+    const open = await runInstrumentExecutor(world, { policy: instrumentPolicy(world, 'long_call'), direction: 1 });
+    assert.deepEqual(open.denied, [], 'a long call must pass D1-D18 (contract symbol reaches the brake wall)');
+    assert.equal(open.orders.length, 1);
+    const buyOrder = open.orders[0];
+    assert.equal(buyOrder.assetClass, 'us_option');
+    assert.match(String(buyOrder.symbol), /^[A-Z]{1,6}\d{6}[CP]\d{8}$/, 'the option order symbol must be the OCC contract');
+    assert.equal(buyOrder.side, 'buy');
+    assert.equal(buyOrder.status, 'filled');
+    assert.ok(Number.isInteger(buyOrder.filledQty) && buyOrder.filledQty >= 1);
+    assert.deepEqual(open.actions.find((action) => action.type === 'entry')?.instrument, 'long_call');
+
+    const position = world.ledger.snapshot(world.id).positionsList[0];
+    assert.ok(position);
+    assert.equal(position.assetClass, 'us_option');
+    assert.equal(position.symbol, buyOrder.symbol);
+    assert.equal(position.multiplier, 100);
+    assert.equal(position.qtySigned, buyOrder.filledQty);
+    assert.equal(position.option.underlying, world.symbol);
+    assert.equal(position.option.type, 'call');
+    assert.ok(position.option.strikeUsd > 0);
+    assert.ok(position.dte >= world.config.instruments.autoCloseDTE);
+    const premiumDebit = round2(buyOrder.filledQty * buyOrder.avgFillPriceUsd * 100);
+    assert.equal(position.marketValueUsd, premiumDebit);
+    assert.equal(round2(world.ledger.snapshot(world.id).cashUsd), round2(world.endowmentUsd - premiumDebit));
+    const brokerPosition = world.broker.getPositions().find((entry) => entry.symbol === buyOrder.symbol);
+    assert.equal(brokerPosition.qtySigned, buyOrder.filledQty);
+    assert.equal(brokerPosition.multiplier, 100);
+
+    const close = await runInstrumentExecutor(world, {
+      policy: { stance: 'trade', atMs: world.clock.now(), exitPressure: 'exit' },
+      direction: 1,
+    });
+    assert.deepEqual(close.denied, []);
+    assert.equal(close.orders.length, 1);
+    const sellOrder = close.orders[0];
+    assert.equal(sellOrder.symbol, buyOrder.symbol);
+    assert.equal(sellOrder.side, 'sell');
+    assert.equal(sellOrder.filledQty, buyOrder.filledQty);
+    const realized = round2((sellOrder.avgFillPriceUsd - buyOrder.avgFillPriceUsd) * buyOrder.filledQty * 100);
+    assert.equal(world.ledger.snapshot(world.id).realizedPlUsd, realized);
+    assert.deepEqual(world.ledger.snapshot(world.id).positionsList, []);
+    assert.equal(round2(world.ledger.snapshot(world.id).cashUsd), round2(world.endowmentUsd + realized));
+    assert.equal(world.ledger.equity(world.id, {}).equityUsd, world.ledger.snapshot(world.id).cashUsd);
+    assert.equal(world.broker.getPositions().some((entry) => entry.symbol === buyOrder.symbol), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.0 covered calls, D15-D18 integration context, the four verticals, margin and DTE
+// ---------------------------------------------------------------------------
+
+describe('v3.0 multi-instrument: covered calls, D15-D18 wall, defined-risk verticals, margin, DTE', () => {
+  it('covered call: real brakes deny without 100 shares and allow with shares; executor sells premium against held shares', async () => {
+    const world = makeInstrumentWorld();
+    const contract = optionContract(world, { type: 'call' });
+    const quote = world.broker.getOptionQuote(contract.symbol);
+    const order = {
+      symbol: contract.symbol,
+      assetClass: 'us_option',
+      side: 'sell',
+      qty: 1,
+      priceUsd: quote.bid,
+      notionalUsd: round2(quote.bid * 100),
+      structure: 'covered_call',
+      option: {
+        underlying: world.symbol,
+        expiration: contract.expiration,
+        type: 'call',
+        strikeUsd: contract.strikeUsd,
+        multiplier: 100,
+        dte: contract.dte,
+      },
+    };
+    const naked = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = order;
+    });
+    assert.equal(naked.decision, 'DENY');
+    assert.equal(naked.code, 'OPTION_FORBIDDEN');
+    assert.equal(naked.brakeId, 'D16');
+    assert.match(naked.reason, /covered call requires .*long shares|naked short options/i);
+
+    const covered = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = order;
+      input.positions = [{
+        symbol: world.symbol,
+        qty: 100,
+        qtySigned: 100,
+        assetClass: 'us_equity',
+        marketValueUsd: round2(100 * world.quote.last),
+        avgPriceUsd: world.quote.last,
+      }];
+    });
+    assert.equal(covered.decision, 'ALLOW', JSON.stringify(covered));
+    assert.equal(covered.structure, 'covered_call');
+
+    // executor: acquire 100 shares, then sell one covered call against them
+    brokerFill(world, { side: 'buy', qty: 100 });
+    const shares = world.ledger.book(world.id).positions[world.symbol];
+    assert.equal(shares.qtySigned, 100);
+    const cashBefore = world.ledger.snapshot(world.id).cashUsd;
+    const run = await runInstrumentExecutor(world, { policy: instrumentPolicy(world, 'covered_call') });
+    assert.deepEqual(run.denied, [], 'a covered call with 100 shares must pass D1-D18');
+    assert.equal(run.orders.length, 1);
+    const callOrder = run.orders[0];
+    assert.equal(callOrder.assetClass, 'us_option');
+    assert.equal(callOrder.side, 'sell');
+    assert.match(String(callOrder.symbol), /^[A-Z]{1,6}\d{6}[CP]\d{8}$/);
+    assert.equal(callOrder.filledQty, 1);
+    const premium = round2(callOrder.filledQty * callOrder.avgFillPriceUsd * 100);
+    const callPosition = world.ledger.snapshot(world.id).positionsList.find((position) => position.symbol === callOrder.symbol);
+    assert.ok(callPosition, 'the short call leg is booked');
+    assert.ok(callPosition.qtySigned < 0);
+    assert.equal(callPosition.assetClass, 'us_option');
+    assert.equal(round2(world.ledger.snapshot(world.id).cashUsd), round2(cashBefore + premium));
+    assert.equal(world.ledger.snapshot(world.id).positionsList.length, 2, '100 shares + short call');
+
+    // buy-to-close a covered call is risk-reducing and must be allowed by D16/D18
+    const closeAllowed = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: callOrder.symbol,
+        assetClass: 'us_option',
+        side: 'buy',
+        qty: 1,
+        priceUsd: quote.ask,
+        notionalUsd: round2(quote.ask * 100),
+        positionIntent: 'buy_to_close',
+        structure: 'covered_call',
+        option: {
+          underlying: world.symbol,
+          expiration: contract.expiration,
+          type: 'call',
+          strikeUsd: contract.strikeUsd,
+          multiplier: 100,
+          dte: contract.dte,
+        },
+      };
+      input.positions = world.ledger.snapshot(world.id).positionsList;
+    });
+    assert.equal(closeAllowed.decision, 'ALLOW', JSON.stringify(closeAllowed));
+  });
+
+  it('D15-D18 in real integration context: naked shorts/options, non-shortable assets, mixed-expiry spreads, DTE and margin', () => {
+    const world = makeInstrumentWorld();
+    const spot = world.quote.last;
+
+    // --- D15 short sale -----------------------------------------------------
+    const shortOrder = (mutate = () => {}) => (input) => {
+      input.order = {
+        symbol: world.symbol,
+        side: 'sell',
+        qty: 3,
+        priceUsd: spot,
+        notionalUsd: round2(3 * spot),
+        asset: { shortable: true, marginable: true, tradable: true },
+      };
+      mutate(input);
+    };
+    assert.equal(instrumentBrakeCheck(world, shortOrder()).decision, 'ALLOW');
+    const notShortable = instrumentBrakeCheck(world, shortOrder((input) => {
+      input.order.asset = { shortable: false, marginable: true };
+    }));
+    assert.equal(notShortable.code, 'SHORT_FORBIDDEN');
+    assert.equal(notShortable.brakeId, 'D15');
+    assert.equal(instrumentBrakeCheck(world, shortOrder((input) => {
+      input.order.qty = 1.5;
+      input.order.notionalUsd = round2(1.5 * spot);
+    })).code, 'SHORT_FORBIDDEN', 'fractional shorts are rejected');
+    assert.equal(instrumentBrakeCheck(world, shortOrder((input) => {
+      input.order.qty = 100;
+      input.order.notionalUsd = round2(100 * spot);
+    })).code, 'SHORT_FORBIDDEN', 'short notional must respect the mandate cap');
+
+    // --- D16 options: naked sold options are never legal ---------------------
+    const chain = world.broker.getOptionChain({ underlying: world.symbol, type: 'call', limit: 250 });
+    const inWindow = chain.filter((contract) => contract.dte >= world.config.instruments.minDTE && contract.dte <= world.config.instruments.maxDTE);
+    assert.ok(inWindow.length >= 4);
+    const expiry = inWindow[0].expiration;
+    const sameExpiry = inWindow.filter((contract) => contract.expiration === expiry).sort((a, b) => a.strikeUsd - b.strikeUsd);
+    assert.ok(sameExpiry.length >= 3);
+    const lower = sameExpiry[Math.floor(sameExpiry.length / 2) - 1] ?? sameExpiry[0];
+    const upper = sameExpiry[Math.floor(sameExpiry.length / 2)] ?? sameExpiry[sameExpiry.length - 1];
+    assert.notEqual(lower.symbol, upper.symbol);
+    const lowerQuote = world.broker.getOptionQuote(lower.symbol);
+    const upperQuote = world.broker.getOptionQuote(upper.symbol);
+    const optionOrder = (contract, quote, { side = 'buy', structure = 'long_call', intent = 'buy_to_open' } = {}) => (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: contract.symbol,
+        assetClass: 'us_option',
+        side,
+        qty: 1,
+        priceUsd: side === 'buy' ? quote.ask : quote.bid,
+        notionalUsd: round2((side === 'buy' ? quote.ask : quote.bid) * 100),
+        positionIntent: intent,
+        structure,
+        option: {
+          underlying: world.symbol,
+          expiration: contract.expiration,
+          type: contract.type,
+          strikeUsd: contract.strikeUsd,
+          multiplier: 100,
+          dte: contract.dte,
+        },
+      };
+    };
+    const nakedCall = instrumentBrakeCheck(world, optionOrder(lower, lowerQuote, { side: 'sell', structure: 'covered_call', intent: 'sell_to_open' }));
+    assert.equal(nakedCall.code, 'OPTION_FORBIDDEN');
+    assert.equal(nakedCall.brakeId, 'D16');
+    assert.match(nakedCall.reason, /covered call requires .*long shares|naked short options/i);
+    const longCall = instrumentBrakeCheck(world, optionOrder(lower, lowerQuote));
+    assert.equal(longCall.decision, 'ALLOW', JSON.stringify(longCall));
+    assert.equal(longCall.structure, 'long_call');
+
+    // mixed-expiry vertical is not defined risk
+    const otherExpiry = inWindow.find((contract) => contract.expiration !== expiry);
+    assert.ok(otherExpiry, 'need a second expiry for the mixed-expiry check');
+    const mixed = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: world.symbol,
+        side: 'buy',
+        qty: 1,
+        priceUsd: 0.2,
+        notionalUsd: 20,
+        structure: 'bull_call_spread',
+        legs: [
+          { symbol: lower.symbol, side: 'buy', ratioQty: 1 },
+          { symbol: otherExpiry.symbol, side: 'sell', ratioQty: 1 },
+        ],
+      };
+    });
+    assert.equal(mixed.code, 'OPTION_FORBIDDEN');
+    assert.match(mixed.reason, /same expiration/i);
+
+    // a genuinely defined-risk debit vertical ALLOWs and reports a defined max loss
+    const netDebit = round2(lowerQuote.ask - upperQuote.bid);
+    assert.ok(netDebit > 0, `defined-risk debit spread must net a debit (premium inversion regression): ${netDebit}`);
+    const spread = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: world.symbol,
+        side: 'buy',
+        qty: 1,
+        priceUsd: netDebit,
+        notionalUsd: round2(netDebit * 100),
+        structure: 'bull_call_spread',
+        legs: [
+          { symbol: lower.symbol, side: 'buy', ratioQty: 1, priceUsd: lowerQuote.ask },
+          { symbol: upper.symbol, side: 'sell', ratioQty: 1, priceUsd: upperQuote.bid },
+        ],
+      };
+    });
+    assert.equal(spread.decision, 'ALLOW', JSON.stringify(spread));
+    assert.equal(spread.maxLossUsd, round2(Math.abs(lower.strikeUsd - upper.strikeUsd) * 100));
+    assert.equal(spread.spreadBps !== null, true);
+
+    // --- D18 expiry guard: opening at 1 DTE denied; sell-to-close allowed ----
+    const expiringSymbol = testOcc(world.symbol, lower.strikeUsd, 'call', 1);
+    const expiringQuote = world.broker.getOptionQuote(expiringSymbol);
+    assert.ok(expiringQuote && expiringQuote.dte <= 1);
+    const expiringOrder = (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: expiringSymbol,
+        assetClass: 'us_option',
+        side: 'buy',
+        qty: 1,
+        priceUsd: expiringQuote.ask,
+        notionalUsd: round2(expiringQuote.ask * 100),
+        structure: 'long_call',
+        option: {
+          underlying: world.symbol,
+          expiration: new Date(T0 + 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+          type: 'call',
+          strikeUsd: lower.strikeUsd,
+          multiplier: 100,
+          dte: 1,
+        },
+      };
+    };
+    const tooSoon = instrumentBrakeCheck(world, expiringOrder);
+    assert.equal(tooSoon.code, 'EXPIRY_GUARD');
+    assert.equal(tooSoon.brakeId, 'D18');
+    const closeSoon = instrumentBrakeCheck(world, (input) => {
+      expiringOrder(input);
+      input.order.side = 'sell';
+      input.order.priceUsd = expiringQuote.bid;
+      input.order.notionalUsd = round2(expiringQuote.bid * 100);
+      input.order.positionIntent = 'sell_to_close';
+      input.order.option.dte = 0;
+      input.positions = [{
+        symbol: expiringSymbol,
+        qty: 1,
+        qtySigned: 1,
+        assetClass: 'us_option',
+        avgPriceUsd: expiringQuote.ask,
+        marketValueUsd: round2(expiringQuote.ask * 100),
+        option: { underlying: world.symbol, expiration: input.order.option.expiration, type: 'call', strikeUsd: lower.strikeUsd, multiplier: 100 },
+      }];
+    });
+    assert.equal(closeSoon.decision, 'ALLOW', 'sell-to-close is always permitted by D18');
+
+    // --- D17 margin: over the cap denied, within the cap allowed -------------
+    const marginOrder = (marginRequiredUsd) => (input) => {
+      input.order = { symbol: world.symbol, side: 'buy', qty: 1, priceUsd: spot, notionalUsd: round2(spot) };
+      input.order.marginRequiredUsd = marginRequiredUsd;
+    };
+    const overMargin = instrumentBrakeCheck(world, marginOrder(6000));
+    assert.equal(overMargin.code, 'MARGIN_LIMIT');
+    assert.equal(overMargin.brakeId, 'D17');
+    const underMargin = instrumentBrakeCheck(world, marginOrder(1000));
+    assert.equal(underMargin.decision, 'ALLOW', JSON.stringify(underMargin));
+  });
+
+  it('all four defined-risk verticals open and close through the executor as one mleg order each', async () => {
+    const cases = [
+      ['bull_call_spread', 1],
+      ['put_credit_spread', 1],
+      ['bear_put_spread', -1],
+      ['call_credit_spread', -1],
+    ];
+    for (const [structure, direction] of cases) {
+      const world = makeInstrumentWorld();
+      const open = await runInstrumentExecutor(world, { policy: instrumentPolicy(world, structure), direction });
+      assert.deepEqual(open.denied, [], `${structure} must pass D1-D18`);
+      assert.equal(open.orders.length, 1, `${structure} opens exactly one mleg order`);
+      const order = open.orders[0];
+      assert.equal(order.orderClass, 'mleg', `${structure} is submitted as one multi-leg order`);
+      assert.equal(order.legs.length, 2, `${structure} has two legs`);
+      assert.ok(order.groupId, `${structure} legs share a group id`);
+      assert.ok(open.actions.some((action) => action.type === 'entry' && action.structure === structure));
+
+      const positions = world.ledger.snapshot(world.id).positionsList;
+      assert.equal(positions.length, 2, `${structure}: both legs are booked`);
+      assert.equal(positions.every((position) => position.assetClass === 'us_option'), true);
+      assert.equal(positions.every((position) => position.groupId === order.groupId), true);
+      assert.equal(positions[0].structure, structure);
+      assert.equal(positions.some((position) => position.qtySigned > 0), true);
+      assert.equal(positions.some((position) => position.qtySigned < 0), true);
+      assert.equal(positions[0].option.expiration, positions[1].option.expiration);
+      assert.notEqual(positions[0].option.strikeUsd, positions[1].option.strikeUsd);
+      const widthUsd = round2(Math.abs(positions[0].option.strikeUsd - positions[1].option.strikeUsd) * 100 * Math.abs(positions[0].qtySigned));
+      assert.ok(widthUsd > 0, 'the vertical has a defined width (max loss)');
+
+      const groups = world.ledger.snapshot(world.id).groups;
+      assert.equal(groups.length, 1);
+      assert.equal(groups[0].structure, structure);
+      assert.equal(groups[0].legs.length, 2);
+      assert.equal(groups[0].openContracts, 2 * Math.abs(positions[0].qtySigned));
+
+      const cashAfterOpen = world.ledger.snapshot(world.id).cashUsd;
+      const cost = positions.reduce((sum, position) => sum + position.qtySigned * position.avgPriceUsd * 100, 0);
+      assert.equal(round2(cashAfterOpen), round2(world.endowmentUsd - cost), `${structure}: premium cash flow is exactly the leg notional`);
+
+      const close = await runInstrumentExecutor(world, {
+        policy: { stance: 'trade', atMs: world.clock.now(), exitPressure: 'exit' },
+        direction,
+      });
+      assert.deepEqual(close.denied, [], `${structure} closes through the wall`);
+      assert.equal(close.orders.length, 1, `${structure} closes with one mleg order`);
+      assert.equal(close.orders[0].orderClass, 'mleg');
+      assert.equal(close.orders[0].legs.length, 2);
+      assert.deepEqual(world.ledger.snapshot(world.id).positionsList, []);
+      const closedGroups = world.ledger.snapshot(world.id).groups;
+      assert.equal(closedGroups[0].openContracts, 0);
+      const cashAfterClose = world.ledger.snapshot(world.id).cashUsd;
+      const realized = world.ledger.snapshot(world.id).realizedPlUsd;
+      assert.equal(realized, round2(cashAfterClose - world.endowmentUsd));
+      assert.ok(realized < 0 && realized > -200, `${structure}: closing crosses the bid/ask, realized ${realized}`);
+      assert.equal(world.ledger.equity(world.id, {}).equityUsd, cashAfterClose);
+      assert.equal(world.broker.getPositions().length, 0, `${structure}: no broker position may remain`);
+    }
+  });
+
+  it('margin: negative cash is allowed within the cap and denied beyond it, without creating money on denial', () => {
+    const world = makeInstrumentWorld({ overrides: { instruments: { allowMargin: true, maxMarginPctEquity: 0.5 } } });
+    const price = world.quote.last;
+    const qty = Math.floor(((world.endowmentUsd + 2000) / price) * 100) / 100;
+    const first = world.ledger.applyFill(world.id, { symbol: world.symbol, side: 'buy', qty, priceUsd: price, at: world.clock.now() });
+    assert.ok(first.cashUsd < 0, 'a margin order may make virtual cash negative');
+    assert.ok(first.marginDebtUsd <= round2(0.5 * world.endowmentUsd) + 1, 'debt stays inside maxMarginPctEquity');
+    const marked = world.ledger.equity(world.id, { [world.symbol]: price });
+    assert.equal(marked.equityUsd, round2(first.cashUsd + marked.positionsValueUsd));
+    assert.ok(Math.abs(marked.equityUsd - world.endowmentUsd) <= 0.05, 'margin does not change equity at the fill price');
+    assert.equal(marked.marginDebtUsd, round2(-first.cashUsd));
+
+    const before = {
+      cashUsd: world.ledger.get(world.id).cashUsd,
+      qty: world.ledger.book(world.id).positions[world.symbol].qtySigned,
+    };
+    assert.throws(
+      () => world.ledger.applyFill(world.id, { symbol: world.symbol, side: 'buy', qty: 60, priceUsd: price, at: world.clock.now() }),
+      (error) => error.code === 'MARGIN_LIMIT',
+      'debt beyond the margin cap must be refused',
+    );
+    assert.equal(world.ledger.get(world.id).cashUsd, before.cashUsd, 'a refused margin fill must not move cash');
+    assert.equal(world.ledger.book(world.id).positions[world.symbol].qtySigned, before.qty, 'a refused margin fill must not move the position');
+
+    const noMargin = makeInstrumentWorld({ overrides: { instruments: { allowMargin: false } } });
+    assert.throws(
+      () => noMargin.ledger.applyFill(noMargin.id, {
+        symbol: noMargin.symbol,
+        side: 'buy',
+        qty: Math.ceil((noMargin.endowmentUsd / noMargin.quote.last) * 2),
+        priceUsd: noMargin.quote.last,
+        at: T0,
+      }),
+      (error) => error.code === 'MARGIN_LIMIT' && /no margin permission/i.test(error.message),
+      'without margin permission any borrowing is refused',
+    );
+  });
+
+  it('DTE guard: no opening below minDTE; a held option auto-closes at <= autoCloseDTE through the executor', async () => {
+    const world = makeInstrumentWorld();
+    const spot = world.quote.last;
+    const expirationTomorrow = new Date(T0 + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const strikeUsd = Math.round(spot);
+    const symbol = testOcc(world.symbol, strikeUsd, 'call', 1);
+    const quote = world.broker.getOptionQuote(symbol);
+    assert.ok(quote && quote.dte <= world.config.instruments.autoCloseDTE);
+    const openDenied = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol,
+        assetClass: 'us_option',
+        side: 'buy',
+        qty: 1,
+        priceUsd: quote.ask,
+        notionalUsd: round2(quote.ask * 100),
+        structure: 'long_call',
+        option: { underlying: world.symbol, expiration: expirationTomorrow, type: 'call', strikeUsd, multiplier: 100, dte: 1 },
+      };
+    });
+    assert.equal(openDenied.code, 'EXPIRY_GUARD');
+    assert.equal(openDenied.brakeId, 'D18');
+
+    const buyOrder = brokerFill(world, {
+      side: 'buy',
+      symbol,
+      assetClass: 'us_option',
+      qty: 1,
+      option: { underlying: world.symbol, expiration: expirationTomorrow, type: 'call', strikeUsd, multiplier: 100 },
+    });
+    assert.equal(world.ledger.snapshot(world.id).positionsList[0].dte, 1);
+    const close = await runInstrumentExecutor(world, {});
+    assert.deepEqual(close.denied, []);
+    assert.equal(close.orders.length, 1);
+    assert.equal(close.orders[0].symbol, symbol);
+    assert.equal(close.orders[0].side, 'sell');
+    assert.ok(close.actions.some((action) => action.type === 'exit' && action.reason === 'dte_auto_close'));
+    assert.deepEqual(world.ledger.snapshot(world.id).positionsList, []);
+    assert.equal(
+      world.ledger.snapshot(world.id).realizedPlUsd,
+      round2((close.orders[0].avgFillPriceUsd - buyOrder.avgFillPriceUsd) * 100),
+    );
+    assert.equal(
+      round2(world.ledger.snapshot(world.id).cashUsd),
+      round2(world.endowmentUsd + world.ledger.snapshot(world.id).realizedPlUsd),
+    );
+  });
+
+  it('an option position does not corrupt the Treasurer: marks, equity and reconciliation stay coherent (D-V3-2 regression)', async () => {
+    const world = makeInstrumentWorld();
+    const open = await runInstrumentExecutor(world, { policy: instrumentPolicy(world, 'long_call'), direction: 1 });
+    assert.equal(open.orders.length, 1);
+    const position = world.ledger.snapshot(world.id).positionsList[0];
+    assert.equal(position.assetClass, 'us_option');
+    const treasurer = createTreasurer({
+      broker: world.broker,
+      ledger: world.ledger,
+      registry: world.registry,
+      journal: createJournal({ paths: world.paths, config: world.config }),
+      config: world.config,
+      paths: world.paths,
+      clock: world.clock,
+    });
+    const tick = await treasurer.tick({ prices: { [world.symbol]: world.quote.last } });
+    assert.equal(tick.halted, false, `holding an option must not halt the treasury: ${JSON.stringify(tick.haltReasons)}`);
+    assert.deepEqual(tick.haltReasons, []);
+    assert.equal(tick.reconciliation.ok, true, JSON.stringify(tick.reconciliation));
+    assert.ok(Math.abs(tick.reconciliation.deltaUsd) <= 1, `reconciliation delta ${tick.reconciliation.deltaUsd}`);
+    const view = tick.agentViews.find((entry) => entry.agentId === world.id);
+    assert.ok(view);
+    const brokerPosition = world.broker.getPositions().find((entry) => entry.symbol === position.symbol);
+    const brokerMark = Math.abs(brokerPosition.marketValueUsd) / (Math.abs(brokerPosition.qtySigned) * 100);
+    const expectedEquity = round2(view.cashUsd + position.qtySigned * brokerMark * 100);
+    assert.ok(Math.abs(view.equityUsd - expectedEquity) <= 0.05, `equity ${view.equityUsd} vs marked ${expectedEquity}`);
+    assert.ok(view.positionsValueUsd < 1000, 'option marks are premium x 100 x contracts, not 100x inflated');
+    assert.ok(view.equityUsd > 4000 && view.equityUsd < 6000, `equity ${view.equityUsd} must stay near the endowment`);
+    assert.equal(round2(view.cashUsd + view.positionsValueUsd), view.equityUsd);
+    assert.ok(view.runwayHours > 0, 'runway is still computed after an option fill');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.0 death liquidation, orchestrator status, paper default/gating, kill switch
+// ---------------------------------------------------------------------------
+
+describe('v3.0 multi-instrument: death liquidation, status surface, paper default and gating', () => {
+  it('multi-instrument death: the Reaper closes short stock, long option and both spread legs, then writes the obituary', async () => {
+    const world = makeInstrumentWorld();
+    const spot = world.quote.last;
+    // short stock
+    brokerFill(world, { side: 'sell', qty: 5 });
+    // long call on one contract; a separate bull-call spread on two other contracts
+    const chain = world.broker.getOptionChain({ underlying: world.symbol, type: 'call', limit: 250 });
+    const expiry = chain.filter(
+      (contract) => contract.dte >= world.config.instruments.minDTE && contract.dte <= world.config.instruments.maxDTE,
+    )[0].expiration;
+    const sameExpiry = chain.filter((contract) => contract.expiration === expiry).sort((a, b) => a.strikeUsd - b.strikeUsd);
+    assert.ok(sameExpiry.length >= 3);
+    const bySymbol = new Map(sameExpiry.map((contract) => [contract.symbol, contract]));
+    const longCallContract = sameExpiry[0];
+    const lower = sameExpiry[1];
+    const upper = sameExpiry[2];
+    brokerFill(world, {
+      side: 'buy',
+      symbol: longCallContract.symbol,
+      assetClass: 'us_option',
+      qty: 1,
+      option: optionMeta(world, longCallContract),
+    });
+    const lowerQuote = world.broker.getOptionQuote(lower.symbol);
+    const upperQuote = world.broker.getOptionQuote(upper.symbol);
+    const netDebit = round2(Math.max(0.01, lowerQuote.ask - upperQuote.bid));
+    const mleg = world.broker.submitOrder({
+      orderClass: 'mleg',
+      type: 'limit',
+      qty: 1,
+      groupId: 'grp-death',
+      structure: 'bull_call_spread',
+      limitPrice: netDebit,
+      legs: [
+        { symbol: lower.symbol, side: 'buy', ratioQty: 1, positionIntent: 'buy_to_open' },
+        { symbol: upper.symbol, side: 'sell', ratioQty: 1, positionIntent: 'sell_to_open' },
+      ],
+    });
+    for (const leg of mleg.legs) {
+      const contract = bySymbol.get(leg.symbol);
+      assert.ok(contract, `spread leg ${leg.symbol} must be from the chain`);
+      world.ledger.applyFill(world.id, {
+        symbol: leg.symbol,
+        assetClass: 'us_option',
+        side: leg.side,
+        qty: leg.qty,
+        priceUsd: leg.avgFillPriceUsd,
+        multiplier: 100,
+        option: optionMeta(world, contract, { groupId: 'grp-death', structure: 'bull_call_spread' }),
+        groupId: 'grp-death',
+        structure: 'bull_call_spread',
+        at: world.clock.now(),
+        orderId: mleg.id,
+      });
+    }
+    const positionsBefore = Object.keys(world.ledger.book(world.id).positions).sort();
+    assert.equal(positionsBefore.length, 4, 'short stock + long call + two spread legs');
+    const creditSpread = world.ledger.snapshot(world.id).groups.find((group) => group.groupId === 'grp-death');
+    assert.equal(creditSpread.legs.length, 2);
+
+    // Under-fund the agent: charging all cash leaves only the (small/negative) position marks,
+    // which is below the drawdown/death floor — so the Reaper must execute the death.
+    const cash = world.ledger.get(world.id).cashUsd;
+    assert.ok(cash > 0);
+    world.ledger.charge(world.id, cash, { category: 'inference', role: 'executor', at: world.clock.now() });
+    const equityAtDeath = world.ledger.equity(world.id, { [world.symbol]: spot });
+    const floorUsd = Math.max(world.config.deathFloorUsd, world.config.deathFloorPct * world.endowmentUsd);
+    const drawdownUsd = world.endowmentUsd * (1 - world.config.maxDrawdownPct);
+    assert.ok(equityAtDeath.equityUsd <= drawdownUsd + 0.01, `equity ${equityAtDeath.equityUsd} must be below the drawdown floor`);
+    assert.ok(equityAtDeath.equityUsd <= floorUsd + 1000, 'equity must be in lethal territory');
+    world.registry.save();
+    world.ledger.save();
+    const journal = createJournal({ paths: world.paths, config: world.config });
+    const reaper = createReaper({
+      broker: world.broker,
+      registry: world.registry,
+      ledger: world.ledger,
+      journal,
+      config: world.config,
+      paths: world.paths,
+      clock: world.clock,
+    });
+    const sweep = await reaper.sweep({ prices: { [world.symbol]: spot } });
+    assert.deepEqual(sweep.errors ?? [], [], JSON.stringify(sweep.errors));
+    assert.equal(sweep.killed.length, 1);
+    const killed = sweep.killed[0];
+    assert.equal(killed.agentId, world.id);
+    assert.ok(DEATH_CAUSES.includes(killed.cause));
+    assert.ok(['insufficient_funds', 'drawdown_limit'].includes(killed.cause));
+    const closedSymbols = killed.liquidated.map((entry) => entry.symbol).sort();
+    assert.deepEqual(closedSymbols, positionsBefore, 'every position (short, long call, both spread legs) must be closed');
+    assert.equal(killed.liquidated.every((entry) => entry.status === 'filled'), true, JSON.stringify(killed.liquidated));
+    const stockClose = killed.liquidated.find((entry) => entry.symbol === world.symbol);
+    assert.equal(stockClose.side, 'buy', 'a short is bought back');
+    assert.equal(stockClose.assetClass, 'us_equity');
+    for (const entry of killed.liquidated.filter((row) => row.assetClass === 'us_option')) {
+      assert.match(entry.symbol, /^[A-Z]{1,6}\d{6}[CP]\d{8}$/);
+      assert.ok(['sell_to_close', 'buy_to_close'].includes(entry.positionIntent));
+    }
+    assert.equal(world.broker.getPositions().length, 0, 'the broker account must be flat after liquidation');
+    assert.deepEqual(world.ledger.book(world.id).positions, {});
+    assert.equal(world.ledger.get(world.id).cashUsd, 0, 'residual cash/debt is settled');
+    assert.equal(world.registry.get(world.id).status, 'dead');
+    assert.equal(journal.count(), 1);
+    const obituary = journal.list()[0];
+    assert.equal(validateObituary(obituary), obituary);
+    assert.equal(obituary.cause, killed.cause);
+    assert.equal(obituary.agentId, world.id);
+    assert.ok(obituary.tradesCount >= 4, 'the multi-instrument trade history is in the obituary');
+    assert.equal(obituary.finalEquityUsd, killed.finalEquityUsd);
+
+    const second = await reaper.sweep({ prices: { [world.symbol]: spot } });
+    assert.equal(second.killed.length, 0);
+    assert.equal(journal.count(), 1, 'a second sweep must not duplicate the obituary');
+    assert.ok(second.skipped.some((entry) => entry.agentId === world.id && entry.reason === 'already_dead'));
+  });
+
+  it('orchestrator status exposes engine.instruments, per-agent permissions/playbook and signed/option positions', async () => {
+    const env = makeEnv({
+      mode: 'paper',
+      population: { initial: 1, cap: 2 },
+      instruments: { maxOptionPremiumPctEquity: 0.5, maxOptionPremiumUsd: 2500 },
+    });
+    const clock = makeClock(T0);
+    const broker = createSimBroker(env.config, { seed: 7, accountEquityUsd: 100000, clock });
+    const automaton = await createAutomaton({ config: env.config, paths: env.paths, broker, clock });
+    await automaton.init();
+    const internals = automaton._internals;
+    const agent = internals.registry.alive()[0];
+    const symbol = agent.genome.symbol;
+    const quote = broker.getLatestQuote(symbol);
+    // signed stock position: short 2 shares (paper mode: the engine never executes death itself)
+    const short = broker.submitOrder({ symbol, side: 'sell', qty: 2, type: 'market' });
+    internals.ledger.applyFill(agent.id, {
+      symbol, side: 'sell', qty: 2, priceUsd: short.avgFillPriceUsd, at: clock.now(), orderId: short.id,
+    });
+    // long option position
+    const chain = broker
+      .getOptionChain({ underlying: symbol, type: 'call', limit: 250 })
+      .filter((contract) => contract.dte >= env.config.instruments.minDTE && contract.dte <= env.config.instruments.maxDTE);
+    assert.ok(chain.length > 0);
+    const contract = chain[Math.floor(chain.length / 2)];
+    const optionQuote = broker.getOptionQuote(contract.symbol);
+    const optionBuy = broker.submitOrder({
+      symbol: contract.symbol, assetClass: 'us_option', side: 'buy', qty: 1, type: 'limit',
+      limitPrice: optionQuote.ask, positionIntent: 'buy_to_open',
+    });
+    internals.ledger.applyFill(agent.id, {
+      symbol: contract.symbol, assetClass: 'us_option', side: 'buy', qty: 1,
+      priceUsd: optionBuy.avgFillPriceUsd, multiplier: 100,
+      option: { underlying: symbol, expiration: contract.expiration, type: 'call', strikeUsd: contract.strikeUsd, multiplier: 100 },
+      at: clock.now(), orderId: optionBuy.id,
+    });
+    // drain cash so the agent is condemned (paper mode: no in-process death execution),
+    // which freezes the positions for the status snapshot without the executor touching them
+    const cash = internals.ledger.get(agent.id).cashUsd;
+    if (cash > 0) internals.ledger.charge(agent.id, cash, { category: 'inference', role: 'executor', at: clock.now() });
+    internals.ledger.save();
+    clock.advance(CYCLE_MS);
+    const trace = await automaton.tick();
+    assert.equal(trace.halted, false, JSON.stringify(trace.haltReasons));
+    assert.equal(trace.deaths.length, 1, 'the drained agent must be condemned by a death verdict');
+    const status = await automaton.status();
+
+    assert.equal(status.mode, 'paper');
+    assert.ok(status.engine.instruments, 'status.engine.instruments must exist');
+    assert.equal(status.engine.instruments.enabled, true);
+    assert.equal(status.engine.instruments.caps.minDTE, env.config.instruments.minDTE);
+    assert.equal(status.engine.instruments.caps.maxDTE, env.config.instruments.maxDTE);
+    assert.ok(status.engine.instruments.caps.maxContracts >= 1);
+    assert.ok(status.engine.instruments.allowedStructures.includes('long_call'));
+    assert.ok(status.engine.instruments.allowedStructures.includes('bull_call_spread'));
+    assert.equal(Object.keys(status.engine.instruments.playbooks).length >= 4, true);
+    assert.equal(status.engine.instruments.account.shortingEnabled, true);
+    assert.equal(status.engine.instruments.account.optionsTradingLevel, 3);
+
+    const row = status.agents.find((entry) => entry.id === agent.id);
+    assert.ok(row);
+    assert.equal(row.instrumentPermissions.enabled, true);
+    assert.equal(row.instrumentPermissions.longOptions, true);
+    assert.equal(row.instrumentPermissions.shortStock, true);
+    assert.equal(row.instrumentPermissions.spreads, true);
+    assert.ok(row.playbook && typeof row.playbook.family === 'string');
+    assert.ok(Array.isArray(row.playbook.structures) && row.playbook.structures.includes('long_call'));
+    const stockRow = row.positions.find((position) => position.symbol === symbol);
+    assert.ok(stockRow, JSON.stringify(row.positions));
+    assert.equal(stockRow.assetClass, 'us_equity');
+    assert.equal(stockRow.side, 'SHORT');
+    assert.equal(stockRow.qtySigned, -2);
+    const optionRow = row.positions.find((position) => position.symbol === contract.symbol);
+    assert.ok(optionRow, JSON.stringify(row.positions));
+    assert.equal(optionRow.assetClass, 'us_option');
+    assert.equal(optionRow.side, 'CALL');
+    assert.equal(optionRow.multiplier, 100);
+    assert.equal(optionRow.qtySigned, 1);
+    assert.ok(optionRow.option.strikeUsd > 0);
+    assert.ok(optionRow.option.expiration);
+    assert.equal(status.population.condemned >= 1, true);
+  });
+
+  it('paper is the default and instruments never bypass the paper/live gates', () => {
+    const defaults = defaultConfig();
+    assert.equal(defaults.mode, 'paper');
+    assert.equal(defaults.allowLive, false);
+    assert.equal(defaults.instruments.enabled, true);
+    assert.equal(defaults.instruments.allowNakedShortOptions, false);
+    const permissions = resolveInstrumentPermissions(defaults);
+    assert.equal(permissions.shortStock, true);
+    assert.equal(permissions.longOptions, true);
+    assert.equal(permissions.coveredCalls, true);
+    assert.equal(permissions.spreads, true);
+    assert.equal(permissions.margin, true);
+
+    // instruments.enabled=false is the documented fallback to long-stock-only (v2)
+    const disabled = makeInstrumentWorld({ overrides: { instruments: { enabled: false } } });
+    const stockBuy = instrumentBrakeCheck(disabled, (input) => {
+      input.order = { symbol: disabled.symbol, side: 'buy', qty: 1, priceUsd: disabled.quote.ask, notionalUsd: round2(disabled.quote.ask) };
+    });
+    assert.equal(stockBuy.decision, 'ALLOW');
+    const stockShort = instrumentBrakeCheck(disabled, (input) => {
+      input.order = {
+        symbol: disabled.symbol, side: 'sell', qty: 2, priceUsd: disabled.quote.last,
+        notionalUsd: round2(2 * disabled.quote.last), asset: { shortable: true, marginable: true },
+      };
+    });
+    assert.equal(stockShort.code, 'SHORT_FORBIDDEN');
+    const disabledOption = optionContract(disabled);
+    const disabledQuote = disabled.broker.getOptionQuote(disabledOption.symbol);
+    const optionBuy = instrumentBrakeCheck(disabled, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: disabledOption.symbol, assetClass: 'us_option', side: 'buy', qty: 1,
+        priceUsd: disabledQuote.ask, notionalUsd: round2(disabledQuote.ask * 100), structure: 'long_call',
+        option: {
+          underlying: disabled.symbol, expiration: disabledOption.expiration, type: 'call',
+          strikeUsd: disabledOption.strikeUsd, multiplier: 100, dte: disabledOption.dte,
+        },
+      };
+    });
+    assert.equal(optionBuy.code, 'OPTION_FORBIDDEN');
+
+    // a paper-configured wall refuses an order that claims live mode (D8, before D15/D16)
+    const paper = makeInstrumentWorld();
+    const liveClaim = instrumentBrakeCheck(paper, (input) => {
+      input.mode = 'live';
+      input.order = {
+        symbol: paper.symbol, side: 'sell', qty: 2, priceUsd: paper.quote.last,
+        notionalUsd: round2(2 * paper.quote.last), asset: { shortable: true, marginable: true },
+      };
+    });
+    assert.equal(liveClaim.code, 'MODE_FORBIDDEN');
+    assert.equal(liveClaim.brakeId, 'D8');
+
+    // a live-configured wall without LIVE_ARMED refuses v3 instruments with LIVE_NOT_ARMED
+    const liveEnv = makeEnv({ mode: 'live', allowLive: true, instruments: { enabled: true, allowShort: true, allowOptions: true } });
+    const liveClock = makeClock(T0);
+    const liveBrakes = createBrakes({ config: liveEnv.config, paths: liveEnv.paths, clock: liveClock });
+    assert.equal(liveBrakes.isLiveArmed(), false);
+    const liveMandate = {
+      agentId: 'atm-live',
+      issuedAt: liveClock.iso(),
+      expiresAt: new Date(liveClock.now() + 10 * 60 * 1000).toISOString(),
+      sizeBudgetUsd: 2500,
+      maxOrderNotionalUsd: 2500,
+      maxDailyOrdersRemaining: 6,
+      allowedSymbols: [...liveEnv.config.symbols],
+      allowExitOnly: false,
+      instruments: deriveInstrumentPermissions(liveEnv.config, 5000),
+    };
+    const liveOrder = {
+      mode: 'live',
+      now: liveClock.now(),
+      agentId: 'atm-live',
+      dayStats: { dayKey: '2026-01-05', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+      quote: { symbol: 'META', bid: 29, ask: 29.01 },
+      order: {
+        symbol: 'META', side: 'sell', qty: 2, priceUsd: 29, notionalUsd: 58,
+        asset: { shortable: true, marginable: true },
+      },
+      equityUsd: 5000,
+      positions: [],
+      mandate: liveMandate,
+      spec: { specId: 'spec-live', proofRef: 'https://data.alpaca.markets/x', proof: { observedAt: new Date(T0 - 60 * 60 * 1000).toISOString() } },
+      accountEquityUsd: 100000,
+      allocatedEquityUsd: 5000,
+      marginDebtUsd: 0,
+      buyingPowerUsd: 100000,
+    };
+    assert.equal(liveBrakes.checkOrder(liveOrder).code, 'LIVE_NOT_ARMED');
+  });
+
+  it('the kill switch blocks shorts, options and spreads too (v3 instruments are not privileged)', async () => {
+    const world = makeInstrumentWorld();
+    fs.mkdirSync(path.dirname(world.paths.killSwitch), { recursive: true });
+    fs.writeFileSync(world.paths.killSwitch, JSON.stringify({ armedAt: new Date(T0).toISOString(), reason: 'verifier' }), 'utf8');
+    const contract = optionContract(world);
+    const quote = world.broker.getOptionQuote(contract.symbol);
+    const shortDecision = instrumentBrakeCheck(world, (input) => {
+      input.order = {
+        symbol: world.symbol, side: 'sell', qty: 2, priceUsd: world.quote.last,
+        notionalUsd: round2(2 * world.quote.last), asset: { shortable: true, marginable: true },
+      };
+    });
+    assert.equal(shortDecision.code, 'KILL_SWITCH');
+    assert.equal(shortDecision.brakeId, 'D11');
+    const optionDecision = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: contract.symbol, assetClass: 'us_option', side: 'buy', qty: 1,
+        priceUsd: quote.ask, notionalUsd: round2(quote.ask * 100), structure: 'long_call',
+        option: {
+          underlying: world.symbol, expiration: contract.expiration, type: 'call',
+          strikeUsd: contract.strikeUsd, multiplier: 100, dte: contract.dte,
+        },
+      };
+    });
+    assert.equal(optionDecision.code, 'KILL_SWITCH');
+    const spreadDecision = instrumentBrakeCheck(world, (input) => {
+      input.quote = null;
+      input.order = {
+        symbol: world.symbol, side: 'buy', qty: 1, priceUsd: 0.2, notionalUsd: 20,
+        structure: 'bull_call_spread',
+        legs: [
+          { symbol: contract.symbol, side: 'buy', ratioQty: 1 },
+          { symbol: testOcc(world.symbol, contract.strikeUsd + 1, 'call', 5), side: 'sell', ratioQty: 1 },
+        ],
+      };
+    });
+    assert.equal(spreadDecision.code, 'KILL_SWITCH');
+
+    // a directly-called executor cannot open the short either
+    const run = await runInstrumentExecutor(world, { policy: instrumentPolicy(world, 'short_stock'), direction: -1 });
+    assert.equal(run.orders.length, 0);
+    assert.equal(run.denied.length >= 1, true);
+    assert.equal(run.denied.every((denial) => denial.code === 'KILL_SWITCH'), true, JSON.stringify(run.denied));
+    assert.throws(() => world.brakes.assertKillSwitchClear(), (error) => error.code === 'KILL_SWITCH');
+
+    fs.rmSync(world.paths.killSwitch, { force: true });
+    assert.equal(world.brakes.assertKillSwitchClear(), undefined);
+    const allowedAgain = instrumentBrakeCheck(world, (input) => {
+      input.order = {
+        symbol: world.symbol, side: 'sell', qty: 2, priceUsd: world.quote.last,
+        notionalUsd: round2(2 * world.quote.last), asset: { shortable: true, marginable: true },
+      };
+    });
+    assert.equal(allowedAgain.decision, 'ALLOW', JSON.stringify(allowedAgain));
   });
 });

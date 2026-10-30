@@ -40,9 +40,9 @@ export const BRAKES = Object.freeze([
   },
   {
     id: 'D2',
-    code: 'MARGIN_FORBIDDEN',
-    rule: 'No margin, leverage, short selling, or options.',
-    enforcement: 'brakes.checkOrder + config defaults',
+    code: 'INSTRUMENT_FORBIDDEN',
+    rule: 'Instruments are gated: long stock always, short stock/options/margin only when config.instruments permits and the mandate grants them.',
+    enforcement: 'brakes.checkOrder (instrument gate) + config defaults',
   },
   {
     id: 'D3',
@@ -116,6 +116,30 @@ export const BRAKES = Object.freeze([
     rule: 'Dead is one-way; registry has markDead and no markAlive.',
     enforcement: 'registry.markDead',
   },
+  {
+    id: 'D15',
+    code: 'SHORT_FORBIDDEN',
+    rule: 'Short sales need shorting enabled, a shortable+marginable asset, whole shares, and a mandate short cap.',
+    enforcement: 'brakes.checkOrder + broker asset metadata',
+  },
+  {
+    id: 'D16',
+    code: 'OPTION_FORBIDDEN',
+    rule: 'Options need the permitted structure, integer contracts within caps, a valid DTE window and premium caps; covered calls need 100+ shares; spreads are defined-risk; naked short options never.',
+    enforcement: 'brakes.checkOrder + option contract metadata',
+  },
+  {
+    id: 'D17',
+    code: 'MARGIN_LIMIT',
+    rule: 'Margin debt must stay within the mandate and the configured equity percentage; buying power is never exceeded.',
+    enforcement: 'brakes.checkOrder + ledger margin invariant',
+  },
+  {
+    id: 'D18',
+    code: 'EXPIRY_GUARD',
+    rule: 'Opening option orders short of minDTE are denied; the executor closes before autoCloseDTE; sell-to-close is always allowed.',
+    enforcement: 'brakes.checkOrder + executor lifecycle',
+  },
 ]);
 
 export const BRAKE_BY_ID = Object.freeze(Object.fromEntries(BRAKES.map((b) => [b.id, b])));
@@ -143,6 +167,10 @@ export const ERROR_CODES = Object.freeze({
   RECONCILIATION_MISMATCH: 'RECONCILIATION_MISMATCH',
   ACCOUNT_NOT_ACTIVE: 'ACCOUNT_NOT_ACTIVE',
   INSUFFICIENT_CASH: 'INSUFFICIENT_CASH',
+  MARGIN_LIMIT: 'MARGIN_LIMIT',
+  SHORT_FORBIDDEN: 'SHORT_FORBIDDEN',
+  OPTION_FORBIDDEN: 'OPTION_FORBIDDEN',
+  EXPIRY_GUARD: 'EXPIRY_GUARD',
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
 });
 

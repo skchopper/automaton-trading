@@ -44,9 +44,27 @@ const SYMBOLS = ['AAPL', 'MSFT', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'TSLA',
 const FAMILIES = ['momentum', 'meanrev', 'breakout', 'gapfade'];
 const FAMILY_NAMES = { momentum: 'Momentum', meanrev: 'MeanRev', breakout: 'Breakout', gapfade: 'GapFade' };
 
+// v3.0 hard brake catalogue (D1–D18): D2 is the instrument gate, D15–D18 are the
+// short/option/margin/expiry instrument rules. Mirrors src/contracts.js BRAKES.
 const BRAKE_RULES = [
-  { id: 'D1', code: 'TRANSFER_FORBIDDEN', rule: 'No transfers, withdrawals, ACH, wires, crypto.', enforcement: 'broker API surface' },
-  { id: 'D2', code: 'MARGIN_FORBIDDEN', rule: 'No margin, leverage, short selling, or options.', enforcement: 'brakes.checkOrder' },
+  { id: 'D1', code: 'TRANSFER_FORBIDDEN', rule: 'No transfers, withdrawals, ACH, wires, crypto, or account configuration exist in the broker client.', enforcement: 'broker API surface (no method) + config validation' },
+  { id: 'D2', code: 'INSTRUMENT_FORBIDDEN', rule: 'Instruments are gated: long stock always, short stock/options/margin only when config.instruments permits and the mandate grants them.', enforcement: 'brakes.checkOrder (instrument gate) + config defaults' },
+  { id: 'D3', code: 'MARKET_CLOSED', rule: 'No orders outside the regular session or the configured window.', enforcement: 'brakes.checkOrder + broker clock' },
+  { id: 'D4', code: 'INSTRUMENT_FORBIDDEN', rule: 'Symbol whitelist, minimum price, minimum notional, spread/slippage ceilings.', enforcement: 'brakes.checkOrder' },
+  { id: 'D5', code: 'SIZE_FORBIDDEN', rule: 'Per-order notional, per-position percentage, and max open positions are capped by the Treasurer mandate.', enforcement: 'brakes.checkOrder' },
+  { id: 'D6', code: 'RATE_FORBIDDEN', rule: 'Daily order cap per agent and max one order per symbol per cycle.', enforcement: 'brakes.checkOrder + dayStats' },
+  { id: 'D7', code: 'LOSS_LIMIT', rule: 'Daily loss and drawdown limits are fatal (death), never a pause.', enforcement: 'treasurer.tick verdicts -> reaper' },
+  { id: 'D8', code: 'LIVE_NOT_ARMED', rule: 'Live mode needs mode=live, allowLive, and a LIVE_ARMED file; keys are checked against the endpoint.', enforcement: 'config.resolveCredentials + brakes' },
+  { id: 'D9', code: 'NO_PROOF', rule: 'No trade without a Builder spec carrying dated proof from the Prospector.', enforcement: 'builder.compile + brakes.checkOrder' },
+  { id: 'D10', code: 'REPLICATION_FORBIDDEN', rule: 'Population cap, surplus gate, 72h runway floor, child endowment only from parent equity.', enforcement: 'treasurer gate + replicator.spawn' },
+  { id: 'D11', code: 'KILL_SWITCH', rule: 'Operator kill switch file blocks every order and every cycle.', enforcement: 'brakes.assertKillSwitchClear (file only the operator writes)' },
+  { id: 'D12', code: 'REAPER_ISOLATED', rule: 'The Reaper runs outside the engine process; no tool, IPC, config write, or handle can reach it.', enforcement: 'architecture (separate process, no control surface)' },
+  { id: 'D13', code: 'ALLOCATION_FORBIDDEN', rule: 'Mandates may never allocate more than allocationCapPct of broker equity.', enforcement: 'treasurer.tick' },
+  { id: 'D14', code: 'RESURRECTION_FORBIDDEN', rule: 'Dead is one-way; registry has markDead and no markAlive.', enforcement: 'registry.markDead' },
+  { id: 'D15', code: 'SHORT_FORBIDDEN', rule: 'Short sales need shorting enabled, a shortable+marginable asset, whole shares, and a mandate short cap.', enforcement: 'brakes.checkOrder + broker asset metadata' },
+  { id: 'D16', code: 'OPTION_FORBIDDEN', rule: 'Options need the permitted structure, integer contracts within caps, a valid DTE window and premium caps; covered calls need 100+ shares; spreads are defined-risk; naked short options never.', enforcement: 'brakes.checkOrder + option contract metadata' },
+  { id: 'D17', code: 'MARGIN_LIMIT', rule: 'Margin debt must stay within the mandate and the configured equity percentage; buying power is never exceeded.', enforcement: 'brakes.checkOrder + ledger margin invariant' },
+  { id: 'D18', code: 'EXPIRY_GUARD', rule: 'Opening option orders short of minDTE are denied; the executor closes before autoCloseDTE; sell-to-close is always allowed.', enforcement: 'brakes.checkOrder + executor lifecycle' },
 ];
 
 const SCHEMA_KEYWORDS = new Set([
@@ -262,6 +280,82 @@ function agentFixture(index) {
     openedAt: '2026-01-01T14:00:00.000Z',
   }] : [];
 
+  // v3.0 multi-instrument fixtures: short stock, long call, a two-leg spread group and a put.
+  if (index === 1) {
+    positions.push({
+      symbol: 'F',
+      assetClass: 'us_equity',
+      qtySigned: -10,
+      side: 'SHORT',
+      avgPriceUsd: 12,
+      lastPriceUsd: 11.5,
+      marketValueUsd: -115,
+      unrealizedPlUsd: 5,
+      openedAt: '2026-01-01T15:00:00.000Z',
+    });
+    positions.push({
+      symbol: 'AAPL260116C00200000',
+      assetClass: 'us_option',
+      qtySigned: 2,
+      side: 'CALL',
+      avgPriceUsd: 3.2,
+      lastPriceUsd: 4.1,
+      marketValueUsd: 820,
+      unrealizedPlUsd: 180,
+      multiplier: 100,
+      openedAt: '2026-01-01T16:00:00.000Z',
+      groupId: 'grp-call-1',
+      option: { underlying: 'AAPL', strikeUsd: 200, expiration: '2026-01-16', dte: 14, type: 'CALL', multiplier: 100 },
+    });
+  }
+  if (index === 2) {
+    positions.push({
+      symbol: 'TSLA260123C00250000',
+      assetClass: 'us_option',
+      qtySigned: 1,
+      side: 'CALL',
+      avgPriceUsd: 5,
+      lastPriceUsd: 6,
+      marketValueUsd: 600,
+      unrealizedPlUsd: 100,
+      multiplier: 100,
+      openedAt: '2026-01-01T16:10:00.000Z',
+      groupId: 'grp-spread-2',
+      option: { underlying: 'TSLA', strikeUsd: 250, expiration: '2026-01-23', dte: 7, type: 'CALL', multiplier: 100 },
+    });
+    positions.push({
+      symbol: 'TSLA260123C00260000',
+      assetClass: 'us_option',
+      qtySigned: -1,
+      side: 'CALL',
+      avgPriceUsd: 2,
+      lastPriceUsd: 1.8,
+      marketValueUsd: -180,
+      unrealizedPlUsd: 20,
+      multiplier: 100,
+      openedAt: '2026-01-01T16:10:00.000Z',
+      groupId: 'grp-spread-2',
+      option: { underlying: 'TSLA', strikeUsd: 260, expiration: '2026-01-23', dte: 7, type: 'CALL', multiplier: 100 },
+    });
+  }
+  if (index === 5) {
+    positions.push({
+      symbol: 'SPY260206P00450000',
+      assetClass: 'us_option',
+      qtySigned: 1,
+      side: 'PUT',
+      avgPriceUsd: 4.5,
+      lastPriceUsd: 5.2,
+      marketValueUsd: 520,
+      unrealizedPlUsd: 70,
+      multiplier: 100,
+      openedAt: '2026-01-01T16:20:00.000Z',
+      option: { underlying: 'SPY', strikeUsd: 450, expiration: '2026-02-06', dte: 21, type: 'PUT', multiplier: 100 },
+    });
+  }
+  const positionsGross = Math.round(positions.reduce((total, position) => total + Math.abs(position.marketValueUsd ?? 0), 0) * 100) / 100;
+  const positionsNet = Math.round(positions.reduce((total, position) => total + (position.marketValueUsd ?? 0), 0) * 100) / 100;
+
   return {
     id,
     name: nameAt(index),
@@ -299,6 +393,9 @@ function agentFixture(index) {
     rankings: rankingsFixture(index),
     strategy: strategyFixture(index),
     policy: policyFixture(index),
+    instrumentPermissions: instrumentPermissionsFixture(index),
+    playbook: playbookFixture(index),
+    marginDebtUsd: index === 1 ? 35.12 : null,
   };
 }
 
@@ -432,6 +529,72 @@ function rankingsFixture(index) {
 }
 
 /** Deterministic strategy taxonomy view (matches src/strategy-types.js for the fixture families). */
+/** Deterministic per-agent instrument permissions (v3.0 multi-instrument). */
+function instrumentPermissionsFixture(index) {
+  const family = familyAt(index);
+  const day = family === 'breakout' || family === 'gapfade';
+  const structures = ['long_stock', 'short_stock', 'long_call', 'long_put'];
+  if (day) structures.push('covered_call');
+  if (!day || index % 4 === 0) structures.push('call_credit_spread', 'put_credit_spread');
+  return {
+    longStock: true,
+    shortStock: index % 2 === 0,
+    longOptions: true,
+    shortOptions: true,
+    coveredCalls: day,
+    spreads: structures.some((structure) => structure.includes('spread')),
+    margin: index % 4 !== 0,
+    allowedStructures: structures,
+  };
+}
+
+/** Deterministic family instrument playbook (mirrors docs/INSTRUMENTS.md). */
+function playbookFixture(index) {
+  const family = familyAt(index);
+  const byFamily = {
+    momentum: { bullish: ['long_stock', 'long_call'], bearish: ['short_stock', 'long_put'], neutral: ['hold'] },
+    meanrev: { bullish: ['long_stock', 'put_credit_spread'], bearish: ['short_stock', 'call_credit_spread'], neutral: ['hold'] },
+    breakout: { bullish: ['long_call', 'long_stock'], bearish: ['long_put'], neutral: ['hold'] },
+    gapfade: { bullish: ['covered_call', 'long_put'], bearish: ['short_stock', 'put_credit_spread'], neutral: ['hold'] },
+  };
+  const entry = byFamily[family] ?? byFamily.momentum;
+  const structures = [...new Set([...entry.bullish, ...entry.bearish, ...entry.neutral])];
+  return { family, ...entry, structures };
+}
+
+function instrumentsFixture() {
+  return {
+    enabled: true,
+    allowMargin: true,
+    allowShort: true,
+    allowOptions: true,
+    allowCoveredCalls: true,
+    allowSpreads: true,
+    maxMarginPctEquity: 1,
+    maxShortPctEquity: 1,
+    maxOptionPremiumPctEquity: 0.25,
+    maxContracts: 3,
+    minDTE: 2,
+    maxDTE: 14,
+    autoCloseDTE: 1,
+    optionDataFeed: 'indicative',
+    account: {
+      buyingPowerUsd: 8000,
+      optionsBuyingPowerUsd: 2000,
+      marginMultiplier: 4,
+      shortingEnabled: true,
+      optionsTradingLevel: 3,
+      marginDebtUsd: 250,
+    },
+    playbooks: {
+      momentum: playbookFixture(0),
+      meanrev: playbookFixture(10),
+      breakout: playbookFixture(20),
+      gapfade: { family: 'gapfade', bullish: 'covered_call', bearish: ['short_stock', 'put_credit_spread'], neutral: 'hold', structures: ['covered_call', 'short_stock', 'put_credit_spread', 'hold'] },
+    },
+  };
+}
+
 function strategyFixture(index) {
   const family = familyAt(index);
   const category = family === 'breakout' || family === 'gapfade' ? 'day' : 'swing';
@@ -477,6 +640,13 @@ function policyFixture(index) {
     stale,
     reviewCount: 3 + (index % 4),
     nextReviewAt: '2026-01-02T00:05:00.000Z',
+    instrument: {
+      prefer: mod === 1 ? 'long_call' : mod === 2 ? 'put_credit_spread' : mod === 3 ? 'short_stock' : 'auto',
+      maxPremiumUsd: 12,
+      maxContracts: 2,
+      dteMin: 2,
+      dteMax: 14,
+    },
   };
 }
 
@@ -527,7 +697,7 @@ function buildRankingsPayload(agents) {
 }
 
 /** Full 30-agent status payload, close to what GET /automaton/state returns. */
-function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings, strategyMix, engineAgents } = {}) {
+function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPULATION, reaper, research, rewards, rankings, strategyMix, engineAgents, instruments } = {}) {
   const agents = Array.from({ length: agentCount }, (_, index) => agentFixture(index));
   const alive = agents.filter((agent) => agent.status === 'alive').length;
   const dead = agents.filter((agent) => agent.status === 'dead').length;
@@ -614,6 +784,9 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
       equityUsd: 20000,
       cashUsd: 15000,
       buyingPowerUsd: 30000,
+      marginDebtUsd: 250,
+      grossExposureUsd: 12000,
+      netExposureUsd: 3500,
       status: 'ACTIVE',
       mode,
       apiKeyId: SECRET,
@@ -664,10 +837,11 @@ function buildStatusPayload({ running = false, mode = 'paper', agentCount = POPU
     },
     halted: false,
     haltReasons: [],
-    brakes: { count: 14, enforced: true, killSwitch: false },
+    brakes: { count: 18, enforced: true, killSwitch: false },
     control: { route: CONTROL_PATH, loopbackOnly: true, actions: ['start', 'stop', 'emergency-stop', 'reaper-stop', 'set-research-settings', 'set-reward-settings'] },
     rankings: rankings ?? buildRankingsPayload(agents),
     strategyMix: strategyMix ?? buildStrategyMixPayload(agents),
+    instruments: instruments ?? instrumentsFixture(),
     rewards: {
       ...(rewards ?? {}),
       history: [
@@ -1047,7 +1221,7 @@ test('GET /automaton/state returns the redacted 30-agent snapshot', async () => 
   assert.equal(json.treasury.state, 'TIGHT');
   assert.equal(json.engine.lastTickAt, '2026-01-02T00:00:00.000Z');
   assert.equal(json.engine.killSwitch, false);
-  assert.equal(json.brakes.count, 14);
+  assert.equal(json.brakes.count, 18);
   assert.equal(json.obituaries.recent.length, 8);
   assert.equal(json.limits.allocationCapPct, 0.8);
   assert.equal(json.control.route, CONTROL_PATH);
@@ -1078,6 +1252,13 @@ test('GET /automaton/state returns the redacted 30-agent snapshot', async () => 
   assert.equal(json.agents[20].strategy.category, 'day');
   assert.equal(json.agents[1].policy.stance, 'trade');
   assert.equal(json.agents[5].policy, null);
+  // v3.0 multi-instrument additions pass through unchanged.
+  assert.equal(json.instruments.enabled, true);
+  assert.equal(json.instruments.account.optionsTradingLevel, 3);
+  assert.equal(json.account.marginDebtUsd, 250);
+  assert.ok(json.agents[0].instrumentPermissions.allowedStructures.length > 0);
+  assert.equal(json.agents[0].playbook.family, json.agents[0].strategy.family);
+  assert.ok(Array.isArray(json.agents[1].positions));
   // Names + drill-down data cross the route untouched by the host.
   assert.equal(json.agents[0].name, 'Momentum AAPL');
   assert.equal(Array.isArray(json.agents[0].recentTrades), true);
@@ -1474,6 +1655,23 @@ test('every tool executes and returns the structured JSON envelope', async () =>
   const configText = JSON.stringify(config);
   assert.equal(configText.includes(SECRET), false, 'config tool leaked credential material');
   assert.equal(configText.includes(SECRET_TWO), false, 'config tool leaked a secret value');
+
+  // v3.0 brake catalogue: 18 hard rules (D1–D18) exposed by the brakes tool. D2 is the
+  // instrument-permission gate; D15–D18 are short / options / margin / expiry.
+  const brakes = await fake.tools.get('automaton_brakes').execute({}, {});
+  assert.equal(brakes.ok, true);
+  assert.equal(brakes.count, 18);
+  assert.equal(brakes.rules.length, 18);
+  const ruleById = new Map(brakes.rules.map((rule) => [rule.id, rule]));
+  assert.equal(ruleById.get('D2').code, 'INSTRUMENT_FORBIDDEN');
+  assert.equal(ruleById.get('D15').code, 'SHORT_FORBIDDEN');
+  assert.equal(ruleById.get('D16').code, 'OPTION_FORBIDDEN');
+  assert.equal(ruleById.get('D17').code, 'MARGIN_LIMIT');
+  assert.equal(ruleById.get('D18').code, 'EXPIRY_GUARD');
+  assert.deepEqual(
+    brakes.rules.filter((rule) => ['D15', 'D16', 'D17', 'D18'].includes(rule.id)).map((rule) => rule.id),
+    ['D15', 'D16', 'D17', 'D18'],
+  );
 
   fake.disposeAll();
 });
@@ -2735,6 +2933,197 @@ test('pure data mapping: strategy types/intervals, category tabs and bot-agent p
     assert.deepEqual(helpers.categoryTabs(null, bareRows).map((tab) => tab.count), [30, 20, 10]);
     assert.equal(helpers.summarize(bareStatus).engineAgents.available, false);
     assert.equal(helpers.botAgentEngineStatus(undefined).available, false);
+  } finally {
+    loaded.restore();
+  }
+});
+
+test('pure data mapping: long/short/option positions, instrument badges, playbook and header caps', async () => {
+  const loaded = await loadClientModule();
+  try {
+    const helpers = loaded.module.helpers;
+    const status = buildStatusPayload({ running: true });
+    const rows = helpers.buildAgentRows(status);
+
+    // ---- position normalization ----
+    const longStock = helpers.positionRows([{ symbol: 'AAPL', qty: 2, avgPriceUsd: 10, lastPriceUsd: 12 }])[0];
+    assert.equal(longStock.isStock, true);
+    assert.equal(longStock.isOption, false);
+    assert.equal(longStock.side, 'LONG');
+    assert.equal(longStock.qtySigned, 2);
+    assert.equal(longStock.marketValueUsd, 24);
+    assert.equal(longStock.option, null);
+
+    const shortStock = helpers.positionRows([{
+      symbol: 'F',
+      assetClass: 'us_equity',
+      qtySigned: -10,
+      side: 'SHORT',
+      avgPriceUsd: 12,
+      lastPriceUsd: 11.5,
+      marketValueUsd: -115,
+      unrealizedPlUsd: 5,
+    }])[0];
+    assert.equal(shortStock.side, 'SHORT');
+    assert.equal(shortStock.isShort, true);
+    assert.equal(shortStock.qtySigned, -10);
+    assert.equal(shortStock.marketValueUsd, -115);
+    assert.equal(shortStock.unrealizedPlUsd, 5);
+
+    const callOption = helpers.positionRows([{
+      symbol: 'AAPL260116C00200000',
+      assetClass: 'us_option',
+      qtySigned: 2,
+      side: 'CALL',
+      avgPriceUsd: 3.2,
+      lastPriceUsd: 4.1,
+      marketValueUsd: 820,
+      unrealizedPlUsd: 180,
+      multiplier: 100,
+      groupId: 'grp-call-1',
+      option: { underlying: 'AAPL', strikeUsd: 200, expiration: '2026-01-16', dte: 14, type: 'CALL', multiplier: 100 },
+    }])[0];
+    assert.equal(callOption.isOption, true);
+    assert.equal(callOption.side, 'CALL');
+    assert.equal(callOption.contracts, 2);
+    assert.equal(callOption.qtyText, '2 ct');
+    assert.equal(callOption.option.strikeUsd, 200);
+    assert.equal(callOption.option.expiration, '2026-01-16');
+    assert.equal(callOption.option.expiryLabel, '2026-01-16');
+    assert.equal(callOption.option.dte, 14);
+    assert.equal(callOption.option.dteLabel, '14d');
+    assert.equal(callOption.option.multiplier, 100);
+    assert.equal(callOption.option.underlying, 'AAPL');
+    assert.equal(callOption.groupId, 'grp-call-1');
+    assert.ok(callOption.groupShort.length > 0);
+
+    const derivedOption = helpers.positionRows([{ symbol: 'F261120C00013000', qtySigned: 3, avgPriceUsd: 1, lastPriceUsd: 2, option: { type: 'CALL', strikeUsd: 13, expiration: '2026-11-20', dte: 5 } }])[0];
+    assert.equal(derivedOption.isOption, true);
+    assert.equal(derivedOption.side, 'CALL');
+    assert.equal(derivedOption.option.underlying, 'F', 'underlying parsed from the OCC symbol');
+    assert.equal(derivedOption.marketValueUsd, 600, 'contracts × premium × multiplier');
+    assert.equal(helpers.positionRows([]).length, 0);
+    assert.equal(helpers.positionRows(null).length, 0);
+
+    // Position rows carry short stock + option + spread legs; summary aggregates exposure.
+    const instrumentRow = rows.find((row) => row.positionRows.some((position) => position.side === 'CALL'));
+    assert.ok(instrumentRow);
+    assert.ok(instrumentRow.positionRows.some((position) => position.isShort));
+    assert.ok(instrumentRow.positionRows.some((position) => position.isOption && position.groupId));
+    const spreadRow = rows.find((row) => row.positionRows.filter((position) => position.groupId).length >= 2);
+    assert.ok(spreadRow);
+    assert.equal(spreadRow.positionSummary.spreadGroups, 1);
+    assert.ok(spreadRow.positionSummary.options.calls >= 2);
+    assert.ok(spreadRow.positionSummary.grossExposureUsd >= spreadRow.positionSummary.netExposureUsd);
+    const putRow = rows.find((row) => row.positionRows.some((position) => position.side === 'PUT'));
+    assert.ok(putRow);
+    const putPosition = putRow.positionRows.find((position) => position.side === 'PUT');
+    assert.equal(putPosition.option.strikeUsd, 450);
+    assert.equal(putPosition.option.dteLabel, '21d');
+    assert.equal(typeof instrumentRow.grossExposureUsd, 'number');
+    assert.equal(typeof instrumentRow.netExposureUsd, 'number');
+    assert.equal(instrumentRow.marginDebtUsd, 35.12);
+
+    // ---- instrument permissions / badges ----
+    const permissions = helpers.instrumentPermissionsMapping(instrumentPermissionsFixture(2));
+    assert.equal(permissions.available, true);
+    assert.equal(permissions.longStock, true);
+    assert.equal(permissions.shortStock, true);
+    assert.equal(permissions.spreads, true);
+    assert.equal(permissions.margin, true);
+    assert.ok(permissions.allowedStructures.some((structure) => structure.key === 'call_credit_spread'));
+    const badgeInfo = helpers.instrumentBadges({ instrumentPermissions: instrumentPermissionsFixture(2) });
+    assert.equal(badgeInfo.available, true);
+    assert.deepEqual(badgeInfo.badges.map((badge) => badge.labelKey), ['badgeStock', 'badgeShort', 'badgeOptions', 'badgeSpreads', 'badgeMargin']);
+    assert.match(badgeInfo.tooltip, /Long stock/);
+    const unknownStructure = helpers.instrumentPermissionsMapping({ allowedStructures: ['mystery_structure'], longStock: false });
+    assert.equal(unknownStructure.allowedStructures[0].label, 'mystery_structure');
+    assert.equal(unknownStructure.badges.some((badge) => badge.key === 'stock'), false);
+    assert.equal(helpers.instrumentPermissionsMapping(null).available, false);
+    assert.deepEqual(helpers.instrumentPermissionsMapping(undefined).badges, []);
+    assert.equal(helpers.instrumentStructureLabel('put_credit_spread'), 'Put credit spread');
+    assert.equal(helpers.instrumentStructureLabel('mystery'), 'mystery');
+    assert.equal(helpers.instrumentStructureLabel(undefined), '—');
+
+    // ---- playbook ----
+    const playbook = helpers.playbookMapping(rows[0].playbook);
+    assert.equal(playbook.available, true);
+    assert.equal(playbook.family, 'momentum');
+    assert.equal(playbook.familyLabel, 'Momentum');
+    assert.deepEqual(playbook.bullish.map((structure) => structure.label), ['Long stock', 'Long call']);
+    assert.deepEqual(playbook.bearish.map((structure) => structure.label), ['Short stock', 'Long put']);
+    assert.deepEqual(playbook.neutral.map((structure) => structure.label), ['Hold']);
+    assert.ok(playbook.structures.length >= 4);
+    const rawPlaybook = helpers.playbookMapping({ family: 'strange', bullish: 'mystery_structure' });
+    assert.equal(rawPlaybook.bullish[0].label, 'mystery_structure');
+    assert.equal(helpers.playbookMapping(null).available, false);
+    assert.equal(helpers.playbookMapping({}).hasContent, false);
+    assert.equal(rows[0].instrumentTooltip.length > 0, true);
+
+    // ---- bot-agent instrument policy plan ----
+    const policyWithPlan = rows.find((row) => row.policy?.instrument);
+    assert.ok(policyWithPlan);
+    assert.equal(policyWithPlan.policy.instrument.available, true);
+    assert.ok(typeof policyWithPlan.policy.instrument.prefer === 'string');
+    assert.equal(policyWithPlan.policy.instrument.maxContracts, 2);
+    assert.equal(policyWithPlan.policy.instrument.dteMin, 2);
+    assert.equal(policyWithPlan.policy.instrument.dteMax, 14);
+    const longCallPlan = rows.find((row) => row.policy?.instrument?.prefer === 'long_call');
+    assert.ok(longCallPlan);
+    assert.equal(longCallPlan.policy.instrument.preferLabel, 'Long call');
+    const autoPlan = rows.find((row) => row.policy?.instrument?.auto === true);
+    assert.ok(autoPlan);
+    assert.equal(helpers.instrumentPolicyMapping(null), null);
+    assert.equal(helpers.instrumentPolicyMapping({}), null);
+    assert.equal(helpers.instrumentPolicyMapping({ prefer: 'auto' }).auto, true);
+
+    // ---- engine instruments header ----
+    const header = helpers.instrumentsHeader(status.instruments, status.account);
+    assert.equal(header.available, true);
+    assert.equal(header.enabled, true);
+    assert.equal(header.allowMargin, true);
+    assert.equal(header.allowShort, true);
+    assert.equal(header.allowOptions, true);
+    assert.equal(header.caps.maxOptionPremiumPctEquity, 0.25);
+    assert.equal(header.caps.maxShortPctEquity, 1);
+    assert.equal(header.caps.maxContracts, 3);
+    assert.equal(header.caps.minDTE, 2);
+    assert.equal(header.caps.maxDTE, 14);
+    assert.equal(header.account.optionsTradingLevel, 3);
+    assert.equal(header.account.marginMultiplier, 4);
+    assert.equal(header.account.optionsBuyingPowerUsd, 2000);
+    assert.equal(header.account.marginDebtUsd, 250);
+    assert.equal(header.account.grossExposureUsd, 12000);
+    assert.equal(header.account.netExposureUsd, 3500);
+    assert.equal(header.playbookCount, 4);
+    assert.equal(helpers.instrumentsHeader(null, null).available, false);
+    assert.equal(helpers.instrumentsHeader(null, null).hasAccount, false);
+    const accountOnly = helpers.instrumentsHeader({}, { marginDebtUsd: 5 });
+    assert.equal(accountOnly.available, true);
+    assert.equal(accountOnly.hasAccount, true);
+    assert.equal(accountOnly.caps.maxContracts, null);
+    const summary = helpers.summarize(status);
+    assert.equal(summary.instruments.available, true);
+    assert.equal(summary.instruments.account.optionsTradingLevel, 3);
+    assert.equal(helpers.summarize({}).instruments.available, false);
+
+    // ---- bare payload: none of the v3.0 fields exist yet ----
+    const bareStatus = buildStatusPayload({ running: true });
+    delete bareStatus.instruments;
+    for (const agent of bareStatus.agents) {
+      delete agent.positions;
+      delete agent.instrumentPermissions;
+      delete agent.playbook;
+      delete agent.policy;
+    }
+    for (const key of ['buyingPowerUsd', 'marginDebtUsd', 'grossExposureUsd', 'netExposureUsd']) delete bareStatus.account[key];
+    const bareRows = helpers.buildAgentRows(bareStatus);
+    assert.equal(bareRows.every((row) => row.positionRows.length === 0 && row.positionCount === 0), true);
+    assert.equal(bareRows.every((row) => row.instrumentBadges.length === 0), true);
+    assert.equal(bareRows.every((row) => row.playbook.available === false), true);
+    assert.equal(bareRows.every((row) => row.instrumentPolicy === null), true);
+    assert.equal(helpers.summarize(bareStatus).instruments.available, false);
+    assert.equal(helpers.instrumentsHeader(undefined, undefined).available, false);
   } finally {
     loaded.restore();
   }

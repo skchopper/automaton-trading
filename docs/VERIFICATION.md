@@ -622,3 +622,144 @@ reward/settings changes are validated + persisted before applying.
 shows the new controls with empty/optional states; a Host restart loads the new engine + panel and is
 required for live cadence/rewards/leaderboards. Research LLM calls remain paused while the DeepSeek
 account balance is exhausted (a separate operator top-up; stale briefings are ignored by trading).
+
+---
+
+## 9. v3.0 multi-instrument paper trading — independent verification (2026-10-30)
+
+Task-17. Scope: `test/integration.test.js`, `test/security.test.js`, this document (no `src/**` edits;
+the verifier read `docs/INSTRUMENTS.md`, `docs/RUNBOOK.md` §8d and the landed v3 code, then attacked
+the real composition — real brakes + real executor + real treasurer/reaper against the **sim broker**
+and a fixed clock — not the builders' fake-brake/fake-broker harnesses).
+
+### 9.1 Reproduce (all suites run directly; the sandbox blocks `node --test` with spawn EPERM)
+
+```powershell
+cd D:\CounterStikers\packages\automaton-trading
+node test/mortality.test.js    # 70
+node test/market.test.js       # 43
+node test/research.test.js     # 13
+node test/rankings.test.js     # 16
+node test/control.test.js      # 16
+node test/instruments.test.js  # 7
+node test/plugin.test.js       # 42
+node test/bot-agent.test.js    # 8
+node test/integration.test.js  # 34  (verifier-owned; +13 v3 tests)
+node test/security.test.js     # 53  (verifier-owned; +6 v3 tests)
+
+cd D:\CounterStikers
+node scripts/verify-fixes.mjs  # 17/17 PASS
+```
+
+The already-installed Harness plugin process still caches the old ESM modules until the app is
+restarted; those fresh Node processes are the authoritative test of the v3 code, and the live GUI may
+serve the pre-v3 build until a restart.
+
+### 9.2 Results (fresh runs, 2026-10-30; every process exit code 0)
+
+| Suite | Tests | Pass | Fail | TODO | wall |
+|---|---:|---:|---:|---:|---:|
+| mortality.test.js | 70 | 70 | 0 | 0 | 0.41 s |
+| market.test.js | 43 | 43 | 0 | 0 | 0.26 s |
+| research.test.js | 13 | 13 | 0 | 0 | 0.22 s |
+| rankings.test.js | 16 | 16 | 0 | 0 | 0.27 s |
+| control.test.js | 16 | 16 | 0 | 0 | 0.59 s |
+| instruments.test.js | 7 | 7 | 0 | 0 | 0.07 s |
+| plugin.test.js | 42 | 42 | 0 | 0 | 0.92 s |
+| bot-agent.test.js | 8 | 8 | 0 | 0 | 0.17 s |
+| **integration.test.js (verifier)** | **34** | **34** | 0 | 0 | 0.90 s |
+| **security.test.js (verifier)** | **53** | **53** | 0 | 0 | 0.45 s |
+| **Total** | **302** | **302** | **0** | **0** | ~4 s |
+
+`scripts/verify-fixes.mjs`: **17/17 PASS** (re-run by the verifier).
+
+v3 verifier integration tests: sim broker v3 surface (assets/chain/quotes/short/option positions);
+short-stock round trip through executor+real brakes (open/mark/cover/realized); long-call round trip
+through executor (multiplier 100, premium flow, realized; D-V3-1 regression); covered call (real brakes
+deny without 100 shares, allow with, executor sells premium against held shares); D15-D18 in real
+context (naked options, non-shortable/fractional/oversized shorts, mixed-expiry spreads, defined-risk
+debit spread with reported `maxLossUsd`, DTE open guard + sell-to-close, margin cap); all four verticals
+open/close as one mleg each (`groupId`, two legs, defined width, realized P&L); margin within cap
+(negative cash) and cap denial without money creation; DTE auto-close through the executor; treasurer
+option marks/reconciliation coherent (D-V3-2 regression); multi-instrument death (short + long call +
+both spread legs liquidated, residual settled, schema-valid obituary, idempotent second sweep);
+orchestrator status (`engine.instruments` caps/structures/playbooks/account facts, per-agent
+`instrumentPermissions`/`playbook`, SHORT and CALL positions with strike/expiry/multiplier); paper
+default + `instruments.enabled=false` long-only fallback + live gate on v3 instruments; kill switch
+blocks short/option/spread orders too.
+
+v3 verifier security tests: config rejects naked short options and unsafe instrument limits
+(allowNakedShortOptions true, maxDTE < minDTE, autoCloseDTE > minDTE, unknown feed, maxContracts 0) both
+via `validateConfig` and `loadConfig`; option/spread symbols cannot bypass the **underlying** whitelist
+(D4); ledger margin invariants (no margin permission → `MARGIN_LIMIT`; over-cap refused with no cash /
+position / pool change; allowed borrowing produces margin debt = −cash and equity unchanged); ledger
+invariants after short/option/margin fills (`equity = cash + Σ signed marks`, closings at the same marks
+return exactly the starting equity, `pool.totalUsd` unchanged → no money creation); the live-mode gate
+applies to v3 instruments (paper-config live claim → `MODE_FORBIDDEN`; live config without `LIVE_ARMED`
+→ `LIVE_NOT_ARMED` for short and option orders); the v3 broker additions expose no money-movement
+methods (`getAsset`/`getOptionChain`/`getOptionQuote` only) and v3 `status.engine.instruments` stays
+secret-free through the tools and `/automaton/state`.
+
+### 9.3 Defects found by this verification (all fixed and regression-tested)
+
+| # | Sev | Defect (pre-fix) | Fix location | Regression evidence |
+|---|-----|------------------|--------------|---------------------|
+| D-V3-1 | **HIGH** | Every single-leg option order sent the **underlying** as `order.symbol` to the brake wall, so D16 denied all long calls/puts, covered-call entries and **all option exits** (incl. DTE auto-close) with `OPTION_FORBIDDEN: symbol "META" is not a valid OCC option symbol`. Options could not trade at all through the engine. | `src/executor.js:1414-1418` (`symbol: isMultiLeg ? displaySymbol : isOptionOrder ? ticker : displaySymbol`) | integration *long-call round trip…* and *covered call…*; the option order now reaches the broker as `assetClass:'us_option'` with the OCC symbol |
+| D-V3-2 | **HIGH** | `treasurer.marksFromPositions()` marked option positions as `marketValue / qty` without dividing by the option multiplier while `ledger.equity` multiplies again → option equity **100×**, reconciliation delta ≈ −$46k and `halted: reconciliation_mismatch` on every cycle holding an option. | `src/treasurer.js:202-213` (mark = \|marketValue\| / (\|qtySigned\| × multiplier); option multiplier default 100) | integration *an option position does not corrupt the Treasurer…*; view equity stays ≈$5k, delta ≈ 0, positionsValue < $1000 |
+| D-V3-3 | **MEDIUM (sim fidelity)** | `broker-sim.optionPremiumUsd()` added `spot × moneyness × 0.10` to time value, so further-OTM contracts were priced **higher** than nearer ones; every vertical netted the wrong way and `executor.buildOptionPlan` returned `null` for all four spread structures (no defined-risk spread could open in sim). | `src/broker-sim.js:141-148` (time value decays with OTM distance: `atmTimeValue × exp(-4 × otmDistance)`) | integration *all four defined-risk verticals open and close…*; each opens one mleg order and closes cleanly |
+
+Repro used before the fixes (kept for the record): real `createBrakes`+`createExecutor`, $5,000 sim
+account, bullish/bearish momentum bars, `policy {instrument:{prefer:'long_call'}}` → denied
+`OPTION_FORBIDDEN`; one META call held via broker+ledger then `treasurer.tick()` → view equity $51,323
+vs $5,000, delta −46,332, halted; `getOptionChain({underlying:'META'})` → calls increasing in premium
+with strike above spot.
+
+### 9.4 Remaining gaps (explicit — NOT verified)
+
+1. **No live paper option/short/margin fills were placed.** Every broker interaction in these tests is
+   the deterministic sim broker or a stubbed `fetch`; no Alpaca paper order for an option, mleg spread,
+   short sale or margin debit was submitted (no network/keys in the verification environment). The
+   vendor payload mapping is covered by `market.test.js` with a stubbed fetch, not by a real fill. The
+   account facts in `docs/INSTRUMENTS.md` (options level 3, shorting enabled, margin ×4) came from the
+   operator's earlier probe, not from this run.
+2. **Panel rendering is not browser-verified.** The verifier checked the HTTP/tool JSON
+   (`/automaton/state`, `automaton_status`) and the client slot-registration tests; no browser rendered
+   the LONG/SHORT/CALL/PUT badges, strike/expiry/DTE columns or the margin-debt row.
+3. **Assignment / early exercise / expiry settlement are not modelled.** Covered calls and spreads rely
+   on the DTE guard (`autoCloseDTE`) and sell/buy-to-close orders; there is no assignment simulation, no
+   early exercise, no pin risk, no dividend/interest/borrow-fee accounting. The DTE auto-close test is
+   synthetic.
+4. **The sim option market is a deterministic stand-in.** Immediate full fills, only two synthetic
+   expiries, synthetic premiums and 2% bid/ask; no partial fills, no real NBBO, no option
+   commissions/regulatory fees (the live broker adapter maps the real payloads but was not exercised
+   against the vendor here).
+5. **Margin call / maintenance-margin waterfall is not simulated.** Caps (`maxMarginPctEquity`,
+   `maxMarginUsd`, mandate cap) are enforced at order time and in the ledger; intraday maintenance
+   margin, forced liquidation and broker margin-call behavior are outside these tests. Short-sale
+   locate/HTB availability is just the static `asset.shortable/marginable` metadata.
+6. **Multi-day population behavior with options/shorts is untested.** The suites run seconds of simulated
+   time; no gen-3 survival comparison, no long-horizon option-overfit study, no journal growth/performance
+   under a full v3 population.
+7. **Real external-Reaper-vs-Alpaca-paper run:** the Reaper's multi-instrument liquidation, persistence
+   and idempotence are verified against the sim broker and fresh state instances; the detached process
+   against the real paper account was not exercised (needs keys + open market).
+8. **Live Harness module cache:** the running plugin process serves the previous (pre-v3) build until a
+   restart; the operator-visible panel/tools may not reflect v3 code until then. The fresh-process suite
+   runs above are authoritative for the workspace code.
+
+### 9.5 Verdict (v3.0)
+
+The multi-instrument expansion is real and walled, not a config-only claim: short stock round-trips
+through the real executor and brakes with signed ledger positions and realized P&L; long calls trade with
+multiplier-100 premium cash flow; covered calls are denied without 100 long shares and permitted (and
+premium-credited) with them; all four defined-risk verticals open and close as single `mleg` orders with a
+shared `groupId` and a defined max loss; margin allows capped negative cash and refuses over-cap debt in
+both the ledger and D17; DTE opens below `minDTE` are denied and held options auto-close through the
+executor; the Reaper liquidates a mixed short/option/spread estate, settles it and writes a schema-valid
+obituary exactly once; and the Treasurer's option marks/reconciliation are coherent. Three real defects
+(one of which made every option order impossible, one of which would have halted the population whenever
+an option was held) were found, reported with file:line + repro, fixed, and re-verified here; two of the
+three would have been invisible to the builders' fake-brake harnesses. The remaining risk is
+environmental: no live paper option fills, no assignment/early-exercise modelling, and no browser-verified
+panel. **Verified as a paper/sim capability expansion with a hard brake wall; live/realmoney option
+behavior remains unverified.**

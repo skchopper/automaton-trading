@@ -21,23 +21,168 @@ import { AutomatonError } from './contracts.js';
 import { errorInfo, readJsonSync, round2, round4, SYSTEM_CLOCK } from './util.js';
 import { statePaths } from './config.js';
 import { burnPerHour, computeRunwayHours, effectiveDeathFloor } from './treasurer.js';
-import { TREASURY_ID } from './ledger.js';
+import { normaliseAssetClass, OPTION_MULTIPLIER, TREASURY_ID } from './ledger.js';
 
 const HOUR_MS = 60 * 60 * 1000;
+const EPSILON = 1e-9;
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
+/**
+ * Marks derived from broker positions (v3 normalized shapes: qtySigned, marketValueUsd).
+ * Options: marketValueUsd = contracts × premium × 100, so the premium mark is
+ * |marketValue / (qtySigned × multiplier)|. Falls back to avgEntryPriceUsd.
+ */
 function marksFromPositions(brokerPositions, prices = {}) {
   const marks = isPlainObject(prices) ? { ...prices } : {};
   for (const position of brokerPositions ?? []) {
     const symbol = String(position?.symbol ?? '').toUpperCase();
     if (symbol === '') continue;
-    const qty = Number(position?.qty);
-    const marketValue = Number(position?.marketValueUsd);
-    if (Number.isFinite(qty) && qty !== 0 && Number.isFinite(marketValue) && marketValue > 0) {
-      marks[symbol] = round4(Math.abs(marketValue / qty));
+    const qtySigned = Number(position?.qtySigned ?? position?.qty);
+    const marketValueUsd = Number(position?.marketValueUsd);
+    const isOption = normaliseAssetClass(position?.assetClass, symbol) === 'us_option';
+    const multiplier = Number(position?.multiplier) > 0
+      ? Number(position.multiplier)
+      : isOption
+        ? OPTION_MULTIPLIER
+        : 1;
+    if (Number.isFinite(qtySigned) && qtySigned !== 0 && Number.isFinite(marketValueUsd) && marketValueUsd !== 0) {
+      marks[symbol] = round4(Math.abs(marketValueUsd) / (Math.abs(qtySigned) * multiplier));
+    } else if (Number(position?.avgEntryPriceUsd) > 0) {
+      marks[symbol] = round4(Number(position.avgEntryPriceUsd));
     }
   }
   return marks;
+}
+
+/**
+ * Close every non-zero position in an agent's virtual book (short stock buy-to-cover,
+ * long stock sell, option contracts buy/sell-to-close), booking each fill through the
+ * ledger. Shared by the external Reaper and the in-process simulation Reaper so the two
+ * death paths cannot diverge.
+ *
+ * Positions are closed leg-by-leg: for a multi-leg spread the two option legs are
+ * submitted as separate close orders carrying the same groupId (mleg close would need
+ * limit pricing and a broker-specific payload; leg-by-leg is universally supported and
+ * the fills still reconcile per orderId).
+ *
+ * @param {{ broker: object, ledger: object, agentId: string, marks?: object,
+ *   at: string, marketOpen?: boolean, clientOrderIdPrefix: string,
+ *   errors?: object[], bookOnFailure?: boolean }} options
+ * @returns {Promise<object[]>} liquidated position records
+ */
+export async function liquidatePositions({
+  broker,
+  ledger,
+  agentId,
+  marks = {},
+  at,
+  marketOpen = true,
+  clientOrderIdPrefix,
+  errors = [],
+  bookOnFailure = false,
+}) {
+  const liquidated = [];
+  let sequence = 0;
+  const book = ledger.book(agentId);
+  for (const [symbol, position] of Object.entries(book?.positions ?? {})) {
+    const qtySigned = round4(Number(position?.qtySigned ?? position?.qty) || 0);
+    if (Math.abs(qtySigned) <= EPSILON) continue;
+    sequence += 1;
+    const assetClass = normaliseAssetClass(position?.assetClass, symbol);
+    const isOption = assetClass === 'us_option';
+    const multiplier = isOption
+      ? (Number(position?.multiplier) > 0 ? Number(position.multiplier) : OPTION_MULTIPLIER)
+      : 1;
+    const quantity = isOption ? Math.round(Math.abs(qtySigned)) : round4(Math.abs(qtySigned));
+    const side = qtySigned > 0 ? 'sell' : 'buy';
+    const positionIntent = isOption ? (qtySigned > 0 ? 'sell_to_close' : 'buy_to_close') : null;
+    const markCandidates = [
+      Number(marks[symbol]),
+      Number(position?.lastPriceUsd),
+      Number(position?.avgPriceUsd),
+    ];
+    const mark = markCandidates.find((value) => Number.isFinite(value) && value > 0) ?? 0;
+    try {
+      const order = await broker.submitOrder({
+        symbol,
+        assetClass,
+        side,
+        qty: quantity,
+        type: 'market',
+        timeInForce: 'day',
+        ...(isOption ? { positionIntent, multiplier } : {}),
+        clientOrderId: `${clientOrderIdPrefix}:${sequence}`,
+      });
+      const fillPrice =
+        Number(order?.avgFillPriceUsd) > 0
+          ? Number(order.avgFillPriceUsd)
+          : Number(order?.filledAvgPrice) > 0
+            ? Number(order.filledAvgPrice)
+            : mark;
+      ledger.applyFill(agentId, {
+        symbol,
+        assetClass,
+        side,
+        qty: quantity,
+        priceUsd: fillPrice,
+        ...(isOption ? { multiplier, option: position?.option ?? null } : {}),
+        groupId: position?.groupId ?? position?.option?.groupId ?? null,
+        at,
+        orderId: order?.id ?? null,
+      });
+      liquidated.push({
+        symbol,
+        assetClass,
+        side,
+        qty: quantity,
+        positionIntent,
+        orderId: order?.id ?? null,
+        priceUsd: round4(fillPrice),
+        status: order?.status ?? 'submitted',
+        queued: marketOpen === false,
+        groupId: position?.groupId ?? null,
+      });
+    } catch (error) {
+      errors.push({ scope: 'liquidate', symbol, agentId, error: errorInfo(error) });
+      if (bookOnFailure) {
+        // In-process simulation has no external truth: the virtual book must still close,
+        // otherwise a dead agent would keep a phantom position forever. The real Reaper
+        // never does this — it retries the broker close on the next sweep instead.
+        try {
+          ledger.applyFill(agentId, {
+            symbol,
+            assetClass,
+            side,
+            qty: quantity,
+            priceUsd: mark > 0 ? mark : Number(position?.avgPriceUsd) || 0,
+            ...(isOption ? { multiplier, option: position?.option ?? null } : {}),
+            groupId: position?.groupId ?? position?.option?.groupId ?? null,
+            at,
+            orderId: null,
+          });
+          liquidated.push({
+            symbol,
+            assetClass,
+            side,
+            qty: quantity,
+            positionIntent,
+            orderId: null,
+            priceUsd: round4(mark),
+            status: 'booked_on_failure',
+            queued: false,
+            groupId: position?.groupId ?? null,
+          });
+        } catch (bookError) {
+          errors.push({ scope: 'liquidate-book', symbol, agentId, error: errorInfo(bookError) });
+        }
+      } else {
+        // Leave the position in the book: the next sweep retries (the death is still
+        // executed now — a dead agent must never keep trading, only be settled).
+        liquidated.push({ symbol, assetClass, side, qty: quantity, status: 'failed', error: errorInfo(error) });
+      }
+    }
+  }
+  return liquidated;
 }
 
 /**
@@ -109,46 +254,18 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
     return canceled;
   }
 
-  async function liquidate(agentId, marks, marketOpen, at) {
-    const liquidated = [];
-    const book = ledger.book(agentId);
-    let sequence = 0;
-    for (const [symbol, position] of Object.entries(book.positions)) {
-      const qty = round4(Number(position?.qty));
-      if (!(qty > 0)) continue;
-      sequence += 1;
-      const mark = Number(marks[symbol]) > 0 ? Number(marks[symbol]) : Number(position?.avgPriceUsd) || 0;
-      try {
-        const order = await broker.submitOrder({
-          symbol,
-          side: 'sell',
-          qty,
-          type: 'market',
-          timeInForce: 'day',
-          clientOrderId: `atm:${agentId}:reaper:${sequence}`,
-        });
-        const fillPrice = Number(order?.avgFillPriceUsd) > 0 ? Number(order.avgFillPriceUsd) : mark;
-        ledger.applyFill(agentId, {
-          symbol,
-          side: 'sell',
-          qty,
-          priceUsd: fillPrice,
-          at,
-          orderId: order?.id ?? null,
-        });
-        liquidated.push({
-          symbol,
-          qty,
-          orderId: order?.id ?? null,
-          priceUsd: round4(fillPrice),
-          status: order?.status ?? 'submitted',
-          queued: marketOpen === false,
-        });
-      } catch (error) {
-        liquidated.push({ symbol, qty, status: 'failed', error: errorInfo(error) });
-      }
-    }
-    return liquidated;
+  /** Close every non-zero position (long/short stock, option legs) via the shared helper. */
+  async function liquidate(agentId, marks, marketOpen, at, errors = []) {
+    return liquidatePositions({
+      broker,
+      ledger,
+      agentId,
+      marks,
+      at,
+      marketOpen,
+      clientOrderIdPrefix: `atm:${agentId}:reaper`,
+      errors,
+    });
   }
 
   function buildObituary(agent, cause, finalEquityUsd, at, atMs) {
@@ -189,19 +306,29 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
   }
 
   /** Execute one death. Idempotent by construction. */
-  async function killAgent(agent, cause, marks, marketOpen, at, atMs) {
+  async function killAgent(agent, cause, marks, marketOpen, at, atMs, errors = []) {
     const agentId = agent.id;
     const orders = await cancelOpenOrders(agentId);
-    const liquidated = await liquidate(agentId, marks, marketOpen, at);
+    const liquidated = await liquidate(agentId, marks, marketOpen, at, errors);
     const finalEquity = ledger.equity(agentId, marks);
     // Sweep whatever cash remains after liquidation; the virtual estate returns to the pool.
     // Use the ledger's exact (8dp) cash, not the 2dp display snapshot, or a sub-cent
     // rounding difference can make the estate "insufficient" and block a legitimate kill.
     let sweptUsd = 0;
+    let absorbedDebtUsd = 0;
     const exactCashUsd = Number(ledger.get?.(agentId)?.cashUsd ?? 0);
     if (exactCashUsd > 0) {
       ledger.transfer(agentId, TREASURY_ID, exactCashUsd, { reason: 'death_sweep', at });
       sweptUsd = round2(exactCashUsd);
+    } else if (exactCashUsd < 0) {
+      // A margined estate leaves debt behind after liquidation. The account absorbs it, so
+      // the treasury (unallocated capital) covers it and the dead book is zeroed.
+      try {
+        ledger.transfer(TREASURY_ID, agentId, -exactCashUsd, { reason: 'death_debt_absorb', at });
+        absorbedDebtUsd = round2(-exactCashUsd);
+      } catch (error) {
+        errors.push({ scope: 'death-debt', agentId, error: errorInfo(error) });
+      }
     }
     let deadAgent;
     try {
@@ -228,6 +355,7 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
       liquidated,
       orders,
       sweptUsd,
+      absorbedDebtUsd,
     };
   }
 
@@ -235,24 +363,35 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
    * Finish anything a crashed sweep left behind for an already-dead agent: retry the
    * liquidation, sweep residual cash, and append the missing obituary.
    */
-  async function settleDeadAgent(agent, marks, marketOpen, at, atMs) {
+  async function settleDeadAgent(agent, marks, marketOpen, at, atMs, errors = []) {
     const agentId = agent.id;
     if (!ledger.has(agentId)) ledger.ensureAgent(agentId, { endowmentUsd: agent.endowmentUsd ?? 0, at });
     const book = ledger.book(agentId);
-    const hasPositions = Object.values(book.positions).some((position) => Number(position?.qty) > 0);
+    const hasPositions = Object.values(book.positions).some(
+      (position) => Math.abs(Number(position?.qtySigned ?? position?.qty) || 0) > EPSILON,
+    );
     const needsObituary = !journal.has(agentId);
     const snapshot = ledger.snapshot(agentId);
-    if (!hasPositions && !needsObituary && snapshot.cashUsd <= 0) {
+    if (!hasPositions && !needsObituary && snapshot.cashUsd <= 0 && snapshot.cashUsd >= -EPSILON) {
       return { settled: false, sweptUsd: 0 };
     }
     const orders = await cancelOpenOrders(agentId);
-    const liquidated = await liquidate(agentId, marks, marketOpen, at);
+    const liquidated = await liquidate(agentId, marks, marketOpen, at, errors);
     const equity = ledger.equity(agentId, marks);
     const after = ledger.get?.(agentId) ?? ledger.snapshot(agentId);
     let sweptUsd = 0;
-    if (Number(after.cashUsd) > 0) {
-      ledger.transfer(agentId, TREASURY_ID, Number(after.cashUsd), { reason: 'death_sweep-recovery', at });
-      sweptUsd = round2(Number(after.cashUsd));
+    let absorbedDebtUsd = 0;
+    const cashUsd = Number(after.cashUsd) || 0;
+    if (cashUsd > 0) {
+      ledger.transfer(agentId, TREASURY_ID, cashUsd, { reason: 'death_sweep-recovery', at });
+      sweptUsd = round2(cashUsd);
+    } else if (cashUsd < 0) {
+      try {
+        ledger.transfer(TREASURY_ID, agentId, -cashUsd, { reason: 'death_debt_absorb', at });
+        absorbedDebtUsd = round2(-cashUsd);
+      } catch (error) {
+        errors.push({ scope: 'death-debt', agentId, error: errorInfo(error) });
+      }
     }
     if (needsObituary) {
       const storedFinalEquity = Number(agent.finalEquityUsd);
@@ -262,7 +401,7 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
     }
     await registry.save();
     await ledger.save();
-    return { settled: true, sweptUsd, liquidated, orders };
+    return { settled: true, sweptUsd, absorbedDebtUsd, liquidated, orders };
   }
 
   /**
@@ -343,7 +482,7 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
         }
         if (!cause && !accountActive) cause = 'account_not_active';
         if (!cause) continue;
-        killed.push(await killAgent(agent, cause, marks, marketOpen, at, atMs));
+        killed.push(await killAgent(agent, cause, marks, marketOpen, at, atMs, errors));
       } catch (error) {
         skipped.push({ agentId, reason: `kill_failed: ${error?.message ?? error}` });
       }
@@ -352,7 +491,7 @@ export function createReaper({ broker, registry, ledger, journal, config, paths,
     // Recovery path for agents a previous (crashed) sweep left half-settled.
     for (const agent of registry.dead()) {
       try {
-        const result = await settleDeadAgent(agent, marks, marketOpen, at, atMs);
+        const result = await settleDeadAgent(agent, marks, marketOpen, at, atMs, errors);
         skipped.push({ agentId: agent.id, reason: 'already_dead', settled: result.settled === true });
       } catch (error) {
         skipped.push({ agentId: agent.id, reason: `settle_failed: ${error?.message ?? error}` });

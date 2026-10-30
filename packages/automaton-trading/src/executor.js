@@ -28,8 +28,165 @@
 
 import { fail } from './contracts.js';
 import { clamp, mean, round2, round4, SYSTEM_CLOCK, timeframeToMs } from './util.js';
+import { parseOccSymbol, formatOccSymbol, daysToExpiration } from './broker-alpaca.js';
+import {
+  normalizeInstrumentPolicy,
+  optionRightForStructure,
+  playbookForFamily,
+  resolveInstrumentPermissions,
+  spreadWidthPct,
+  strikeOffsetPct,
+  structuresForDirection,
+  targetDTE,
+} from './instruments.js';
 
 const MAX_BARS_FETCH = 240;
+const OPTION_MULTIPLIER = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const OPTION_DATA_FEED = 'indicative';
+
+/** Instrument structure catalog (falls back to local names if instruments.js changes). */
+const STRUCTURE_KEYS = Object.freeze([
+  'long_call', 'long_put', 'covered_call', 'bull_call_spread', 'bear_put_spread',
+  'call_credit_spread', 'put_credit_spread',
+]);
+const SPREAD_KEYS = Object.freeze(['bull_call_spread', 'bear_put_spread', 'call_credit_spread', 'put_credit_spread']);
+
+/** Local playbook fallback (docs/INSTRUMENTS.md table) — used if the helper returns nothing. */
+const LOCAL_PLAYBOOKS = Object.freeze({
+  momentum: { bullish: ['long_call', 'bull_call_spread', 'long_stock'], bearish: ['short_stock', 'long_put', 'call_credit_spread'], neutral: ['long_stock'] },
+  meanrev: { bullish: ['long_stock', 'put_credit_spread', 'bull_call_spread'], bearish: ['short_stock', 'call_credit_spread', 'bear_put_spread'], neutral: [] },
+  breakout: { bullish: ['long_call', 'bull_call_spread', 'long_stock'], bearish: ['long_put', 'short_stock', 'bear_put_spread'], neutral: [] },
+  gapfade: { bullish: ['long_stock', 'put_credit_spread', 'long_call'], bearish: ['covered_call', 'short_stock', 'long_put', 'call_credit_spread'], neutral: ['covered_call'] },
+});
+
+function isSpread(structure) {
+  return SPREAD_KEYS.includes(String(structure ?? ''));
+}
+
+function isOptionStructure(structure) {
+  return STRUCTURE_KEYS.includes(String(structure ?? ''));
+}
+
+function isDayFamily(family) {
+  return family === 'breakout' || family === 'gapfade';
+}
+
+/** Playbook structures for one family/direction, with a local fallback. */
+function playbookStructures(family, direction) {
+  try {
+    const listed = structuresForDirection(family, direction);
+    if (Array.isArray(listed) && listed.length > 0) {
+      return listed.filter((entry) => entry === 'long_stock' || entry === 'short_stock' || isOptionStructure(entry));
+    }
+  } catch {
+    /* fall through to the local table */
+  }
+  const book = LOCAL_PLAYBOOKS[String(family ?? '').toLowerCase()] ?? LOCAL_PLAYBOOKS.momentum;
+  return [...(book[direction] ?? book.neutral ?? [])];
+}
+
+/** Vertical width as a fraction of spot (day families use tighter spreads). */
+function spreadWidthFraction(family) {
+  let width = 0.05;
+  try {
+    const raw = Number(spreadWidthPct(family));
+    if (Number.isFinite(raw) && raw > 0) width = raw;
+  } catch {
+    /* keep the default */
+  }
+  if (isDayFamily(family)) width = Math.min(width, 0.03);
+  return width;
+}
+
+/** Target DTE for a structure. */
+function structureTargetDTE(family, structure, minDTE, maxDTE) {
+  try {
+    const target = targetDTE({ family: isDayFamily(family) ? 'day' : family, structure, minDTE, maxDTE });
+    if (Number.isFinite(Number(target))) return clamp(Number(target), minDTE, maxDTE);
+  } catch {
+    /* fall through */
+  }
+  return Math.min(maxDTE, Math.max(minDTE, minDTE + 3));
+}
+
+/** Strike offset fraction for one structure (docs/INSTRUMENTS.md strike rules). */
+function structureStrikeOffset(family, structure) {
+  try {
+    const raw = Number(strikeOffsetPct(family, structure));
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+  } catch {
+    /* fall through */
+  }
+  if (structure === 'covered_call') return 0.04;
+  if (structure === 'call_credit_spread' || structure === 'put_credit_spread') return 0.03;
+  return 0.035;
+}
+
+/** Which direction a structure expresses. */
+function structureDirection(structure) {
+  switch (structure) {
+    case 'long_call':
+    case 'bull_call_spread':
+    case 'put_credit_spread':
+    case 'long_stock':
+      return 'bullish';
+    case 'long_put':
+    case 'bear_put_spread':
+    case 'call_credit_spread':
+    case 'short_stock':
+      return 'bearish';
+    case 'covered_call':
+      return 'neutral';
+    default:
+      return null;
+  }
+}
+
+/** Resolve per-agent instrument permissions (defensive: falls back to local rules). */
+export function resolveExecutorPermissions(config, agent) {
+  let base = null;
+  try {
+    base = resolveInstrumentPermissions(config);
+  } catch {
+    base = null;
+  }
+  if (!base) {
+    const cfg = config?.instruments ?? {};
+    const enabled = cfg.enabled !== false;
+    const allowOptions = enabled && cfg.allowOptions !== false;
+    const allowSpreads = allowOptions && cfg.allowSpreads !== false;
+    const allowCoveredCalls = allowOptions && cfg.allowCoveredCalls !== false;
+    const allowShort = enabled && cfg.allowShort !== false;
+    base = {
+      enabled,
+      longStock: enabled,
+      shortStock: allowShort,
+      longOptions: allowOptions,
+      shortOptions: allowOptions && (allowCoveredCalls || allowSpreads),
+      coveredCalls: allowCoveredCalls,
+      spreads: allowSpreads,
+      margin: enabled && cfg.allowMargin !== false,
+      allowedStructures: allowOptions
+        ? ['long_call', 'long_put', ...(allowCoveredCalls ? ['covered_call'] : []), ...(allowSpreads ? SPREAD_KEYS : [])]
+        : [],
+    };
+  }
+  void agent;
+  return { ...base, allowedStructures: [...(base.allowedStructures ?? [])] };
+}
+
+/** True when a structure is permitted by a permission view. */
+export function structureAllowed(structure, permissions) {
+  if (!permissions || permissions.enabled === false) return false;
+  if (structure === 'long_stock') return permissions.longStock !== false;
+  if (structure === 'short_stock') return permissions.shortStock === true;
+  if (!isOptionStructure(structure)) return false;
+  if (permissions.longOptions !== true && structure.startsWith('long_')) return false;
+  if (structure === 'covered_call') return permissions.coveredCalls === true;
+  if (isSpread(structure)) return permissions.spreads === true;
+  return (permissions.allowedStructures ?? []).includes(structure);
+}
 
 // ---------------------------------------------------------------------------
 // small normalization helpers
@@ -106,12 +263,23 @@ export function resolveAgentPolicy({ policy, config, atMs }) {
   // v1: sizing can only shrink; out-of-range values are clamped into [0.2, 1].
   const sizeMultiplier = rawSize === null ? 1 : clamp(rawSize, 0.2, 1);
   const exitPressure = policy.exitPressure === 'exit' ? 'exit' : 'none';
+  // Optional bot-chosen instrument plan (docs/INSTRUMENTS.md § Bot agent); validated and
+  // clamped by the Lead-owned instruments helper, with a safe local fallback.
+  let instrument = null;
+  if (policy.instrument && typeof policy.instrument === 'object') {
+    try {
+      instrument = normalizeInstrumentPolicy(policy.instrument, { config });
+    } catch {
+      instrument = null;
+    }
+  }
   return {
     stance: rawStance,
     sizeMultiplier,
     exitPressure,
     confidence: clamp(numberOrNull(policy.confidence) ?? 0, 0, 1),
     at: observedAtMs,
+    instrument,
   };
 }
 
@@ -217,17 +385,32 @@ export function spreadBpsOf(quote) {
 
 /**
  * Evaluate a spec's family signal on the bar history.
- * Long-only (the mandate forbids shorting): `enter` means buy, `exit` means close.
+ *
+ * Multi-instrument: exposes both directions. `longEntry`/`shortEntry` are the entry
+ * triggers and `longExit`/`shortExit` the signal-based closes. `enter`/`exit` are kept
+ * as aliases of the long side for backward compatibility with older callers/tests.
+ *
  * @param {string} family
  * @param {Array<{t:number|null,o:number,h:number,l:number,c:number,v:number}>} bars ascending
  * @param {object} params spec params
- * @returns {{enter:boolean, exit:boolean, z:number|null, lastClose:number|null, reason:string}}
+ * @returns {{enter:boolean, exit:boolean, longEntry:boolean, shortEntry:boolean,
+ *            longExit:boolean, shortExit:boolean, z:number|null, lastClose:number|null,
+ *            reason:string}}
  */
 export function computeSignal(family, bars, params = {}) {
   const n = bars.length;
-  if (n < 30) {
-    return { enter: false, exit: false, z: null, lastClose: n > 0 ? bars[n - 1].c : null, reason: 'insufficient_bars' };
-  }
+  const empty = {
+    enter: false,
+    exit: false,
+    longEntry: false,
+    shortEntry: false,
+    longExit: false,
+    shortExit: false,
+    z: null,
+    lastClose: n > 0 ? bars[n - 1].c : null,
+    reason: 'insufficient_bars',
+  };
+  if (n < 30) return empty;
   const last = bars[n - 1];
   const entryZ = Number.isFinite(params.entryZ) ? params.entryZ : 1;
   const exitZ = Number.isFinite(params.exitZ) ? params.exitZ : 0.5;
@@ -239,9 +422,17 @@ export function computeSignal(family, bars, params = {}) {
     const history = momentum.slice(0, -1);
     const { mean: avg, std } = meanStd(history);
     const z = std > 0 ? (latest - avg) / std : 0;
+    const longEntry = z >= entryZ;
+    const shortEntry = z <= -entryZ;
+    const longExit = z <= exitZ;
+    const shortExit = z >= -exitZ;
     return {
-      enter: z >= entryZ,
-      exit: z <= exitZ,
+      enter: longEntry,
+      exit: longExit,
+      longEntry,
+      shortEntry,
+      longExit,
+      shortExit,
       z: round4(z),
       lastClose: last.c,
       reason: `momentum z=${round2(z)}`,
@@ -252,9 +443,17 @@ export function computeSignal(family, bars, params = {}) {
     const slice = bars.slice(-window).map((bar) => bar.c);
     const { mean: avg, std } = meanStd(slice);
     const z = std > 0 ? (last.c - avg) / std : 0;
+    const longEntry = z <= -entryZ;
+    const shortEntry = z >= entryZ;
+    const longExit = z >= -exitZ;
+    const shortExit = z <= exitZ;
     return {
-      enter: z <= -entryZ,
-      exit: z >= -exitZ,
+      enter: longEntry,
+      exit: longExit,
+      longEntry,
+      shortEntry,
+      longExit,
+      shortExit,
       z: round4(z),
       lastClose: last.c,
       reason: `meanrev z=${round2(z)}`,
@@ -263,28 +462,75 @@ export function computeSignal(family, bars, params = {}) {
   if (family === 'breakout') {
     const window = Math.min(20, n - 1);
     let priorHigh = -Infinity;
-    for (let i = n - 1 - window; i < n - 1; i += 1) priorHigh = Math.max(priorHigh, bars[i].h);
+    let priorLow = Infinity;
+    for (let i = n - 1 - window; i < n - 1; i += 1) {
+      priorHigh = Math.max(priorHigh, bars[i].h);
+      priorLow = Math.min(priorLow, bars[i].l);
+    }
     const sma10 = mean(bars.slice(-10).map((bar) => bar.c));
+    const longEntry = last.c > priorHigh;
+    const shortEntry = last.c < priorLow;
+    const longExit = last.c < sma10;
+    const shortExit = last.c > sma10;
     return {
-      enter: last.c > priorHigh,
-      exit: last.c < sma10,
+      enter: longEntry,
+      exit: longExit,
+      longEntry,
+      shortEntry,
+      longExit,
+      shortExit,
       z: priorHigh > 0 ? round4(((last.c - priorHigh) / priorHigh) * 10_000) : null,
       lastClose: last.c,
-      reason: last.c > priorHigh ? 'breakout' : 'inside_range',
+      reason: longEntry ? 'breakout' : shortEntry ? 'breakdown' : 'inside_range',
     };
   }
   if (family === 'gapfade') {
     const prev = bars[n - 2];
     const gap = (last.o - prev.c) / prev.c;
+    const longEntry = gap <= -0.002;
+    const shortEntry = gap >= 0.002;
+    const longExit = last.c >= prev.c;
+    const shortExit = last.c <= prev.c;
     return {
-      enter: gap <= -0.002,
-      exit: last.c >= prev.c,
+      enter: longEntry,
+      exit: longExit,
+      longEntry,
+      shortEntry,
+      longExit,
+      shortExit,
       z: round4(gap * 10_000),
       lastClose: last.c,
       reason: `gap ${round2(gap * 10_000)}bps`,
     };
   }
-  return { enter: false, exit: false, z: null, lastClose: last.c, reason: 'unknown_family' };
+  return { ...empty, lastClose: last.c, reason: 'unknown_family' };
+}
+
+/**
+ * Normalize one ledger position into the executor's multi-instrument position shape.
+ * Legacy stock-only books (`{qty, avgPriceUsd, openedAt}`) keep working.
+ * @param {string} rawSymbol
+ * @param {object} raw
+ */
+export function normalizeLedgerPosition(rawSymbol, raw) {
+  const symbol = String(rawSymbol ?? '').trim().toUpperCase();
+  const option = raw && typeof raw.option === 'object' ? raw.option : parseOccSymbol(symbol);
+  const assetClass = raw?.assetClass === 'us_option' || option ? 'us_option' : 'us_equity';
+  const qtySigned = numberOrNull(raw?.qtySigned) ?? numberOrNull(raw?.qty) ?? 0;
+  const multiplier = numberOrNull(raw?.multiplier) ?? (assetClass === 'us_option' ? OPTION_MULTIPLIER : 1);
+  return {
+    symbol,
+    assetClass,
+    option: option ?? null,
+    qtySigned,
+    qty: qtySigned,
+    absQty: Math.abs(qtySigned),
+    avgPriceUsd: numberOrNull(raw?.avgPriceUsd ?? raw?.avgEntryPriceUsd) ?? 0,
+    multiplier,
+    groupId: raw?.groupId ?? null,
+    structure: raw?.structure ?? null,
+    openedAt: raw?.openedAt ?? null,
+  };
 }
 
 function positionsToMap(raw) {
@@ -292,24 +538,17 @@ function positionsToMap(raw) {
   if (!raw) return map;
   if (Array.isArray(raw)) {
     for (const position of raw) {
-      if (position && position.symbol && Number(position.qty) > 0) {
-        map.set(String(position.symbol).toUpperCase(), {
-          qty: Number(position.qty),
-          avgPriceUsd: numberOrNull(position.avgPriceUsd ?? position.avgEntryPriceUsd) ?? 0,
-          openedAt: position.openedAt ?? null,
-        });
-      }
+      if (!position || !position.symbol) continue;
+      const normalized = normalizeLedgerPosition(position.symbol, position);
+      if (Math.abs(normalized.qtySigned) > 1e-9) map.set(normalized.symbol, normalized);
     }
     return map;
   }
   if (typeof raw === 'object') {
     for (const [symbol, position] of Object.entries(raw)) {
-      if (!position || !(Number(position.qty) > 0)) continue;
-      map.set(String(symbol).toUpperCase(), {
-        qty: Number(position.qty),
-        avgPriceUsd: numberOrNull(position.avgPriceUsd ?? position.avgEntryPriceUsd) ?? 0,
-        openedAt: position.openedAt ?? null,
-      });
+      if (!position || typeof position !== 'object') continue;
+      const normalized = normalizeLedgerPosition(symbol, position);
+      if (Math.abs(normalized.qtySigned) > 1e-9) map.set(normalized.symbol, normalized);
     }
   }
   return map;
@@ -355,6 +594,25 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
   // Per-bot agent policy consumption is opt-in and gated by config.agents (docs/BOT-AGENTS.md).
   const agentsConfig = config.agents && typeof config.agents === 'object' ? config.agents : {};
   const agentsEnabled = agentsConfig.enabled === true;
+  // Multi-instrument trading (docs/INSTRUMENTS.md): margin, short stock, long options,
+  // defined-risk verticals and covered calls. Brakes remain the authoritative gate.
+  const instrumentsConfig = config.instruments && typeof config.instruments === 'object' ? config.instruments : {};
+  const instrumentsEnabled = instrumentsConfig.enabled !== false;
+  const globalPermissions = resolveExecutorPermissions(config);
+  const minDTE = Math.max(1, Math.trunc(Number(instrumentsConfig.minDTE) || 2));
+  const maxDTE = Math.max(minDTE, Math.trunc(Number(instrumentsConfig.maxDTE) || 14));
+  const autoCloseDTE = Math.max(0, Math.trunc(Number(instrumentsConfig.autoCloseDTE) || 1));
+  const configMaxContracts = Math.max(1, Math.trunc(Number(instrumentsConfig.maxContracts) || 3));
+  const configMaxOptionPremiumUsd = Number.isFinite(Number(instrumentsConfig.maxOptionPremiumUsd))
+    ? Number(instrumentsConfig.maxOptionPremiumUsd)
+    : 25;
+  const maxOptionPremiumPctEquity = Number.isFinite(Number(instrumentsConfig.maxOptionPremiumPctEquity))
+    ? Number(instrumentsConfig.maxOptionPremiumPctEquity)
+    : 0.25;
+  const optionDataFeed = instrumentsConfig.optionDataFeed ?? OPTION_DATA_FEED;
+  const maxShortNotionalUsd = Number.isFinite(Number(instrumentsConfig.maxShortNotionalUsd))
+    ? Number(instrumentsConfig.maxShortNotionalUsd)
+    : 25;
 
   /** Monotonic per-agent order sequence, so client_order_id never repeats. */
   const orderSeq = new Map();
@@ -403,38 +661,115 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
       //   - we track how much of each order id is already booked,
       //   - we reconcile recent broker orders for THIS agent at the start of every cycle,
       //   - and after submitting we briefly poll for the fill before booking.
-      /** @type {Map<string, number>} orderId -> booked qty */
+      /** @type {Map<string, number>} `${orderId}:${symbol}:${side}` -> booked qty */
       const bookedQtyByOrder = new Map();
       if (typeof ledger.history === 'function') {
         try {
           for (const fill of ledger.history(agentId, { limit: 250 })) {
-            if (fill?.orderId) bookedQtyByOrder.set(fill.orderId, (bookedQtyByOrder.get(fill.orderId) ?? 0) + Number(fill.qty || 0));
+            if (!fill?.orderId) continue;
+            const key = `${fill.orderId}:${String(fill.symbol ?? '').toUpperCase()}:${fill.side ?? ''}`;
+            bookedQtyByOrder.set(key, (bookedQtyByOrder.get(key) ?? 0) + Number(fill.qty || 0));
           }
         } catch {
           /* history is optional for reconciliation */
         }
       }
 
-      /** Book the not-yet-booked part of a broker order fill. */
+      /** Book one not-yet-booked fill unit (stock, option contract or mleg leg). */
+      async function bookFillUnit({ orderId, symbol, side, qty, priceUsd, assetClass, option, groupId, structure, multiplier }) {
+        const ticker = String(symbol ?? '').toUpperCase();
+        if (!ticker || !(Number(qty) > 0) || !(Number(priceUsd) > 0)) return 0;
+        const key = `${orderId ?? 'noorder'}:${ticker}:${side ?? ''}`;
+        const already = orderId ? (bookedQtyByOrder.get(key) ?? 0) : 0;
+        const delta = round4(Number(qty) - already);
+        if (!(delta > 0)) return 0;
+        await ledger.applyFill(agentId, {
+          symbol: ticker,
+          assetClass: assetClass ?? 'us_equity',
+          side,
+          qty: delta,
+          priceUsd: Number(priceUsd),
+          multiplier: multiplier ?? (assetClass === 'us_option' ? OPTION_MULTIPLIER : 1),
+          option: option ?? null,
+          groupId: groupId ?? null,
+          structure: structure ?? null,
+          at,
+          orderId: orderId ?? null,
+        });
+        bookedQtyByOrder.set(key, already + delta);
+        return delta;
+      }
+
+      /** Book the not-yet-booked part of a broker order fill (incl. mleg leg fills). */
       async function bookFilledOrder(order) {
         const orderId = order?.id ?? null;
+        const legs = Array.isArray(order?.legs) ? order.legs.filter((leg) => leg && leg.symbol) : [];
+        if (legs.length >= 2) {
+          const groupId = order.groupId ?? null;
+          const structure = order.structure ?? null;
+          let bookedLegs = 0;
+          for (const leg of legs) {
+            const filledLegQty = numberOrNull(leg.filledQty) ?? numberOrNull(leg.qty) ?? numberOrNull(leg.ratioQty) ?? 0;
+            const legPrice = numberOrNull(leg.avgFillPriceUsd) ?? numberOrNull(leg.filledAvgPriceUsd) ?? 0;
+            if (!(filledLegQty > 0) || !(legPrice > 0)) continue;
+            const parsed = parseOccSymbol(leg.symbol);
+            const booked = await bookFillUnit({
+              orderId,
+              symbol: leg.symbol,
+              side: leg.side,
+              qty: filledLegQty,
+              priceUsd: legPrice,
+              assetClass: 'us_option',
+              option: parsed
+                ? {
+                    underlying: parsed.underlying,
+                    type: parsed.type,
+                    strikeUsd: parsed.strikeUsd,
+                    expiration: parsed.expiration,
+                    multiplier: OPTION_MULTIPLIER,
+                    groupId,
+                    structure,
+                  }
+                : null,
+              groupId,
+              structure,
+              multiplier: OPTION_MULTIPLIER,
+            });
+            bookedLegs += booked;
+          }
+          return { bookedQty: bookedLegs, multiLeg: true, symbol: String(order.symbol ?? '').toUpperCase(), side: null, price: 0 };
+        }
         const filledQty = numberOrNull(order?.filledQty) ?? 0;
         const price = numberOrNull(order?.avgFillPriceUsd) ?? numberOrNull(order?.filledAvgPriceUsd) ?? 0;
         const symbol = String(order?.symbol ?? '').toUpperCase();
         if (!(filledQty > 0) || !(price > 0) || symbol === '') return { bookedQty: 0, reason: 'not_filled' };
-        const already = orderId ? (bookedQtyByOrder.get(orderId) ?? 0) : 0;
-        const delta = round4(filledQty - already);
-        if (!(delta > 0)) return { bookedQty: 0, reason: 'already_booked' };
-        await ledger.applyFill(agentId, {
+        const parsed = parseOccSymbol(symbol);
+        const assetClass = order.assetClass === 'us_option' || parsed ? 'us_option' : 'us_equity';
+        const booked = await bookFillUnit({
+          orderId,
           symbol,
           side: order.side,
-          qty: delta,
+          qty: filledQty,
           priceUsd: price,
-          at,
-          orderId,
+          assetClass,
+          option: parsed
+            ? {
+                underlying: parsed.underlying,
+                type: parsed.type,
+                strikeUsd: parsed.strikeUsd,
+                expiration: parsed.expiration,
+                multiplier: OPTION_MULTIPLIER,
+                groupId: order.groupId ?? null,
+                structure: order.structure ?? null,
+              }
+            : null,
+          groupId: order.groupId ?? null,
+          structure: order.structure ?? null,
+          multiplier: order.multiplier ?? (assetClass === 'us_option' ? OPTION_MULTIPLIER : 1),
         });
-        if (orderId) bookedQtyByOrder.set(orderId, already + delta);
-        return { bookedQty: delta, price, side: order.side, symbol };
+        return booked > 0
+          ? { bookedQty: booked, price, side: order.side, symbol }
+          : { bookedQty: 0, reason: 'already_booked' };
       }
 
       /** Book any filled orders the broker has for this agent that the ledger has not seen. */
@@ -462,19 +797,34 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         }
       }
 
+      function orderHasFill(candidate) {
+        if (!candidate) return false;
+        if ((numberOrNull(candidate.filledQty) ?? 0) > 0) return true;
+        return Array.isArray(candidate.legs)
+          && candidate.legs.some((leg) => (numberOrNull(leg?.filledQty) ?? 0) > 0);
+      }
+
       /** Poll briefly for a just-submitted order to fill; returns the freshest order record. */
       async function waitForFill(order) {
-        if (!order || (numberOrNull(order.filledQty) ?? 0) > 0 || typeof broker.getOrders !== 'function') return order;
+        if (!order || orderHasFill(order)) return order;
+        if (typeof broker.getOrders !== 'function' && typeof broker.getOrder !== 'function') return order;
         for (let attempt = 0; attempt < 6; attempt += 1) {
           await new Promise((resolve) => setTimeout(resolve, 250));
           try {
-            const recent = await broker.getOrders({ status: 'all', limit: 100, direction: 'desc' });
-            const match = (Array.isArray(recent) ? recent : []).find(
-              (candidate) => candidate?.id === order.id || (order.clientOrderId && candidate?.clientOrderId === order.clientOrderId),
-            );
+            let match = null;
+            if (typeof broker.getOrder === 'function' && order.id) {
+              match = await broker.getOrder(order.id);
+            }
+            if (!match && typeof broker.getOrders === 'function') {
+              const recent = await broker.getOrders({ status: 'all', limit: 100, direction: 'desc' });
+              match = (Array.isArray(recent) ? recent : []).find(
+                (candidate) => candidate?.id === order.id
+                  || (order.clientOrderId && candidate?.clientOrderId === order.clientOrderId),
+              );
+            }
             if (match) {
               order = { ...order, ...match };
-              if ((numberOrNull(order.filledQty) ?? 0) > 0) return order;
+              if (orderHasFill(order)) return order;
             }
           } catch {
             /* retry until the short poll window ends */
@@ -647,6 +997,323 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         return normalized;
       }
 
+      // --- multi-instrument helpers (docs/INSTRUMENTS.md) -------------------------
+      // Per-agent permissions are the intersection of the global config gates and the
+      // Treasurer mandate's instrument block (mandate is authoritative when present).
+      const mandatePermissions = (() => {
+        const raw = mandate && typeof mandate.instruments === 'object' && mandate.instruments ? mandate.instruments : null;
+        const base = globalPermissions;
+        if (!raw) return base;
+        const allowedStructuresBase = Array.isArray(base.allowedStructures) ? base.allowedStructures : [];
+        const allowed = (Array.isArray(raw.allowedStructures) ? raw.allowedStructures : allowedStructuresBase)
+          .filter((structure) => !isOptionStructure(structure) || allowedStructuresBase.includes(structure));
+        return {
+          ...base,
+          longStock: raw.longStock !== false && base.longStock !== false,
+          shortStock: raw.shortStock === true && base.shortStock === true,
+          longOptions: raw.longOptions === true && base.longOptions === true,
+          shortOptions: raw.shortOptions === true && base.shortOptions === true,
+          coveredCalls: raw.coveredCalls === true && base.coveredCalls === true,
+          spreads: raw.spreads === true && base.spreads === true,
+          margin: raw.margin === true && base.margin === true,
+          allowedStructures: allowed,
+          maxShortNotionalUsd: numberOrNull(raw.maxShortNotionalUsd) ?? maxShortNotionalUsd,
+          maxOptionPremiumUsd: numberOrNull(raw.maxOptionPremiumUsd) ?? configMaxOptionPremiumUsd,
+          maxContracts: Math.max(1, Math.trunc(numberOrNull(raw.maxContracts) ?? configMaxContracts)),
+          maxMarginUsd: numberOrNull(raw.maxMarginUsd),
+        };
+      })();
+      const policyInstrument = policyState?.instrument ?? null;
+      const assetCache = new Map();
+      const chainCache = new Map();
+
+      async function getAssetInfo(symbol) {
+        const ticker = String(symbol ?? '').toUpperCase();
+        if (assetCache.has(ticker)) return assetCache.get(ticker);
+        let asset = null;
+        if (typeof broker.getAsset === 'function') {
+          try {
+            asset = await broker.getAsset(ticker);
+          } catch {
+            asset = null;
+          }
+        }
+        assetCache.set(ticker, asset);
+        return asset;
+      }
+
+      /** Whole shares held long in one underlying (covered-call guard). */
+      function longSharesOf(underlying) {
+        const position = positions.get(String(underlying ?? '').toUpperCase());
+        if (!position || position.assetClass !== 'us_equity' || position.qtySigned <= 0) return 0;
+        return position.qtySigned;
+      }
+
+      /** Premium already committed to open option positions (USD notional). */
+      function openOptionPremiumUsd() {
+        let total = 0;
+        for (const position of positions.values()) {
+          if (position.assetClass !== 'us_option') continue;
+          total += position.absQty * position.avgPriceUsd * (position.multiplier || OPTION_MULTIPLIER);
+        }
+        return round2(total);
+      }
+
+      async function loadOptionChain(underlying, right) {
+        const ticker = String(underlying ?? '').toUpperCase();
+        const key = `${ticker}:${right}`;
+        if (chainCache.has(key)) return chainCache.get(key);
+        let chain = [];
+        if (instrumentsEnabled && typeof broker.getOptionChain === 'function') {
+          try {
+            const fetched = await broker.getOptionChain({ underlying: ticker, type: right, limit: 250 }, { nowMs: atMs });
+            chain = Array.isArray(fetched) ? fetched : [];
+          } catch {
+            chain = [];
+          }
+        }
+        chain = chain
+          .filter((contract) => contract && contract.symbol && contract.tradable !== false)
+          .map((contract) => ({
+            ...contract,
+            strikeUsd: numberOrNull(contract.strikeUsd) ?? 0,
+            dte: numberOrNull(contract.dte) ?? daysToExpiration(contract.expiration, atMs),
+          }))
+          .filter((contract) => contract.strikeUsd > 0 && Number.isFinite(contract.dte) && contract.dte >= 0);
+        chainCache.set(key, chain);
+        return chain;
+      }
+
+      /** Resolve a contract's live synthetic/market price (mark/bid/ask + dte). */
+      async function contractQuote(contract) {
+        if (!contract) return null;
+        const parsed = parseOccSymbol(contract.symbol);
+        let quote = null;
+        if (typeof broker.getOptionQuote === 'function' && parsed) {
+          try {
+            quote = await broker.getOptionQuote(contract.symbol, { nowMs: atMs, feed: optionDataFeed });
+          } catch {
+            quote = null;
+          }
+        }
+        const fallback = numberOrNull(contract.closePriceUsd);
+        const mark = numberOrNull(quote?.mark) ?? numberOrNull(quote?.last) ?? fallback;
+        if (!(mark > 0)) return null;
+        const bid = numberOrNull(quote?.bid);
+        const ask = numberOrNull(quote?.ask);
+        return {
+          symbol: contract.symbol,
+          parsed,
+          contract,
+          mark,
+          bid: bid !== null && bid > 0 ? bid : mark,
+          ask: ask !== null && ask > 0 ? ask : mark,
+          dte: numberOrNull(quote?.dte) ?? contract.dte,
+          ts: quote?.ts ?? null,
+        };
+      }
+
+      function nearestContract(chain, { right, expiration, targetStrike }) {
+        let best = null;
+        for (const contract of chain) {
+          if (String(contract.type ?? '').toLowerCase() !== right) continue;
+          if (expiration && contract.expiration !== expiration) continue;
+          const distance = Math.abs(Number(contract.strikeUsd) - targetStrike);
+          if (!best || distance < best.distance || (distance === best.distance && contract.strikeUsd < best.contract.strikeUsd)) {
+            best = { distance, contract };
+          }
+        }
+        return best?.contract ?? null;
+      }
+
+      function pickExpiration(chain, target, dteMin, dteMax) {
+        const inWindow = chain.filter((contract) => contract.dte >= dteMin && contract.dte <= dteMax);
+        const pool = inWindow.length > 0 ? inWindow : chain.filter((contract) => contract.dte > 0);
+        if (pool.length === 0) return null;
+        let best = null;
+        for (const contract of pool) {
+          const distance = Math.abs(Number(contract.dte) - target);
+          if (!best || distance < best.distance || (distance === best.distance && contract.dte < best.contract.dte)) {
+            best = { distance, contract };
+          }
+        }
+        return best?.contract?.expiration ?? null;
+      }
+
+      /** The premium/contracts budget for one option order (only shrinks with research/policy). */
+      function optionBudgetUsd(permissions) {
+        const pct = Number.isFinite(maxOptionPremiumPctEquity) ? maxOptionPremiumPctEquity : 0.25;
+        const pctBudget = Number.isFinite(equityUsd) ? Math.max(0, equityUsd) * pct : 0;
+        const perOrder = Number.isFinite(permissions.maxOptionPremiumUsd)
+          ? permissions.maxOptionPremiumUsd
+          : configMaxOptionPremiumUsd;
+        const policyCap = numberOrNull(policyInstrument?.maxPremiumUsd);
+        const caps = [pctBudget, perOrder, Number.isFinite(policyCap) ? policyCap : Infinity];
+        const remaining = Math.max(0, Math.min(...caps) - openOptionPremiumUsd());
+        return round2(remaining * researchSizeFactor * policySizeFactor);
+      }
+
+      function optionMaxContracts(permissions) {
+        const policyCap = numberOrNull(policyInstrument?.maxContracts);
+        const caps = [permissions.maxContracts ?? configMaxContracts, configMaxContracts];
+        if (policyCap !== null) caps.push(Math.trunc(policyCap));
+        return Math.max(1, Math.trunc(Math.min(...caps.filter((value) => Number.isFinite(value) && value > 0))));
+      }
+
+      /**
+       * Build a defined-risk option plan for one structure: select expiry (DTE window),
+       * strikes (2–5% OTM / spread width), price the legs and size the contracts.
+       * Returns null when the structure cannot be built/afforded (caller falls back to
+       * stock), or {blocked} for a covered call without 100 long shares.
+       */
+      async function buildOptionPlan({ structure, family, underlying, direction }) {
+        const ticker = String(underlying ?? '').toUpperCase();
+        const spot = numberOrNull(priceMap[ticker]);
+        if (!(spot > 0)) return null;
+        const right = optionRightForStructure(structure) ?? (structure.includes('put') ? 'put' : 'call');
+        const chain = await loadOptionChain(ticker, right);
+        if (chain.length === 0) return null;
+        const dteMin = Math.max(1, Math.trunc(numberOrNull(policyInstrument?.dteMin) ?? minDTE));
+        const dteMax = Math.max(dteMin, Math.trunc(numberOrNull(policyInstrument?.dteMax) ?? maxDTE));
+        const targetDte = structureTargetDTE(family, structure, dteMin, dteMax);
+        const expiration = pickExpiration(chain, targetDte, dteMin, dteMax);
+        if (!expiration) return null;
+        const offset = structureStrikeOffset(family, structure);
+        const widthStep = spot >= 100 ? 5 : spot >= 25 ? 1 : 0.5;
+        const width = Math.max(widthStep, Math.round((spot * spreadWidthFraction(family)) / widthStep) * widthStep);
+        const permissions = mandatePermissions;
+        const maxContracts = optionMaxContracts(permissions);
+        const budgetUsd = optionBudgetUsd(permissions);
+
+        const legSpecs = [];
+        if (structure === 'long_call' || structure === 'long_put') {
+          if (!(budgetUsd > 0)) return null;
+          const target = structure === 'long_call' ? spot * (1 + offset) : spot * (1 - offset);
+          const contract = nearestContract(chain, { right, expiration, targetStrike: target });
+          if (!contract) return null;
+          const quote = await contractQuote(contract);
+          if (!quote) return null;
+          legSpecs.push({ contract, quote, side: 'buy', positionIntent: 'buy_to_open', ratioQty: 1 });
+          const perContract = quote.ask * OPTION_MULTIPLIER;
+          const contracts = Math.min(maxContracts, Math.floor(budgetUsd / perContract));
+          if (!(contracts > 0)) return null;
+          return {
+            structure,
+            orderClass: 'simple',
+            underlying: ticker,
+            side: 'buy',
+            contracts,
+            expiration,
+            perContractCostUsd: round2(perContract),
+            premiumUsd: round2(contracts * perContract),
+            maxRiskUsd: round2(contracts * perContract),
+            limitPrice: quote.ask,
+            legs: [{ ...legSpecs[0], contract, quote }],
+          };
+        }
+        if (structure === 'covered_call') {
+          const shares = longSharesOf(ticker);
+          const coveredContracts = Math.min(Math.floor(shares / 100), maxContracts);
+          if (coveredContracts < 1) return { blocked: 'covered_call_requires_100_shares', structure };
+          const target = spot * (1 + offset);
+          const contract = nearestContract(chain, { right: 'call', expiration, targetStrike: target });
+          if (!contract) return null;
+          const quote = await contractQuote(contract);
+          if (!quote) return null;
+          return {
+            structure,
+            orderClass: 'simple',
+            underlying: ticker,
+            side: 'sell',
+            contracts: coveredContracts,
+            expiration,
+            perContractCostUsd: 0,
+            premiumUsd: round2(coveredContracts * quote.bid * OPTION_MULTIPLIER),
+            maxRiskUsd: 0,
+            limitPrice: quote.bid,
+            legs: [{ contract, quote, side: 'sell', positionIntent: 'sell_to_open', ratioQty: 1 }],
+          };
+        }
+        // --- vertical spreads (one mleg order, two legs, defined risk) ----------
+        if (!(budgetUsd > 0)) return null;
+        let primaryStrike;
+        let secondaryStrike;
+        let primarySide;
+        let secondarySide;
+        let rightSide;
+        let structureSide;
+        if (structure === 'call_credit_spread') {
+          structureSide = 'credit';
+          rightSide = 'call';
+          primaryStrike = spot * (1 + offset); // short call
+          secondaryStrike = primaryStrike + width; // long call further OTM
+          primarySide = 'sell';
+          secondarySide = 'buy';
+        } else if (structure === 'put_credit_spread') {
+          structureSide = 'credit';
+          rightSide = 'put';
+          primaryStrike = spot * (1 - offset); // short put
+          secondaryStrike = primaryStrike - width; // long put further OTM
+          primarySide = 'sell';
+          secondarySide = 'buy';
+        } else if (structure === 'bull_call_spread') {
+          structureSide = 'debit';
+          rightSide = 'call';
+          primaryStrike = spot * (1 + 0.005); // long call near the money
+          secondaryStrike = primaryStrike + width; // short call above
+          primarySide = 'buy';
+          secondarySide = 'sell';
+        } else if (structure === 'bear_put_spread') {
+          structureSide = 'debit';
+          rightSide = 'put';
+          primaryStrike = spot * (1 - 0.005); // long put near the money
+          secondaryStrike = primaryStrike - width; // short put below
+          primarySide = 'buy';
+          secondarySide = 'sell';
+        } else {
+          return null;
+        }
+        const primaryContract = nearestContract(chain, { right: rightSide, expiration, targetStrike: primaryStrike });
+        const secondaryContract = nearestContract(chain, { right: rightSide, expiration, targetStrike: secondaryStrike });
+        if (!primaryContract || !secondaryContract || primaryContract.symbol === secondaryContract.symbol) return null;
+        const primaryQuote = await contractQuote(primaryContract);
+        const secondaryQuote = await contractQuote(secondaryContract);
+        if (!primaryQuote || !secondaryQuote) return null;
+        const strikeWidth = Math.abs(primaryContract.strikeUsd - secondaryContract.strikeUsd);
+        if (!(strikeWidth > 0)) return null;
+        const longQuote = primarySide === 'buy' ? primaryQuote : secondaryQuote;
+        const shortQuote = primarySide === 'sell' ? primaryQuote : secondaryQuote;
+        const netDebit = round2(longQuote.ask - shortQuote.bid);
+        const netCredit = round2(shortQuote.bid - longQuote.ask);
+        let perContractCostUsd;
+        if (structureSide === 'debit') {
+          if (!(netDebit > 0.01)) return null; // no sensible debit
+          perContractCostUsd = netDebit * OPTION_MULTIPLIER;
+        } else {
+          if (!(netCredit > 0.01)) return null; // no sensible credit
+          perContractCostUsd = Math.max(1, (strikeWidth - netCredit) * OPTION_MULTIPLIER); // defined max risk
+        }
+        const contracts = Math.min(maxContracts, Math.floor(budgetUsd / perContractCostUsd));
+        if (!(contracts > 0)) return null;
+        const legs = [
+          { contract: primaryContract, quote: primaryQuote, side: primarySide, positionIntent: primarySide === 'buy' ? 'buy_to_open' : 'sell_to_open', ratioQty: 1 },
+          { contract: secondaryContract, quote: secondaryQuote, side: secondarySide, positionIntent: secondarySide === 'buy' ? 'buy_to_open' : 'sell_to_open', ratioQty: 1 },
+        ];
+        return {
+          structure,
+          orderClass: 'mleg',
+          underlying: ticker,
+          side: structureSide === 'credit' ? 'sell' : 'buy',
+          contracts,
+          expiration,
+          perContractCostUsd: round2(perContractCostUsd),
+          premiumUsd: round2(contracts * (structureSide === 'debit' ? netDebit : -netCredit) * OPTION_MULTIPLIER),
+          maxRiskUsd: round2(contracts * (structureSide === 'debit' ? netDebit * OPTION_MULTIPLIER : (strikeWidth - netCredit) * OPTION_MULTIPLIER)),
+          limitPrice: structureSide === 'debit' ? netDebit : netCredit,
+          legs,
+        };
+      }
+
       // --- equity proxy used only for the absolute sizing cap ---------------------
       let equityUsd = null;
       if (Number.isFinite(mandate.equityUsd)) equityUsd = mandate.equityUsd;
@@ -676,18 +1343,96 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
 
       /**
        * Check the brakes, submit, and book the fill for one intended order.
+       * Handles long/short stock, single-leg options and multi-leg (mleg) option
+       * spreads; every path passes `brakes.checkOrder()` first (no bypass).
        * @returns {Promise<object|null>} submitted order or null when denied/skipped
        */
-      async function submitChecked({ symbol, side, qty, priceUsd, reason, kind, quote, positionsSnapshot, research: actionResearch = null, policy: actionPolicy = null }) {
+      async function submitChecked({
+        symbol,
+        side,
+        qty,
+        priceUsd,
+        reason,
+        kind,
+        quote,
+        positionsSnapshot,
+        research: actionResearch = null,
+        policy: actionPolicy = null,
+        assetClass = 'us_equity',
+        asset = null,
+        option = null,
+        structure = null,
+        groupId = null,
+        legs = null,
+        orderClass = 'simple',
+        limitPrice = null,
+        positionIntent = null,
+        marginRequiredUsd = 0,
+        underlying = null,
+        orderType = null,
+        closing = false,
+      }) {
+        const isMultiLeg = orderClass === 'mleg' && Array.isArray(legs) && legs.length >= 2;
+        const isOptionOrder = assetClass === 'us_option' || isMultiLeg;
         const ticker = String(symbol).toUpperCase();
-        const orderQty = round4(qty);
+        const displaySymbol = underlying ? String(underlying).toUpperCase() : ticker;
+        const orderQty = isMultiLeg ? Math.max(1, Math.trunc(qty)) : round4(qty);
         if (!(orderQty > 0)) {
-          skip(ticker, 'qty_rounds_to_zero');
+          skip(displaySymbol, 'qty_rounds_to_zero');
           return null;
         }
-        const notionalUsd = round2(orderQty * priceUsd);
+        const premiumNotionalUsd = isOptionOrder
+          ? round2(orderQty * priceUsd * OPTION_MULTIPLIER)
+          : round2(orderQty * priceUsd);
+        const notionalUsd = premiumNotionalUsd;
+        const cashRequiredUsd = side === 'buy' && !closing
+          ? (isMultiLeg ? round2(orderQty * priceUsd * OPTION_MULTIPLIER) : premiumNotionalUsd)
+          : 0;
+        const marginRequiredForOrder = round2(Number(marginRequiredUsd) || 0);
         const spreadBps = spreadBpsOf(quote);
-
+        const optionMeta = isOptionOrder
+          ? {
+              underlying: displaySymbol,
+              expiration: option?.expiration ?? null,
+              type: option?.type ?? (ticker ? parseOccSymbol(ticker)?.type : null) ?? null,
+              strikeUsd: numberOrNull(option?.strikeUsd) ?? (parseOccSymbol(ticker)?.strikeUsd ?? null),
+              multiplier: OPTION_MULTIPLIER,
+              dte: numberOrNull(option?.dte) ?? daysToExpiration(option?.expiration ?? parseOccSymbol(ticker)?.expiration, atMs),
+              structure: structure ?? null,
+              groupId: groupId ?? null,
+            }
+          : null;
+        const mappedLegs = isMultiLeg
+          ? legs.map((leg) => ({
+              symbol: String(leg.contract?.symbol ?? leg.symbol ?? '').toUpperCase(),
+              side: leg.side,
+              ratioQty: Number(leg.ratioQty) || 1,
+              positionIntent: leg.positionIntent ?? null,
+            }))
+          : undefined;
+        /** @type {object} */
+        const orderInput = {
+          // Single-leg option orders must carry the OCC contract symbol: the D16 brake validates
+          // order.symbol as an option contract and the broker submits it directly. Display/whitelist
+          // logic still uses the underlying (displaySymbol). Multi-leg orders are validated by legs.
+          symbol: isMultiLeg ? displaySymbol : isOptionOrder ? ticker : displaySymbol,
+          side,
+          qty: orderQty,
+          priceUsd,
+          notionalUsd,
+          netPremiumUsd: premiumNotionalUsd,
+          assetClass: isOptionOrder ? 'us_option' : 'us_equity',
+          asset,
+          option: optionMeta,
+          structure: structure ?? null,
+          groupId: groupId ?? null,
+          legs: mappedLegs,
+          marginRequiredUsd: marginRequiredForOrder,
+          premiumUsd: premiumNotionalUsd,
+          positionIntent: positionIntent ?? null,
+          limitPrice: limitPrice ?? null,
+          orderClass: isMultiLeg ? 'mleg' : 'simple',
+        };
         /** @type {object} */
         const brakeInput = {
           mode: config.mode,
@@ -695,8 +1440,19 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           agentId,
           dayStats: dayStats ?? { dayKey: null, ordersCount: 0, startEquityUsd: equityUsd, pnlUsd: 0 },
           quote,
-          order: { symbol: ticker, side, qty: orderQty, priceUsd, notionalUsd },
+          order: orderInput,
+          assetClass: isOptionOrder ? 'us_option' : 'us_equity',
+          asset,
+          option: optionMeta,
+          structure: structure ?? null,
+          groupId: groupId ?? null,
+          legs: mappedLegs,
+          marginRequiredUsd: marginRequiredForOrder,
+          closing,
           equityUsd,
+          // D17 margin inputs: current virtual debt + any mandate buying-power figure.
+          marginDebtUsd: numberOrNull(snapshot?.marginDebtUsd) ?? 0,
+          buyingPowerUsd: numberOrNull(mandate?.buyingPowerUsd) ?? numberOrNull(mandate?.equityUsd) ?? null,
           positions: positionsSnapshot,
           mandate,
           spec,
@@ -718,83 +1474,159 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         try {
           decision = await brakes.checkOrder(brakeInput);
         } catch (error) {
-          deny(error?.code ?? 'BRAKE_DENIED', `brakes threw: ${error?.message ?? error}`, { symbol: ticker, side });
-          skip(ticker, `brake_denied:${error?.code ?? 'BRAKE_DENIED'}`, { reason: error?.message ?? String(error) });
+          deny(error?.code ?? 'BRAKE_DENIED', `brakes threw: ${error?.message ?? error}`, { symbol: displaySymbol, side });
+          skip(displaySymbol, `brake_denied:${error?.code ?? 'BRAKE_DENIED'}`, { reason: error?.message ?? String(error) });
           return null;
         }
         if (!decision || decision.decision !== 'ALLOW') {
           deny(decision?.code ?? 'BRAKE_DENIED', decision?.reason ?? 'brakes denied the order', {
-            symbol: ticker,
+            symbol: displaySymbol,
             side,
             rule: decision?.rule ?? null,
+            structure: structure ?? null,
           });
-          skip(ticker, `brake_denied:${decision?.code ?? 'BRAKE_DENIED'}`, { rule: decision?.rule ?? null });
+          skip(displaySymbol, `brake_denied:${decision?.code ?? 'BRAKE_DENIED'}`, { rule: decision?.rule ?? null });
           return null;
         }
 
-        // Our own virtual book must be able to pay for a buy (no broker account read).
-        if (side === 'buy' && snapshot && Number.isFinite(snapshot.cashUsd) && snapshot.cashUsd < notionalUsd) {
-          deny('INSUFFICIENT_CASH', `virtual cash ${snapshot.cashUsd} < notional ${notionalUsd}`);
-          skip(ticker, 'insufficient_cash');
+        // Our own virtual book must be able to pay for a debit (no broker account read).
+        if (cashRequiredUsd > 0 && snapshot && Number.isFinite(snapshot.cashUsd) && snapshot.cashUsd < cashRequiredUsd) {
+          deny('INSUFFICIENT_CASH', `virtual cash ${snapshot.cashUsd} < required ${cashRequiredUsd}`, { symbol: displaySymbol });
+          skip(displaySymbol, 'insufficient_cash');
           return null;
         }
 
         const seq = nextSeq(agentId);
         const clientOrderId = `atm:${agentId}:${spec.specId}:${seq}`;
+        // Every option order gets a durable internal group link for the ledger (spread legs
+        // are opened/closed together); single-leg orders use their own group as well.
+        const effectiveGroupId = isOptionOrder
+          ? String(groupId ?? `grp:${agentId}:${spec.specId}:${seq}`)
+          : null;
+        if (isOptionOrder) {
+          orderInput.groupId = effectiveGroupId;
+          brakeInput.groupId = effectiveGroupId;
+          brakeInput.order.groupId = effectiveGroupId;
+          if (optionMeta) optionMeta.groupId = effectiveGroupId;
+        }
         let order;
         try {
-          order = await broker.submitOrder({
-            symbol: ticker,
-            side,
-            qty: orderQty,
-            type: 'market',
-            clientOrderId,
-            timeInForce: 'day',
-          });
+          if (isMultiLeg) {
+            order = await broker.submitOrder({
+              orderClass: 'mleg',
+              type: 'limit',
+              limitPrice,
+              legs: legs.map((leg) => ({
+                symbol: leg.contract?.symbol ?? leg.symbol,
+                side: leg.side,
+                ratioQty: leg.ratioQty ?? 1,
+                positionIntent: leg.positionIntent,
+              })),
+              qty: orderQty,
+              clientOrderId,
+              timeInForce: 'day',
+              groupId: effectiveGroupId,
+              structure,
+            });
+          } else if (isOptionOrder) {
+            order = await broker.submitOrder({
+              symbol: ticker,
+              assetClass: 'us_option',
+              side,
+              qty: Math.trunc(orderQty),
+              type: orderType ?? 'limit',
+              limitPrice,
+              positionIntent,
+              clientOrderId,
+              timeInForce: 'day',
+              groupId: effectiveGroupId,
+              structure,
+            });
+          } else {
+            order = await broker.submitOrder({
+              symbol: ticker,
+              assetClass: 'us_equity',
+              side,
+              qty: orderQty,
+              type: orderType ?? 'market',
+              limitPrice: limitPrice ?? undefined,
+              positionIntent: positionIntent ?? undefined,
+              clientOrderId,
+              timeInForce: 'day',
+            });
+          }
         } catch (error) {
           deny(error?.code ?? 'BROKER_ERROR', `broker rejected order: ${error?.message ?? error}`, {
-            symbol: ticker,
+            symbol: displaySymbol,
             side,
             clientOrderId,
           });
-          skip(ticker, `broker_error:${error?.code ?? 'BROKER_ERROR'}`);
+          skip(displaySymbol, `broker_error:${error?.code ?? 'BROKER_ERROR'}`);
           return null;
         }
 
         const resolvedOrder = await waitForFill(order);
+        const bookableOrder = isOptionOrder
+          ? {
+              ...resolvedOrder,
+              groupId: effectiveGroupId,
+              structure: structure ?? null,
+              legs: Array.isArray(resolvedOrder?.legs) && resolvedOrder.legs.length > 0
+                ? resolvedOrder.legs.map((leg) => ({
+                    ...leg,
+                    side: leg.side ?? (leg.positionIntent?.startsWith('sell') ? 'sell' : 'buy'),
+                  }))
+                : resolvedOrder?.legs,
+            }
+          : resolvedOrder;
         result.orders.push(resolvedOrder);
         let booked = { bookedQty: 0 };
         try {
-          booked = await bookFilledOrder(resolvedOrder);
+          booked = await bookFilledOrder(bookableOrder);
         } catch (error) {
           deny(error?.code ?? 'LEDGER_REJECTED', `fill could not be booked: ${error?.message ?? error}`, {
-            symbol: ticker,
+            symbol: displaySymbol,
             orderId: resolvedOrder?.id ?? null,
           });
         }
         const bookedQty = booked.bookedQty ?? 0;
         result.actions.push({
           type: kind,
-          symbol: ticker,
+          symbol: displaySymbol,
           side,
-          qty: bookedQty,
+          qty: isMultiLeg ? orderQty : bookedQty,
           // A market order that is still `accepted` is not a denial: the next cycle's
           // reconciliation books the fill once the broker reports it as filled.
-          reason: bookedQty > 0 ? reason : `${reason} (awaiting fill)`,
+          reason: bookedQty > 0 || isMultiLeg ? reason : `${reason} (awaiting fill)`,
           orderId: resolvedOrder?.id ?? null,
-          fillPriceUsd: bookedQty > 0 ? round2(booked.price) : null,
-          pending: bookedQty === 0,
+          fillPriceUsd: isMultiLeg ? round2(limitPrice) : bookedQty > 0 ? round2(booked.price) : null,
+          pending: bookedQty === 0 && !isMultiLeg,
+          ...(isOptionOrder
+            ? {
+                instrument: structure ?? (option?.type === 'put' ? 'long_put' : 'long_call'),
+                assetClass: 'us_option',
+                structure: structure ?? null,
+                groupId: groupId ?? null,
+                option: option ?? null,
+                contractSymbol: isMultiLeg ? null : ticker,
+                contracts: orderQty,
+                legs: mappedLegs ?? null,
+              }
+            : { assetClass: 'us_equity' }),
           ...(actionResearch ? { research: actionResearch } : {}),
           ...(actionPolicy ? { policy: actionPolicy } : {}),
         });
         // Position book changed; keep the local map current for the rest of the cycle.
-        if (bookedQty > 0) {
+        if (bookedQty > 0 && !isOptionOrder) {
           if (side === 'buy') {
             const existing = positions.get(ticker);
             positions.set(ticker, {
-              qty: round4((existing?.qty ?? 0) + bookedQty),
+              qtySigned: round4((existing?.qtySigned ?? 0) + bookedQty),
+              qty: round4((existing?.qtySigned ?? 0) + bookedQty),
               avgPriceUsd: existing?.avgPriceUsd ?? booked.price,
               openedAt: existing?.openedAt ?? at,
+              assetClass: 'us_equity',
+              multiplier: 1,
             });
           } else {
             positions.delete(ticker);
@@ -803,74 +1635,415 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         return resolvedOrder;
       }
 
-      // =========================================================================
-      // 1) EXITS FIRST (risk-reducing orders have priority over new entries)
-      // =========================================================================
-      for (const [symbol, position] of [...positions.entries()]) {
-        if (cycleBudgetLeft() <= 0) {
-          skip(symbol, 'max_orders_per_cycle');
-          continue;
-        }
-        const quote = await getQuote(symbol);
-        if (!quote) {
-          deny('DATA_MISSING', `no quote for held position ${symbol}`);
-          continue;
-        }
-        const bars = await getBars(symbol);
+      // --- shared exit/entry helpers (multi-instrument) ---------------------------
+      const signalCache = new Map();
+      async function getSignalFor(underlying) {
+        const ticker = String(underlying ?? '').toUpperCase();
+        if (signalCache.has(ticker)) return signalCache.get(ticker);
+        const bars = await getBars(ticker);
         const signal = computeSignal(spec.family, bars, spec.params);
-        const openedAtMs = timestampOf(position.openedAt);
-        // `maxHoldBars` is expressed in BARS of the configured data timeframe, so the hold
-        // duration must be measured with that bar length (1Min bars = minutes, 1Hour bars = hours).
-        // Previously this always divided by an hour, which made fast timeframes hold ~60x too long.
-        const barMs = timeframeToMs(timeframe);
-        const barsHeld = openedAtMs === null ? 0 : Math.floor((atMs - openedAtMs) / barMs);
-        const stopPrice = position.avgPriceUsd * (1 - (spec.params?.stopPct ?? 0.02));
-        const targetPrice = position.avgPriceUsd * (1 + (spec.params?.targetPct ?? 0.04));
-        const maxHoldBars = spec.params?.maxHoldBars ?? 12;
+        signalCache.set(ticker, signal);
+        return signal;
+      }
 
-        let exitReason = null;
-        let exitResearch = null;
-        let exitPolicy = null;
-        if (researchExitAlert) {
-          // Research pressure is risk-reducing, so it runs in the exit pass and before
-          // the mechanical rules: an isolated analyst calling ALERT forces the exit.
-          exitReason = 'research_alert';
-          exitResearch = { ...researchEffect, applied: 'exit' };
-        } else if (policyExitPressure) {
-          // The bot's own brain pressed the exit: force the held position out before the
-          // mechanical rules (stop/target/hold/signal) get a chance to hold it.
-          exitReason = 'agent_exit_pressure';
-          exitPolicy = { ...policyEffect, applied: 'exit' };
-        } else if (position.avgPriceUsd > 0 && quote.last <= stopPrice) exitReason = 'stop';
-        else if (position.avgPriceUsd > 0 && quote.last >= targetPrice) exitReason = 'target';
-        else if (barsHeld >= maxHoldBars) exitReason = 'max_hold';
-        else if (signal.exit) exitReason = 'signal';
-        if (!exitReason) {
-          result.actions.push({
-            type: 'hold',
-            symbol,
-            reason: signal.reason ?? 'within_bounds',
-            barsHeld,
-            z: signal.z,
-          });
-          continue;
+      /** Order candidates: bot-chosen preference first, then family playbook, stock fallback last. */
+      function candidateStructures(family, direction) {
+        const preferred = policyInstrument?.prefer;
+        const stockFallback = direction === 'bearish' ? 'short_stock' : 'long_stock';
+        const candidates = [];
+        if (preferred && preferred !== 'auto') {
+          if (preferred === 'stock') candidates.push('long_stock');
+          else if (preferred === 'short_stock') {
+            if (direction === 'bearish') candidates.push('short_stock');
+          } else if (isOptionStructure(preferred)) {
+            const preferredDirection = structureDirection(preferred);
+            if (preferredDirection === direction || preferredDirection === 'neutral') candidates.push(preferred);
+          }
         }
-        await submitChecked({
+        for (const entry of playbookStructures(family, direction)) {
+          if (!candidates.includes(entry)) candidates.push(entry);
+        }
+        if (!candidates.includes(stockFallback)) candidates.push(stockFallback);
+        if (!instrumentsEnabled) return [stockFallback];
+        return candidates;
+      }
+
+      async function enterLongStockEntry({ symbol, quote, signal, reason }) {
+        const price = round4(quote.ask ?? quote.last);
+        const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
+        if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
+        if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
+        if (snapshot && Number.isFinite(snapshot.cashUsd) && snapshot.cashUsd > 0) caps.push(snapshot.cashUsd);
+        const capValue = Math.min(...caps.filter((cap) => Number.isFinite(cap) && cap > 0));
+        let qty = round4(capValue / price);
+        let notionalUsd = round2(qty * price);
+        if (notionalUsd < minOrderNotionalUsd || qty <= 0) {
+          const minQty = round4(minOrderNotionalUsd / price);
+          if (minQty > 0 && round2(minQty * price) <= capValue + 0.01) {
+            qty = minQty;
+            notionalUsd = round2(qty * price);
+          } else {
+            skip(symbol, 'below_min_notional', { attemptedNotionalUsd: notionalUsd, minOrderNotionalUsd });
+            return false;
+          }
+        }
+        const order = await submitChecked({
           symbol,
-          side: 'sell',
-          qty: position.qty,
-          priceUsd: round4(quote.bid ?? quote.last),
-          reason: exitReason,
-          kind: 'exit',
+          side: 'buy',
+          qty,
+          priceUsd: price,
+          reason,
+          kind: 'entry',
           quote,
           positionsSnapshot: Object.fromEntries(positions),
-          research: exitResearch,
-          policy: exitPolicy,
+          research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
+          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
         });
+        return Boolean(order);
+      }
+
+      async function enterShortStockEntry({ symbol, quote, signal }) {
+        const asset = await getAssetInfo(symbol);
+        if (instrumentsConfig.shortableOnly !== false && asset && (asset.shortable === false || asset.marginable === false)) {
+          skip(symbol, 'asset_not_shortable');
+          return false;
+        }
+        const price = round4(quote.bid ?? quote.last);
+        const caps = [(spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor];
+        if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
+        if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
+        if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
+        if (Number.isFinite(mandatePermissions.maxShortNotionalUsd)) caps.push(mandatePermissions.maxShortNotionalUsd);
+        const capValue = Math.min(...caps.filter((cap) => Number.isFinite(cap) && cap > 0));
+        const qty = Math.trunc(capValue / price);
+        if (!(qty >= 1)) {
+          skip(symbol, 'short_notional_too_small', { capUsd: round2(capValue) });
+          return false;
+        }
+        const order = await submitChecked({
+          symbol,
+          side: 'sell',
+          qty,
+          priceUsd: price,
+          reason: signal?.reason ?? 'short_signal',
+          kind: 'entry',
+          quote,
+          asset,
+          positionsSnapshot: Object.fromEntries(positions),
+          research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
+          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
+        });
+        return Boolean(order);
+      }
+
+      async function enterOptionEntry({ plan, quote, signal, direction }) {
+        const right = optionRightForStructure(plan.structure) ?? (plan.structure.includes('put') ? 'put' : 'call');
+        const primary = plan.legs[0];
+        const creditStructure = plan.structure === 'covered_call'
+          || plan.structure === 'call_credit_spread'
+          || plan.structure === 'put_credit_spread';
+        return Boolean(await submitChecked({
+          symbol: plan.orderClass === 'simple' ? primary.contract.symbol : plan.underlying,
+          underlying: plan.underlying,
+          side: plan.side,
+          qty: plan.contracts,
+          priceUsd: plan.limitPrice,
+          reason: signal?.reason ?? direction,
+          kind: 'entry',
+          quote,
+          assetClass: 'us_option',
+          asset: await getAssetInfo(plan.underlying),
+          option: {
+            underlying: plan.underlying,
+            expiration: plan.expiration,
+            type: right,
+            strikeUsd: primary.contract?.strikeUsd ?? null,
+            dte: primary.quote?.dte ?? primary.contract?.dte ?? null,
+            multiplier: OPTION_MULTIPLIER,
+          },
+          structure: plan.structure,
+          orderClass: plan.orderClass,
+          legs: plan.legs,
+          limitPrice: plan.limitPrice,
+          orderType: 'limit',
+          positionIntent: plan.orderClass === 'simple' ? primary.positionIntent : null,
+          marginRequiredUsd: creditStructure && plan.orderClass === 'mleg' ? plan.maxRiskUsd : 0,
+          closing: false,
+          positionsSnapshot: Object.fromEntries(positions),
+          research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
+          policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
+        }));
       }
 
       // =========================================================================
-      // 2) ENTRIES (long-only, one order per symbol per cycle)
+      // 1) EXITS FIRST (risk-reducing orders have priority over new entries)
+      // =========================================================================
+      const barMs = timeframeToMs(timeframe);
+      const stopPct = spec.params?.stopPct ?? 0.02;
+      const targetPct = spec.params?.targetPct ?? 0.04;
+      const maxHoldBars = spec.params?.maxHoldBars ?? 12;
+      const exitResearch = researchExitAlert ? { ...researchEffect, applied: 'exit' } : null;
+      const exitPolicy = !researchExitAlert && policyExitPressure ? { ...policyEffect, applied: 'exit' } : null;
+      const optionsSnapshot = () => Object.fromEntries(positions);
+      const handledSymbols = new Set();
+
+      // --- spread groups are opened together, so they close together (one mleg) ----
+      const spreadGroups = new Map();
+      for (const position of positions.values()) {
+        if (position.assetClass === 'us_option' && position.groupId) {
+          const key = String(position.groupId);
+          if (!spreadGroups.has(key)) spreadGroups.set(key, []);
+          spreadGroups.get(key).push(position);
+        }
+      }
+      for (const [groupId, legs] of spreadGroups) {
+        if (legs.length < 2) continue;
+        legs.forEach((leg) => handledSymbols.add(leg.symbol));
+        if (cycleBudgetLeft() <= 0) {
+          skip(legs[0].option?.underlying ?? legs[0].symbol, 'max_orders_per_cycle');
+          continue;
+        }
+        const marked = [];
+        let markFailed = false;
+        for (const leg of legs) {
+          const quote = await contractQuote({
+            symbol: leg.symbol,
+            expiration: leg.option?.expiration,
+            dte: leg.option?.dte,
+            closePriceUsd: null,
+          });
+          if (!quote) {
+            markFailed = true;
+            break;
+          }
+          marked.push({ leg, quote });
+        }
+        if (markFailed) {
+          deny('DATA_MISSING', `no option marks for spread group ${groupId}`);
+          continue;
+        }
+        const contracts = Math.max(1, Math.trunc(Math.min(...legs.map((leg) => Math.abs(leg.qtySigned)))));
+        const openValue = round2(legs.reduce((sum, leg) => sum + leg.qtySigned * leg.avgPriceUsd * OPTION_MULTIPLIER, 0));
+        const currentValue = round2(marked.reduce((sum, entry) => sum + entry.leg.qtySigned * entry.quote.mark * OPTION_MULTIPLIER, 0));
+        const pnlUsd = round2(currentValue - openValue);
+        const dte = Math.min(...legs.map((leg) => numberOrNull(leg.option?.dte) ?? daysToExpiration(leg.option?.expiration, atMs) ?? 999));
+        const strikes = legs.map((leg) => numberOrNull(leg.option?.strikeUsd)).filter((value) => value !== null);
+        const widthUsd = strikes.length >= 2
+          ? round2(Math.abs(Math.max(...strikes) - Math.min(...strikes)) * OPTION_MULTIPLIER * contracts)
+          : 0;
+        const maxRiskUsd = round2(openValue > 0 ? openValue : Math.max(1, widthUsd + openValue));
+        let exitReason = null;
+        let legResearch = null;
+        let legPolicy = null;
+        if (researchExitAlert) {
+          exitReason = 'research_alert';
+          legResearch = exitResearch;
+        } else if (policyExitPressure) {
+          exitReason = 'agent_exit_pressure';
+          legPolicy = exitPolicy;
+        } else if (dte <= autoCloseDTE) {
+          exitReason = 'dte_auto_close';
+        } else if (maxRiskUsd > 0 && pnlUsd >= targetPct * maxRiskUsd) {
+          exitReason = 'target';
+        } else if (maxRiskUsd > 0 && pnlUsd <= -stopPct * maxRiskUsd) {
+          exitReason = 'stop';
+        }
+        const groupUnderlying = legs[0].option?.underlying ?? parseOccSymbol(legs[0].symbol)?.underlying ?? legs[0].symbol;
+        if (!exitReason) {
+          result.actions.push({
+            type: 'hold',
+            symbol: groupUnderlying,
+            reason: 'spread_within_bounds',
+            groupId,
+            structure: legs[0].structure ?? null,
+            pnlUsd,
+            dte,
+          });
+          continue;
+        }
+        const closeLegs = marked.map(({ leg, quote }) => {
+          const side = leg.qtySigned > 0 ? 'sell' : 'buy';
+          const price = side === 'sell' ? quote.bid : quote.ask;
+          return {
+            contract: { symbol: leg.symbol },
+            quote,
+            side,
+            positionIntent: side === 'sell' ? 'sell_to_close' : 'buy_to_close',
+            ratioQty: 1,
+            cashPerShare: side === 'sell' ? price : -price,
+          };
+        });
+        const netCashPerSpread = closeLegs.reduce((sum, leg) => sum + leg.cashPerShare, 0);
+        await submitChecked({
+          symbol: groupUnderlying,
+          underlying: groupUnderlying,
+          side: netCashPerSpread >= 0 ? 'sell' : 'buy',
+          qty: contracts,
+          priceUsd: Math.max(0.01, round2(Math.abs(netCashPerSpread))),
+          reason: exitReason,
+          kind: 'exit',
+          quote: null,
+          assetClass: 'us_option',
+          option: {
+            underlying: groupUnderlying,
+            expiration: legs[0].option?.expiration ?? null,
+            type: legs[0].option?.type ?? 'call',
+            strikeUsd: legs[0].option?.strikeUsd ?? null,
+            dte,
+            multiplier: OPTION_MULTIPLIER,
+          },
+          structure: legs[0].structure ?? null,
+          groupId,
+          legs: closeLegs,
+          orderClass: 'mleg',
+          limitPrice: Math.max(0.01, round2(Math.abs(netCashPerSpread))),
+          closing: true,
+          marginRequiredUsd: 0,
+          research: legResearch,
+          policy: legPolicy,
+        });
+      }
+
+      // --- single stock/option positions -----------------------------------------
+      for (const [positionSymbol, position] of [...positions.entries()]) {
+        if (handledSymbols.has(positionSymbol)) continue;
+        if (cycleBudgetLeft() <= 0) {
+          skip(positionSymbol, 'max_orders_per_cycle');
+          continue;
+        }
+        const isOption = position.assetClass === 'us_option';
+        const underlying = position.option?.underlying
+          ?? parseOccSymbol(positionSymbol)?.underlying
+          ?? positionSymbol;
+        const signal = await getSignalFor(underlying);
+        let mark = null;
+        let bid = null;
+        let ask = null;
+        let dte = null;
+        let stockQuote = null;
+        if (isOption) {
+          const quote = await contractQuote({
+            symbol: positionSymbol,
+            expiration: position.option?.expiration,
+            dte: position.option?.dte,
+            closePriceUsd: null,
+          });
+          if (!quote) {
+            deny('DATA_MISSING', `no option quote for held position ${positionSymbol}`);
+            continue;
+          }
+          mark = quote.mark;
+          bid = quote.bid;
+          ask = quote.ask;
+          dte = numberOrNull(quote.dte) ?? daysToExpiration(position.option?.expiration, atMs);
+        } else {
+          stockQuote = await getQuote(underlying);
+          if (!stockQuote) {
+            deny('DATA_MISSING', `no quote for held position ${underlying}`);
+            continue;
+          }
+          mark = stockQuote.last;
+          bid = stockQuote.bid ?? stockQuote.last;
+          ask = stockQuote.ask ?? stockQuote.last;
+        }
+        const openedAtMs = timestampOf(position.openedAt);
+        const barsHeld = openedAtMs === null ? 0 : Math.floor((atMs - openedAtMs) / barMs);
+        const isLong = position.qtySigned > 0;
+        let exitReason = null;
+        let positionResearch = null;
+        let positionPolicy = null;
+        if (researchExitAlert) {
+          exitReason = 'research_alert';
+          positionResearch = exitResearch;
+        } else if (policyExitPressure) {
+          exitReason = 'agent_exit_pressure';
+          positionPolicy = exitPolicy;
+        } else if (isOption && isLong) {
+          if (dte !== null && dte <= autoCloseDTE) exitReason = 'dte_auto_close';
+          else if (position.avgPriceUsd > 0 && mark <= position.avgPriceUsd * (1 - stopPct)) exitReason = 'stop';
+          else if (position.avgPriceUsd > 0 && mark >= position.avgPriceUsd * (1 + targetPct)) exitReason = 'target';
+        } else if (isOption && !isLong) {
+          if (dte !== null && dte <= autoCloseDTE) exitReason = 'dte_auto_close';
+          else if (position.avgPriceUsd > 0 && mark <= position.avgPriceUsd * 0.5) exitReason = 'covered_call_profit';
+          else if (position.avgPriceUsd > 0 && mark >= position.avgPriceUsd * (1 + stopPct * 2)) exitReason = 'stop';
+        } else if (!isOption && isLong) {
+          if (position.avgPriceUsd > 0 && mark <= position.avgPriceUsd * (1 - stopPct)) exitReason = 'stop';
+          else if (position.avgPriceUsd > 0 && mark >= position.avgPriceUsd * (1 + targetPct)) exitReason = 'target';
+          else if (barsHeld >= maxHoldBars) exitReason = 'max_hold';
+          else if (signal.longExit) exitReason = 'signal';
+        } else if (!isOption && !isLong) {
+          if (position.avgPriceUsd > 0 && mark >= position.avgPriceUsd * (1 + stopPct)) exitReason = 'stop';
+          else if (position.avgPriceUsd > 0 && mark <= position.avgPriceUsd * (1 - targetPct)) exitReason = 'target';
+          else if (barsHeld >= maxHoldBars) exitReason = 'max_hold';
+          else if (signal.shortExit) exitReason = 'signal';
+        }
+        if (!exitReason) {
+          result.actions.push({
+            type: 'hold',
+            symbol: underlying,
+            reason: isOption ? `option_mark ${round2(mark)}` : signal.reason ?? 'within_bounds',
+            barsHeld,
+            z: signal.z,
+            dte: isOption ? dte : undefined,
+            groupId: position.groupId ?? null,
+          });
+          continue;
+        }
+        if (isOption) {
+          const side = isLong ? 'sell' : 'buy';
+          await submitChecked({
+            symbol: positionSymbol,
+            underlying,
+            side,
+            qty: Math.abs(position.qtySigned),
+            priceUsd: round4(isLong ? bid : ask),
+            reason: exitReason,
+            kind: 'exit',
+            quote: { symbol: underlying, bid, ask, last: mark, ts: atMs },
+            assetClass: 'us_option',
+            asset: await getAssetInfo(underlying),
+            option: {
+              underlying,
+              expiration: position.option?.expiration ?? null,
+              type: position.option?.type ?? (parseOccSymbol(positionSymbol)?.type ?? 'call'),
+              strikeUsd: position.option?.strikeUsd ?? parseOccSymbol(positionSymbol)?.strikeUsd ?? null,
+              dte,
+              multiplier: OPTION_MULTIPLIER,
+            },
+            structure: position.structure ?? null,
+            groupId: position.groupId ?? null,
+            orderClass: 'simple',
+            limitPrice: round4(isLong ? bid : ask),
+            orderType: 'limit',
+            positionIntent: isLong ? 'sell_to_close' : 'buy_to_close',
+            closing: true,
+            marginRequiredUsd: 0,
+            research: positionResearch,
+            policy: positionPolicy,
+          });
+        } else {
+          const side = isLong ? 'sell' : 'buy';
+          const exitPrice = isLong ? bid : ask;
+          await submitChecked({
+            symbol: underlying,
+            side,
+            qty: Math.abs(position.qtySigned),
+            priceUsd: round4(exitPrice),
+            reason: exitReason,
+            kind: 'exit',
+            quote: stockQuote,
+            asset: !isLong ? await getAssetInfo(underlying) : null,
+            positionsSnapshot: optionsSnapshot(),
+            closing: true,
+            research: positionResearch,
+            policy: positionPolicy,
+          });
+        }
+      }
+
+      // =========================================================================
+      // 2) ENTRIES (multi-instrument: stock, short stock, options, spreads)
       // =========================================================================
       // Risk-only passes (non-due swing bots with open positions) stop here: exits above are
       // evaluated every cycle for safety, but no new position is opened outside the bot's cadence.
@@ -883,7 +2056,15 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         return result;
       }
       const symbol = String(spec.symbol ?? '').toUpperCase();
-      if (positions.has(symbol)) {
+      // A long stock book can still sell covered calls against its shares (an entry order).
+      const heldUnderlying = positions.get(symbol);
+      const heldShares = heldUnderlying && heldUnderlying.assetClass === 'us_equity' && heldUnderlying.qtySigned > 0
+        ? heldUnderlying.qtySigned
+        : 0;
+      const coverEligible = instrumentsEnabled
+        && mandatePermissions.coveredCalls === true
+        && heldShares >= OPTION_MULTIPLIER;
+      if (positions.has(symbol) && !coverEligible) {
         // Already handled by the exit pass; nothing to do without a new signal.
         if (!result.actions.some((action) => action.symbol === symbol)) {
           result.actions.push({ type: 'hold', symbol, reason: 'in_position' });
@@ -902,9 +2083,11 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
         if (!quote) {
           deny('DATA_MISSING', `no quote for ${symbol}`);
         } else {
-          const bars = await getBars(symbol);
-          const signal = computeSignal(spec.family, bars, spec.params);
-          if (!signal.enter) {
+          const signal = await getSignalFor(symbol);
+          const wantLong = signal.longEntry === true || signal.enter === true;
+          const wantShort = signal.shortEntry === true && mandatePermissions.shortStock === true;
+          const coveredCallOnly = coverEligible; // shares already held: only sell calls against them
+          if (!coveredCallOnly && !wantLong && !wantShort) {
             result.actions.push({
               type: 'hold',
               symbol,
@@ -930,42 +2113,50 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
               research: { ...researchEffect, applied: 'veto' },
             });
           } else {
-            const price = round4(quote.ask ?? quote.last);
-            // Research and bot-agent sizing can only shrink: both factors multiply the
-            // target notional BEFORE the existing mandate/risk caps are applied below.
-            const caps = [
-              (spec.params?.sizePct ?? 0.2) * sizeBudgetUsd * researchSizeFactor * policySizeFactor,
-            ];
-            if (Number.isFinite(mandate.maxOrderNotionalUsd)) caps.push(mandate.maxOrderNotionalUsd);
-            if (Number.isFinite(hardMaxNotionalUsd)) caps.push(hardMaxNotionalUsd);
-            if (Number.isFinite(equityUsd)) caps.push(maxOrderPctOfEquity * equityUsd);
-            if (snapshot && Number.isFinite(snapshot.cashUsd) && snapshot.cashUsd > 0) caps.push(snapshot.cashUsd);
-            const notionalCap = Math.min(...caps.filter((cap) => Number.isFinite(cap) && cap > 0));
-            let qty = round4(notionalCap / price);
-            let notionalUsd = round2(qty * price);
-            if (notionalUsd < minOrderNotionalUsd || qty <= 0) {
-              // Try the minimum notional size before giving up, then honour the cap.
-              const minQty = round4(minOrderNotionalUsd / price);
-              if (minQty > 0 && round2(minQty * price) <= Math.min(...caps.filter((c) => Number.isFinite(c) && c > 0)) + 0.01) {
-                qty = minQty;
-                notionalUsd = round2(qty * price);
-              } else {
-                skip(symbol, 'below_min_notional', { attemptedNotionalUsd: notionalUsd, minOrderNotionalUsd });
-                return result;
+            const direction = wantLong ? 'bullish' : wantShort ? 'bearish' : 'neutral';
+            const structures = coveredCallOnly ? ['covered_call'] : candidateStructures(spec.family, direction);
+            let placed = false;
+            let lastSkipReason = 'no_instrument_available';
+            let lastBlocked = null;
+            for (const structure of structures) {
+              if (cycleBudgetLeft() <= 0) break;
+              if (!structureAllowed(structure, mandatePermissions)) {
+                lastSkipReason = 'instrument_not_permitted';
+                continue;
+              }
+              if (structure === 'long_stock') {
+                if (instrumentsEnabled && !mandatePermissions.longStock) continue;
+                placed = await enterLongStockEntry({ symbol, quote, signal, reason: signal.reason ?? 'signal' });
+                break;
+              }
+              if (structure === 'short_stock') {
+                placed = await enterShortStockEntry({ symbol, quote, signal });
+                break;
+              }
+              const plan = await buildOptionPlan({ structure, family: spec.family, underlying: symbol, direction });
+              if (!plan) {
+                lastSkipReason = 'option_plan_unavailable';
+                continue;
+              }
+              if (plan.blocked === 'covered_call_requires_100_shares') {
+                lastBlocked = 'covered_call_requires_100_shares';
+                lastSkipReason = lastBlocked;
+                result.actions.push({
+                  type: 'skip',
+                  symbol,
+                  reason: 'covered_call_requires_100_shares',
+                  structure,
+                });
+                continue;
+              }
+              placed = await enterOptionEntry({ plan, quote, signal, direction });
+              break;
+            }
+            if (!placed) {
+              if (!result.actions.some((action) => action.type === 'skip' && action.symbol === symbol)) {
+                skip(symbol, lastBlocked ?? lastSkipReason);
               }
             }
-            await submitChecked({
-              symbol,
-              side: 'buy',
-              qty,
-              priceUsd: price,
-              reason: signal.reason ?? 'signal',
-              kind: 'entry',
-              quote,
-              positionsSnapshot: Object.fromEntries(positions),
-              research: researchEffect ? { ...researchEffect, applied: 'size' } : null,
-              policy: policyEffect ? { ...policyEffect, applied: 'size' } : null,
-            });
           }
         }
       }
@@ -993,6 +2184,23 @@ export function createExecutor({ broker, brakes, ledger, config, clock } = {}) {
           policyActive: agentsEnabled,
           maxAgeSec: Number.isFinite(Number(agentsConfig.maxAgeSec)) ? Number(agentsConfig.maxAgeSec) : 7200,
           effects: ['stand_down', 'size_multiplier', 'exit_pressure'],
+        },
+        instruments: {
+          enabled: instrumentsEnabled,
+          margin: globalPermissions.margin === true,
+          shortStock: globalPermissions.shortStock === true,
+          options: globalPermissions.longOptions === true,
+          coveredCalls: globalPermissions.coveredCalls === true,
+          spreads: globalPermissions.spreads === true,
+          allowedStructures: [...(globalPermissions.allowedStructures ?? [])],
+          minDTE,
+          maxDTE,
+          autoCloseDTE,
+          maxContracts: configMaxContracts,
+          maxOptionPremiumUsd: configMaxOptionPremiumUsd,
+          maxOptionPremiumPctEquity,
+          maxShortNotionalUsd,
+          optionDataFeed,
         },
       };
     },

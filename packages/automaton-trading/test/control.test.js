@@ -546,6 +546,7 @@ describe('strategy categories and per-bot agent status', () => {
           thesis: 'Fixture bot-agent thesis.',
           plan: ['wait for confirmation'],
           watch: ['AAPL'],
+          instrument: { prefer: 'long_call', maxContracts: 99, dteMin: 0, dteMax: 99 },
         }),
         provider: 'fake',
         model: 'fake-agent-model',
@@ -560,6 +561,23 @@ describe('strategy categories and per-bot agent status', () => {
       const families = before.agents.map((agent) => agent.strategy.family);
       assert.equal(new Set(families).size, 4, 'a small genesis population covers all four strategy families');
       assert.equal(before.engine.agents.configured, true);
+      assert.equal(before.engine.instruments.enabled, true);
+      assert.equal(before.engine.instruments.longOptions, true);
+      assert.equal(before.engine.instruments.shortStock, true);
+      assert.equal(before.engine.instruments.margin, true);
+      for (const structure of ['long_call', 'long_put', 'covered_call', 'call_credit_spread', 'put_credit_spread']) {
+        assert.ok(before.engine.instruments.allowedStructures.includes(structure), `instruments expose ${structure}`);
+      }
+      assert.equal(before.engine.instruments.allowedStructures.includes('naked_short_call'), false);
+      for (const family of ['momentum', 'meanrev', 'breakout', 'gapfade']) {
+        assert.ok(before.engine.instruments.playbooks[family].bullish.length > 0);
+      }
+      for (const agent of before.agents) {
+        assert.ok(agent.instrumentPermissions, 'every agent exposes instrument permissions');
+        assert.equal(agent.instrumentPermissions.shortStock, true);
+        assert.ok(agent.playbook && agent.playbook.family === agent.genome.family);
+        assert.ok(agent.playbook.bullish.length > 0);
+      }
 
       await automaton.tick();
       const status = await automaton.status();
@@ -578,10 +596,95 @@ describe('strategy categories and per-bot agent status', () => {
       assert.equal(sample.sizeMultiplier, 0.5);
       assert.equal(sample.confidence, 0.55);
       assert.ok(Array.isArray(sample.plan));
+      assert.equal(sample.instrument.prefer, 'long_call');
+      assert.equal(sample.instrument.maxContracts, config.instruments.maxContracts);
+      assert.equal(sample.instrument.dteMin, config.instruments.minDTE);
+      assert.equal(sample.instrument.dteMax, config.instruments.maxDTE);
       assert.equal(status.engine.agents.enabled, true);
       assert.equal(status.engine.agents.configured, true);
       assert.equal(status.engine.agents.provider, 'fake');
       assert.equal(status.engine.agents.runs >= 1, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3.0 capital migration ($20 -> $50 per bot, one-time, idempotent)
+// ---------------------------------------------------------------------------
+
+describe('capital top-up for multi-instrument paper trading', () => {
+  it('credits legacy $20 bots to the configured $50 endowment', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'automaton-control-topup-'));
+    try {
+      const clock = makeClock(Date.parse('2026-10-30T15:00:00Z'));
+      const config = loadConfig({
+        configFile: path.join(dir, 'missing.config.json'),
+        envFile: path.join(dir, 'missing.env'),
+        overrides: {
+          mode: 'sim',
+          cycleIntervalSec: 60,
+          paths: { stateDir: dir },
+          population: { initial: 2, cap: 5 },
+          endowmentUsd: 50,
+          replication: { surplus7dUsd: 3, minRunwayHours: 72, childEndowmentUsd: 25 },
+          research: { enabled: false },
+          rewards: { enabled: false, period: 'daily', rankPercents: [0.05, 0.03, 0.02], maxPerPeriodUsd: null },
+          agents: { enabled: false },
+        },
+      }).config;
+      const paths = statePaths(config);
+      fs.mkdirSync(paths.stateDir, { recursive: true });
+      const registry = createRegistry({ paths, config, clock });
+      const ledger = createLedger({ paths, config, clock });
+      for (const [index, symbol] of ['AAPL', 'MSFT'].entries()) {
+        const agentId = `atm-topup000${index + 1}`;
+        const genome = {
+          symbol,
+          family: index === 0 ? 'momentum' : 'meanrev',
+          lookback: 24,
+          entryZ: 1.2,
+          exitZ: 0.4,
+          stopPct: 0.02,
+          targetPct: 0.04,
+          maxHoldBars: 12,
+          sizePct: 0.2,
+          sessionFilter: 'any',
+        };
+        registry.register({
+          id: agentId,
+          name: index === 0 ? 'Momentum AAPL' : 'MeanRev MSFT',
+          parentId: null,
+          generation: 0,
+          bornAt: clock.iso(),
+          status: 'alive',
+          endowmentUsd: 20,
+          genome,
+          mutation: null,
+          specId: null,
+          notes: ['genesis'],
+        });
+        ledger.ensureAgent(agentId, { endowmentUsd: 20 });
+        ledger.credit(agentId, 20, { category: 'endowment', reason: 'seed', at: clock.now() });
+      }
+      registry.save();
+      ledger.save();
+      const broker = createSimBroker(config, { seed: 3, accountEquityUsd: 100000 });
+      const automaton = await createAutomaton({ config, broker, clock });
+      await automaton.init();
+      const status = await automaton.status();
+      assert.equal(status.agents.length, 2);
+      for (const agent of status.agents) {
+        assert.equal(agent.endowmentUsd, 50, 'endowment basis raised to the configured amount');
+        assert.equal(agent.cashUsd, 50, 'one-time $30 top-up credited');
+        assert.equal(agent.equityUsd, 50);
+      }
+      const snapshot = automaton._internals.ledger.snapshot('atm-topup0001');
+      assert.equal(snapshot.cashUsd, 50);
+      assert.equal(snapshot.marginDebtUsd, 0);
+      assert.equal(snapshot.creditsUsd >= 50, true, 'top-up is recorded as capital, not trading P&L');
+      assert.equal(snapshot.realizedPlUsd, 0);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

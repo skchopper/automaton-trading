@@ -5,7 +5,7 @@
     "initial": 30,
     "cap": 60
   },
-  "endowmentUsd": 20,
+  "endowmentUsd": 50,
   "deathFloorUsd": 1,
   "deathFloorPct": 0.05,
   "maxDrawdownPct": 0.2,
@@ -18,16 +18,16 @@
   "replication": {
     "surplus7dUsd": 3,
     "minRunwayHours": 72,
-    "childEndowmentUsd": 10
+    "childEndowmentUsd": 25
   },
   "risk": {
     "maxPositionPct": 0.5,
     "maxOpenPositions": 2,
     "maxSpreadBps": 100,
-    "maxDailyOrders": 12,
+    "maxDailyOrders": 20,
     "maxDailyLossPct": 0.2,
     "maxOrderPctOfEquity": 0.5,
-    "maxOrderNotionalUsd": 20,
+    "maxOrderNotionalUsd": 40,
     "minOrderNotionalUsd": 1
   },
   "data": {
@@ -84,5 +84,25 @@
     "maxInputChars": 8000,
     "maxOutputTokens": 700,
     "errorCooldownSec": 900
+  },
+  "instruments": {
+    "enabled": true,
+    "allowMargin": true,
+    "maxMarginPctEquity": 1,
+    "allowShort": true,
+    "maxShortPctEquity": 1,
+    "maxShortNotionalUsd": 25,
+    "shortableOnly": true,
+    "allowOptions": true,
+    "allowCoveredCalls": true,
+    "allowSpreads": true,
+    "maxOptionPremiumPctEquity": 0.25,
+    "maxOptionPremiumUsd": 25,
+    "maxContracts": 3,
+    "minDTE": 2,
+    "maxDTE": 14,
+    "autoCloseDTE": 1,
+    "allowNakedShortOptions": false,
+    "optionDataFeed": "indicative"
   }
 }

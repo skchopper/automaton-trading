@@ -625,6 +625,7 @@ async function buildState(holder, row) {
     agents: Array.isArray(status?.agents) ? status.agents : [],
     rankings: status?.rankings ?? null,
     strategyMix: status?.strategyMix ?? null,
+    instruments: status?.instruments ?? null,
     rewards: status?.rewards ?? (status?.engine?.rewards ? { ...status.engine.rewards, history: [] } : null),
     obituaries: {
       stats: obituaries.stats ?? status?.obituaries ?? null,
@@ -1378,7 +1379,7 @@ function buildToolDefinitions(ctx, row, holder) {
   tools.push(defineTool({
     toolName: 'automaton_brakes',
     description:
-      'Show the 14 hard brake rules (D1-D14) and the current kill-switch/live-armed state. When symbol is supplied, also run the operator dry-run pre-trade check through the real brakes chain (agentId, symbol, side, notionalUsd, priceUsd) and return its ALLOW/DENY decision, rule id, and reason. Advisory only: the dry run does not place an order.',
+      'Show the 18 hard brake rules (D1-D18) and the current kill-switch/live-armed state. D2 gates instruments and D15-D18 cover short sales, options (never naked short options), margin debt and the expiry guard. When symbol is supplied, also run the operator dry-run pre-trade check through the real brakes chain (agentId, symbol, side, notionalUsd, priceUsd) and return its ALLOW/DENY decision, rule id, and reason. Advisory only: the dry run does not place an order.',
     parameters: {
       type: 'object',
       properties: {

@@ -16,7 +16,7 @@ import path from 'node:path';
 
 import { AutomatonError } from '../src/contracts.js';
 import { defaultConfig, statePaths } from '../src/config.js';
-import { createBroker as createAlpacaBroker } from '../src/broker-alpaca.js';
+import { createBroker as createAlpacaBroker, formatOccSymbol } from '../src/broker-alpaca.js';
 import { createBroker as createSimBroker } from '../src/broker-sim.js';
 import { createProspector } from '../src/prospector.js';
 import { createBuilder, PARAM_BOUNDS } from '../src/builder.js';
@@ -172,6 +172,239 @@ function makeBrakesDouble(handler) {
       calls.push(input);
       return handler ? handler(input) : { decision: 'ALLOW', code: null, rule: null, reason: 'allowed' };
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v3.0 multi-instrument helpers (synthetic option chains, option broker doubles)
+// ---------------------------------------------------------------------------
+
+/** Build normalized OCC contracts for tests (mirrors the broker chain shape). */
+function makeOptionChain({
+  underlying = 'AAPL',
+  type = 'call',
+  expirations = ['2030-01-18', '2030-01-25'],
+  dtes = [12, 19],
+  strikes = [100, 105, 110, 115, 120, 125],
+  premiums = {},
+  defaultPremium = 0.5,
+} = {}) {
+  const chain = [];
+  expirations.forEach((expiration, expiryIndex) => {
+    for (const strikeUsd of strikes) {
+      const premiumKey = `${type}:${strikeUsd}`;
+      const closePriceUsd = Number.isFinite(Number(premiums[premiumKey]))
+        ? Number(premiums[premiumKey])
+        : Number.isFinite(Number(premiums[strikeUsd]))
+          ? Number(premiums[strikeUsd])
+          : defaultPremium;
+      chain.push({
+        symbol: formatOccSymbol({ underlying, expiration, type, strikeUsd }),
+        underlying,
+        type,
+        strikeUsd,
+        expiration,
+        dte: dtes[expiryIndex] ?? dtes[0] ?? 12,
+        multiplier: 100,
+        tradable: true,
+        closePriceUsd,
+      });
+    }
+  });
+  return chain;
+}
+
+function num2(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+/** Fake broker that supports stock + deterministic option chain/quotes/orders. */
+function makeOptionBrokerDouble({ underlying = 'AAPL', spot = 110, chain = null, premiumBySymbol = {} } = {}) {
+  const submitted = [];
+  const contracts = chain ?? [
+    ...makeOptionChain({ underlying, spot, type: 'call' }),
+    ...makeOptionChain({ underlying, spot, type: 'put' }),
+  ];
+  const contractBySymbol = new Map(contracts.map((contract) => [contract.symbol, contract]));
+  const premiumFor = (symbol) => {
+    if (Number.isFinite(Number(premiumBySymbol[symbol]))) return Number(premiumBySymbol[symbol]);
+    if (Number.isFinite(Number(contractBySymbol.get(symbol)?.closePriceUsd))) return Number(contractBySymbol.get(symbol).closePriceUsd);
+    return 0.5;
+  };
+  const broker = {
+    submitted,
+    async getLatestQuote(symbol) {
+      return { symbol, bid: spot - 0.1, ask: spot + 0.1, last: spot, ts: T0 };
+    },
+    async getBars() {
+      return {};
+    },
+    async getAsset(symbol) {
+      return { symbol, assetClass: 'us_equity', tradable: true, shortable: true, marginable: true, fractionable: true };
+    },
+    async getOptionChain({ type = 'call' } = {}) {
+      return contracts.filter((contract) => !type || type === 'both' || contract.type === type);
+    },
+    async getOptionQuote(symbol) {
+      const premium = premiumFor(symbol);
+      const bid = Math.max(0.01, num2(premium * 0.98));
+      const ask = Math.max(bid + 0.01, num2(premium * 1.02));
+      const contract = contractBySymbol.get(symbol);
+      return {
+        symbol,
+        underlying: contract?.underlying ?? underlying,
+        type: contract?.type ?? 'call',
+        strikeUsd: contract?.strikeUsd ?? null,
+        expiration: contract?.expiration ?? '2030-01-18',
+        dte: contract?.dte ?? 12,
+        multiplier: 100,
+        bid,
+        ask,
+        last: premium,
+        mark: num2((bid + ask) / 2),
+        ts: T0,
+        simulated: true,
+      };
+    },
+    async submitOrder(order = {}) {
+      submitted.push(order);
+      const id = `opt-ord-${submitted.length}`;
+      if (order.orderClass === 'mleg') {
+        const legs = (order.legs ?? []).map((leg) => ({
+          symbol: leg.symbol,
+          side: leg.side,
+          ratioQty: leg.ratioQty ?? 1,
+          qty: leg.ratioQty ?? 1,
+          filledQty: leg.ratioQty ?? 1,
+          avgFillPriceUsd: premiumFor(leg.symbol),
+          positionIntent: leg.positionIntent ?? null,
+          status: 'filled',
+        }));
+        return {
+          id,
+          clientOrderId: order.clientOrderId ?? null,
+          symbol: legSymbolOf(order.legs?.[0]) ?? underlying,
+          side: null,
+          qty: order.qty ?? 1,
+          filledQty: order.qty ?? 1,
+          avgFillPriceUsd: order.limitPrice,
+          status: 'filled',
+          assetClass: 'us_option',
+          orderClass: 'mleg',
+          groupId: order.groupId ?? null,
+          structure: order.structure ?? null,
+          legs,
+          submittedAt: T0,
+        };
+      }
+      const isOption = order.assetClass === 'us_option';
+      return {
+        id,
+        clientOrderId: order.clientOrderId ?? null,
+        symbol: order.symbol,
+        side: order.side,
+        qty: order.qty,
+        filledQty: order.qty,
+        avgFillPriceUsd: order.limitPrice ?? spot,
+        status: 'filled',
+        assetClass: isOption ? 'us_option' : 'us_equity',
+        positionIntent: order.positionIntent ?? null,
+        groupId: order.groupId ?? null,
+        submittedAt: T0,
+      };
+    },
+    async getOrders() {
+      return [];
+    },
+    async getOrder() {
+      return null;
+    },
+    getAccount() {
+      throw new Error('executor must never call broker.getAccount()');
+    },
+  };
+  return broker;
+}
+
+function legSymbolOf(leg) {
+  return leg && typeof leg === 'object' ? leg.symbol : undefined;
+}
+
+/** Executor harness backed by the multi-instrument broker double. */
+function optionExecutorHarness({
+  positions = {},
+  brokerOptions = {},
+  mandate,
+  configOverrides,
+  specOverrides,
+  brakesHandler,
+} = {}) {
+  const config = testConfig({ mode: 'paper', ...(configOverrides ?? {}) });
+  const clock = createClock({ now: () => T0 });
+  const broker = makeOptionBrokerDouble(brokerOptions);
+  const brakes = makeBrakesDouble(brakesHandler);
+  const ledger = makeLedgerDouble({ positions, equityUsd: 5000, cashUsd: 100_000 });
+  const executor = createExecutor({ broker, brakes, ledger, config, clock });
+  return {
+    config,
+    clock,
+    broker,
+    brakes,
+    ledger,
+    executor,
+    agent: { id: 'atm-1', status: 'alive', generation: 0, genome: { symbol: 'AAPL', family: 'breakout' } },
+    spec: baseSpec({ family: 'breakout', ...(specOverrides ?? {}) }),
+    mandate: mandate ?? baseMandate(),
+    quotes: { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+    dayStats: { dayKey: '2024-01-10', ordersCount: 0, startEquityUsd: 5000, pnlUsd: 0 },
+  };
+}
+
+/** Bars whose last close breaks above a flat range (bullish breakout signal). */
+function gapUpBars({ count = 32, base = 100 } = {}) {
+  const bars = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    bars.push({ t: T0 - (count - 1 - i) * HOUR_MS, o: base, h: base + 0.4, l: base - 0.4, c: base, v: 1000 });
+  }
+  bars.push({ t: T0, o: base + 1, h: base + 1.6, l: base + 0.9, c: base + 1.5, v: 5000 });
+  return bars;
+}
+
+/** Bars whose last close drops below a flat range (bearish breakdown signal). */
+function breakdownBars({ count = 32, base = 100 } = {}) {
+  const bars = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    bars.push({ t: T0 - (count - 1 - i) * HOUR_MS, o: base, h: base + 0.4, l: base - 0.4, c: base, v: 1000 });
+  }
+  bars.push({ t: T0, o: base, h: base + 0.1, l: base - 10, c: base - 9, v: 5000 });
+  return bars;
+}
+
+/** Gap-up open that fades back below the prior close (bearish gap-fade signal, no long exit). */
+function gapUpFadeBars({ count = 32, base = 100 } = {}) {
+  const bars = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    bars.push({ t: T0 - (count - 1 - i) * HOUR_MS, o: base, h: base + 0.4, l: base - 0.4, c: base, v: 1000 });
+  }
+  bars.push({ t: T0, o: base + 1.2, h: base + 1.3, l: base - 0.5, c: base - 0.1, v: 5000 });
+  return bars;
+}
+
+function makeOptionPosition(overrides = {}) {
+  const contract = overrides.contract ?? {
+    underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 115,
+  };
+  return {
+    assetClass: 'us_option',
+    qtySigned: 1,
+    qty: 1,
+    avgPriceUsd: 1,
+    multiplier: 100,
+    option: { ...contract, multiplier: 100, dte: 12 },
+    groupId: overrides.groupId ?? 'grp-long-call',
+    structure: overrides.structure ?? 'long_call',
+    openedAt: new Date(T0 - HOUR_MS).toISOString(),
+    ...overrides,
   };
 }
 
@@ -747,14 +980,30 @@ test('sim broker: market fills, cash, positions and client_order_id accounting',
   assert.equal(notionalOrder.notionalUsd, 123.45);
 });
 
-test('sim broker: no shorting, no negative cash, deterministic reset', async () => {
+test('sim broker: margin/short capability gates, and deterministic reset', async () => {
+  // New v3.0 account parity: shorting and margin are allowed by default (paper config).
   const config = testConfig({ mode: 'sim' });
   const broker = createSimBroker(config, { seed: 7, accountEquityUsd: 500 });
   broker.setQuoteOverrides({ AAPL: { bid: 100, ask: 100, last: 100 } });
 
-  expectSyncCode(() => broker.submitOrder({ symbol: 'AAPL', side: 'sell', qty: 1 }), 'BRAKE_DENIED');
-  expectSyncCode(() => broker.submitOrder({ symbol: 'AAPL', side: 'buy', qty: 10 }), 'INSUFFICIENT_CASH');
+  const short = broker.submitOrder({ symbol: 'AAPL', side: 'sell', qty: 1 });
+  assert.equal(short.status, 'filled');
+  let positions = broker.getPositions();
+  assert.equal(positions[0].qtySigned, -1);
+  assert.equal(positions[0].side, 'SHORT');
+  assert.equal(broker.getAccount().cashUsd, 599.95, 'short sale credits cash (minus configured slippage)');
+
+  // A margin-enabled account can go to negative cash (D17 caps are enforced by brakes).
+  broker.submitOrder({ symbol: 'AAPL', side: 'buy', qty: 7 });
+  assert.ok(broker.getAccount().cashUsd < 0, 'margin-enabled sim account may carry debt');
   expectSyncCode(() => broker.submitOrder({ symbol: 'ZZZZ', side: 'buy', qty: 1 }), 'BRAKE_DENIED');
+
+  // With the capability disabled explicitly, the sim broker refuses both.
+  const noShortConfig = testConfig({ mode: 'sim', instruments: { allowShort: false, allowMargin: false } });
+  const strict = createSimBroker(noShortConfig, { seed: 7, accountEquityUsd: 500 });
+  strict.setQuoteOverrides({ AAPL: { bid: 100, ask: 100, last: 100 } });
+  expectSyncCode(() => strict.submitOrder({ symbol: 'AAPL', side: 'sell', qty: 1 }), 'BRAKE_DENIED');
+  expectSyncCode(() => strict.submitOrder({ symbol: 'AAPL', side: 'buy', qty: 10 }), 'INSUFFICIENT_CASH');
 
   broker.reset();
   assert.equal(broker.getAccount().cashUsd, 500);
@@ -1678,6 +1927,510 @@ test('executor: describe() exposes the per-bot agent policy gate', () => {
 
   const off = executorHarness({ configOverrides: AGENTS_OFF });
   assert.equal(off.executor.describe().agents.enabled, false);
+});
+
+// ===========================================================================
+// v3.0 multi-instrument: Alpaca broker (payloads only — never places orders)
+// ===========================================================================
+
+test('alpaca broker: account capability fields, asset permissions, option chain + quote mapping', async () => {
+  const nowMs = Date.parse('2026-01-10T15:00:00Z');
+  const fetchImpl = stubFetch((url) => {
+    if (url.includes('/v2/account')) {
+      return jsonResponse(200, {
+        equity: '2000.55',
+        cash: '1500.10',
+        buying_power: '6000.00',
+        options_buying_power: '1500.00',
+        multiplier: '4',
+        shorting_enabled: true,
+        options_trading_level: 3,
+        status: 'ACTIVE',
+        currency: 'USD',
+      });
+    }
+    if (url.includes('/v2/assets/AAPL')) {
+      return jsonResponse(200, {
+        symbol: 'AAPL', class: 'us_equity', tradable: true, shortable: true,
+        marginable: true, fractionable: true, maintenance_margin_requirement: 30,
+      });
+    }
+    if (url.includes('/v2/options/contracts')) {
+      return jsonResponse(200, {
+        option_contracts: [
+          { symbol: 'F260116C00013000', underlying_symbol: 'F', type: 'call', strike_price: '13', expiration_date: '2026-01-16', multiplier: '100', tradable: true, close_price: '0.04' },
+          { symbol: 'F260116C00012000', underlying_symbol: 'F', type: 'call', strike_price: '12', expiration_date: '2026-01-16', multiplier: '100', tradable: true, close_price: '0.11' },
+        ],
+      });
+    }
+    if (url.includes('/v1beta1/options/snapshots/AAPL')) {
+      return jsonResponse(200, {
+        snapshots: {
+          AAPL260116C00115000: {
+            latestQuote: { bp: 1.48, ap: 1.52, t: '2026-01-10T15:00:00Z' },
+            latestTrade: { p: 1.5 },
+            dailyBar: { c: 1.5 },
+          },
+        },
+      });
+    }
+    if (url.includes('/v2/positions')) {
+      return jsonResponse(200, [
+        { symbol: 'AAPL', qty: '-3', avg_entry_price: '150', market_value: '-450', asset_class: 'us_equity' },
+        { symbol: 'AAPL260116C00115000', qty: '2', avg_entry_price: '1.50', market_value: '300', asset_class: 'us_option' },
+      ]);
+    }
+    if (url.includes('/v2/orders/ord-1') && !url.endsWith('/v2/orders/ord-1')) return jsonResponse(404, {});
+    if (url.includes('/v2/orders/ord-1')) {
+      return jsonResponse(200, { id: 'ord-1', symbol: 'AAPL260116C00115000', side: 'buy', qty: '2', filled_qty: '2', filled_avg_price: '1.51', status: 'filled', order_class: 'simple', client_order_id: 'atm:atm-1:spec-1:1', asset_class: 'us_option', submitted_at: '2026-01-10T15:00:00Z' });
+    }
+    return jsonResponse(404, { message: 'unexpected path' });
+  });
+  const broker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl },
+  );
+
+  const account = await broker.getAccount();
+  assert.equal(account.buyingPowerUsd, 6000);
+  assert.equal(account.optionsBuyingPowerUsd, 1500);
+  assert.equal(account.marginMultiplier, 4);
+  assert.equal(account.shortingEnabled, true);
+  assert.equal(account.optionsTradingLevel, 3);
+
+  const asset = await broker.getAsset('AAPL');
+  assert.equal(asset.shortable, true);
+  assert.equal(asset.marginable, true);
+  assert.equal(asset.maintenanceMarginPct, 0.3);
+
+  const chain = await broker.getOptionChain(
+    { underlying: 'F', type: 'call', expirationGte: '2026-01-12', expirationLte: '2026-01-20', strikeGte: 10, strikeLte: 15, limit: 50 },
+    { nowMs },
+  );
+  assert.equal(chain.length, 2);
+  assert.deepEqual(chain.map((contract) => contract.strikeUsd), [12, 13], 'chain sorted by strike');
+  assert.equal(chain[0].underlying, 'F');
+  assert.equal(chain[0].type, 'call');
+  assert.equal(chain[0].expiration, '2026-01-16');
+  assert.equal(chain[0].dte, 6);
+  assert.equal(chain[0].multiplier, 100);
+  assert.equal(chain[0].closePriceUsd, 0.11);
+  const chainUrl = new URL(fetchImpl.calls.find((call) => call.url.includes('/v2/options/contracts')).url);
+  assert.equal(chainUrl.searchParams.get('underlying_symbols'), 'F');
+  assert.equal(chainUrl.searchParams.get('type'), 'call');
+  assert.equal(chainUrl.searchParams.get('expiration_date_gte'), '2026-01-12');
+  assert.equal(chainUrl.searchParams.get('strike_price_lte'), '15');
+
+  const quote = await broker.getOptionQuote('AAPL260116C00115000', { nowMs });
+  assert.equal(quote.underlying, 'AAPL');
+  assert.equal(quote.type, 'call');
+  assert.equal(quote.strikeUsd, 115);
+  assert.equal(quote.bid, 1.48);
+  assert.equal(quote.ask, 1.52);
+  assert.equal(quote.mark, 1.5);
+  assert.equal(quote.dte, 6);
+
+  const positions = await broker.getPositions();
+  const shortStock = positions.find((position) => position.assetClass === 'us_equity');
+  const longOption = positions.find((position) => position.assetClass === 'us_option');
+  assert.equal(shortStock.qtySigned, -3);
+  assert.equal(shortStock.side, 'SHORT');
+  assert.equal(longOption.side, 'CALL');
+  assert.equal(longOption.contracts, 2);
+  assert.equal(longOption.option.type, 'call');
+
+  const order = await broker.getOrder('ord-1');
+  assert.equal(order.filledQty, 2);
+  assert.equal(order.assetClass, 'us_option');
+  assert.equal(order.clientOrderId, 'atm:atm-1:spec-1:1');
+});
+
+test('alpaca broker: option, mleg and short-stock order payloads; option quote cache', async () => {
+  const posted = [];
+  const fetchImpl = stubFetch((url, init) => {
+    if (url.includes('/v2/orders') && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      posted.push(body);
+      const isMleg = body.order_class === 'mleg';
+      return jsonResponse(200, {
+        id: `ord-${posted.length}`,
+        client_order_id: body.client_order_id,
+        symbol: isMleg ? 'AAPL260116C00115000' : body.symbol,
+        side: body.side ?? null,
+        qty: body.qty ?? null,
+        filled_qty: body.qty ?? null,
+        filled_avg_price: body.limit_price ?? '1.50',
+        status: 'filled',
+        order_class: isMleg ? 'mleg' : 'simple',
+        asset_class: isMleg || body.asset_class === 'us_option' ? 'us_option' : 'us_equity',
+        legs: isMleg
+          ? body.legs.map((leg) => ({ ...leg, filled_qty: leg.ratio_qty, filled_avg_price: '1.50' }))
+          : [],
+        submitted_at: '2026-01-10T15:00:00Z',
+      });
+    }
+    if (url.includes('/v1beta1/options/snapshots/AAPL')) {
+      return jsonResponse(200, {
+        snapshots: { AAPL260116C00115000: { latestQuote: { bp: '1.48', ap: '1.52', t: '2026-01-10T15:00:00Z' } } },
+      });
+    }
+    return jsonResponse(404, {});
+  });
+  const broker = createAlpacaBroker(
+    { mode: 'paper' },
+    { secrets: { ALPACA_API_KEY_ID: 'k', ALPACA_API_SECRET_KEY: 's' }, fetchImpl },
+  );
+
+  await broker.submitOrder({
+    symbol: 'AAPL260116C00115000', assetClass: 'us_option', side: 'buy', qty: 2,
+    type: 'limit', limitPrice: 1.52, positionIntent: 'buy_to_open', clientOrderId: 'atm:atm-1:spec-1:1',
+  });
+  assert.deepEqual(posted[0], {
+    symbol: 'AAPL260116C00115000',
+    side: 'buy',
+    asset_class: 'us_option',
+    qty: '2',
+    type: 'limit',
+    time_in_force: 'day',
+    limit_price: '1.52',
+    client_order_id: 'atm:atm-1:spec-1:1',
+    position_intent: 'buy_to_open',
+  });
+
+  await broker.submitOrder({
+    orderClass: 'mleg',
+    type: 'limit',
+    limitPrice: 0.35,
+    qty: 2,
+    clientOrderId: 'atm:atm-1:spec-1:2',
+    legs: [
+      { symbol: 'AAPL260116C00120000', side: 'sell', ratioQty: 1, positionIntent: 'sell_to_open' },
+      { symbol: 'AAPL260116C00125000', side: 'buy', ratioQty: 1, positionIntent: 'buy_to_open' },
+    ],
+  });
+  assert.equal(posted[1].order_class, 'mleg');
+  assert.equal(posted[1].type, 'limit');
+  assert.equal(posted[1].limit_price, '0.35');
+  assert.deepEqual(posted[1].legs, [
+    { symbol: 'AAPL260116C00120000', side: 'sell', ratio_qty: '1', position_intent: 'sell_to_open' },
+    { symbol: 'AAPL260116C00125000', side: 'buy', ratio_qty: '1', position_intent: 'buy_to_open' },
+  ]);
+  assert.equal(posted[1].symbol, undefined, 'mleg payload has no top-level symbol');
+
+  // short stock is a plain sell order (no position intent, no option fields)
+  await broker.submitOrder({ symbol: 'AAPL', assetClass: 'us_equity', side: 'sell', qty: 10, type: 'market' });
+  assert.equal(posted[2].symbol, 'AAPL');
+  assert.equal(posted[2].side, 'sell');
+  assert.equal(posted[2].qty, '10');
+  assert.equal(posted[2].position_intent, undefined);
+  assert.equal(posted[2].asset_class, 'us_equity');
+
+  // option qty must be a positive integer number of contracts
+  await expectCode(
+    broker.submitOrder({ symbol: 'AAPL260116C00115000', assetClass: 'us_option', side: 'buy', qty: 1.5, type: 'limit', limitPrice: 1 }),
+    'SPEC_INVALID',
+  );
+
+  // chain snapshot is cached briefly: two quote calls -> one data request
+  const first = await broker.getOptionQuote('AAPL260116C00115000');
+  const second = await broker.getOptionQuote('AAPL260116C00115000');
+  assert.equal(first.mark, 1.5);
+  assert.deepEqual(second, first);
+  assert.equal(fetchImpl.calls.filter((call) => call.url.includes('/v1beta1/options/snapshots/')).length, 1);
+});
+
+// ===========================================================================
+// v3.0 multi-instrument: simulated broker (deterministic, offline)
+// ===========================================================================
+
+test('sim broker: deterministic option chain/quotes, option fills and mleg spread fills', async () => {
+  const config = testConfig({ mode: 'sim' });
+  const brokerA = createSimBroker(config, { seed: 42 });
+  const brokerB = createSimBroker(config, { seed: 42 });
+  const chainA = await brokerA.getOptionChain({ underlying: 'AAPL', type: 'call' });
+  const chainB = await brokerB.getOptionChain({ underlying: 'AAPL', type: 'call' });
+  assert.deepEqual(chainA, chainB, 'same seed => identical option chain');
+  assert.ok(chainA.length >= 8);
+  const expiries = [...new Set(chainA.map((contract) => contract.expiration))];
+  assert.equal(expiries.length, 2, 'two synthetic expiries');
+  assert.ok(chainA.every((contract) => Number.isInteger(contract.dte) && contract.dte > 0));
+  assert.ok(chainA.every((contract) => Number.isFinite(contract.strikeUsd) && contract.closePriceUsd > 0));
+
+  const contract = chainA[Math.floor(chainA.length / 2)];
+  const quote = await brokerA.getOptionQuote(contract.symbol);
+  assert.equal(quote.symbol, contract.symbol);
+  assert.ok(quote.bid > 0 && quote.ask > quote.bid && quote.mark > 0);
+  assert.equal(quote.multiplier, 100);
+  assert.equal(quote.dte, contract.dte);
+  assert.deepEqual(await brokerB.getOptionQuote(contract.symbol), quote);
+
+  // long option fill: debit premium * 100 * contracts, position marked CALL
+  const cashBefore = brokerA.getAccount().cashUsd;
+  const buy = brokerA.submitOrder({
+    symbol: contract.symbol, assetClass: 'us_option', side: 'buy', qty: 2,
+    type: 'limit', limitPrice: quote.ask, positionIntent: 'buy_to_open', clientOrderId: 'atm:atm-1:spec-1:1',
+  });
+  assert.equal(buy.status, 'filled');
+  assert.equal(buy.assetClass, 'us_option');
+  assert.equal(buy.filledQty, 2);
+  assert.equal(brokerA.getAccount().cashUsd, num2(cashBefore - quote.ask * 2 * 100));
+  const optionPosition = brokerA.getPositions().find((position) => position.symbol === contract.symbol);
+  assert.equal(optionPosition.side, 'CALL');
+  assert.equal(optionPosition.qtySigned, 2);
+  assert.equal(optionPosition.multiplier, 100);
+  assert.ok(optionPosition.marketValueUsd > 0);
+
+  // sell-to-close part of the position
+  brokerA.submitOrder({ symbol: contract.symbol, assetClass: 'us_option', side: 'sell', qty: 1, type: 'limit', limitPrice: quote.bid, positionIntent: 'sell_to_close' });
+  assert.equal(brokerA.getPositions().find((position) => position.symbol === contract.symbol).qtySigned, 1);
+
+  // mleg credit spread fills both legs atomically and links them by groupId
+  const callsOtm = chainA.filter((entry) => entry.strikeUsd > 100).slice(0, 2);
+  const [shortLeg, longLeg] = callsOtm;
+  const mleg = brokerA.submitOrder({
+    orderClass: 'mleg',
+    type: 'limit',
+    limitPrice: 0.1,
+    qty: 1,
+    legs: [
+      { symbol: shortLeg.symbol, side: 'sell', ratioQty: 1, positionIntent: 'sell_to_open' },
+      { symbol: longLeg.symbol, side: 'buy', ratioQty: 1, positionIntent: 'buy_to_open' },
+    ],
+    clientOrderId: 'atm:atm-1:spec-1:2',
+    structure: 'call_credit_spread',
+  });
+  assert.equal(mleg.status, 'filled');
+  assert.equal(mleg.orderClass, 'mleg');
+  assert.equal(mleg.legs.length, 2);
+  assert.equal(mleg.legs[0].filledQty, 1);
+  assert.equal(mleg.legs[1].filledQty, 1);
+  const positions = brokerA.getPositions();
+  const shortCall = positions.find((position) => position.symbol === shortLeg.symbol);
+  const longCall = positions.find((position) => position.symbol === longLeg.symbol);
+  assert.equal(shortCall.qtySigned, -1);
+  assert.equal(shortCall.side, 'CALL');
+  assert.equal(longCall.qtySigned, 1);
+  assert.equal(shortCall.groupId, longCall.groupId);
+  assert.ok(shortCall.groupId);
+});
+
+// ===========================================================================
+// v3.0 multi-instrument: executor instrument selection, orders and exits
+// ===========================================================================
+
+test('executor: buys a long call when the family playbook says so (option payload)', async () => {
+  const chain = makeOptionChain({ underlying: 'AAPL', type: 'call', strikes: [105, 110, 115, 120], defaultPremium: 0.1 });
+  const harness = optionExecutorHarness({ brokerOptions: { chain } });
+  const result = await runHarness(harness, { bars: { AAPL: breakoutBars() } });
+  assert.equal(result.denied.length, 0, JSON.stringify(result.denied));
+  assert.equal(harness.broker.submitted.length, 1);
+  const order = harness.broker.submitted[0];
+  assert.equal(order.assetClass, 'us_option');
+  assert.equal(order.side, 'buy');
+  assert.equal(order.positionIntent, 'buy_to_open');
+  assert.equal(order.type, 'limit');
+  assert.ok(order.qty >= 1 && Number.isInteger(order.qty));
+  assert.ok(order.limitPrice > 0);
+  assert.ok(String(order.symbol).length > 10, 'order targets an OCC contract');
+  const entry = result.actions.find((action) => action.type === 'entry');
+  assert.equal(entry.instrument, 'long_call');
+  assert.equal(entry.assetClass, 'us_option');
+  assert.equal(entry.contracts, order.qty);
+  // booked as an option fill with the 100x multiplier
+  assert.equal(harness.ledger.fills.length, 1);
+  assert.equal(harness.ledger.fills[0].assetClass, 'us_option');
+  assert.equal(harness.ledger.fills[0].multiplier, 100);
+  assert.equal(harness.ledger.fills[0].side, 'buy');
+  assert.ok(entry.option.strikeUsd > 0);
+
+  // describe() reports the enabled instruments/structures
+  const view = harness.executor.describe();
+  assert.equal(view.instruments.enabled, true);
+  assert.equal(view.instruments.options, true);
+  assert.equal(view.instruments.spreads, true);
+  assert.ok(view.instruments.allowedStructures.includes('long_call'));
+});
+
+test('executor: long option exits on premium stop with sell_to_close', async () => {
+  const contract = { underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 115 };
+  const occ = formatOccSymbol(contract);
+  const position = makeOptionPosition({ contract, avgPriceUsd: 1, qtySigned: 1 });
+  const harness = optionExecutorHarness({
+    positions: { [occ]: position },
+    brokerOptions: { premiumBySymbol: { [occ]: 0.3 }, chain: makeOptionChain({ underlying: 'AAPL', type: 'call', strikes: [115], defaultPremium: 0.3 }) },
+  });
+  const result = await runHarness(harness, { bars: { AAPL: breakoutBars() } });
+  assert.equal(result.orders.length, 1);
+  const order = harness.broker.submitted[0];
+  assert.equal(order.assetClass, 'us_option');
+  assert.equal(order.side, 'sell');
+  assert.equal(order.positionIntent, 'sell_to_close');
+  assert.equal(order.symbol, occ);
+  const exit = result.actions.find((action) => action.type === 'exit');
+  assert.equal(exit.reason, 'stop');
+  assert.equal(exit.instrument, 'long_call');
+  assert.equal(harness.brakes.calls[0].closing, true, 'closing order is flagged for the brake wall');
+});
+
+test('executor: covered call requires 100 shares (guard + with-shares entry)', async () => {
+  const chain = makeOptionChain({ underlying: 'AAPL', type: 'call', strikes: [110, 115, 120], defaultPremium: 0.1 });
+  const policy = makePolicy({ instrument: { prefer: 'covered_call' } });
+  const gapBars = gapUpFadeBars();
+
+  // no shares -> covered call blocked, recorded skip, falls back to a short stock entry
+  const guardHarness = optionExecutorHarness({
+    brokerOptions: { chain },
+    specOverrides: { family: 'gapfade' },
+  });
+  const guardResult = await runHarness(guardHarness, { bars: { AAPL: gapBars }, policy });
+  const guardSkip = guardResult.actions.find((action) => action.reason === 'covered_call_requires_100_shares');
+  assert.ok(guardSkip, 'covered-call guard must record a skip');
+  assert.ok(!guardHarness.broker.submitted.some((order) => order.assetClass === 'us_option'));
+
+  // 100 shares -> sells one covered call against them (never more contracts than covered)
+  const coveredPosition = {
+    qty: 100, qtySigned: 100, avgPriceUsd: 100, assetClass: 'us_equity',
+    openedAt: new Date(T0 - HOUR_MS).toISOString(),
+  };
+  const coveredHarness = optionExecutorHarness({
+    positions: { AAPL: coveredPosition },
+    brokerOptions: { chain },
+    specOverrides: { family: 'gapfade', params: { ...baseSpec().params, stopPct: 0.06, targetPct: 0.12, maxHoldBars: 48 } },
+  });
+  const coveredResult = await runHarness(coveredHarness, { bars: { AAPL: gapBars }, policy });
+  assert.equal(coveredResult.orders.length, 1, JSON.stringify(coveredResult.denied));
+  const order = coveredHarness.broker.submitted[0];
+  assert.equal(order.assetClass, 'us_option');
+  assert.equal(order.side, 'sell');
+  assert.equal(order.positionIntent, 'sell_to_open');
+  assert.equal(order.qty, 1);
+  const entry = coveredResult.actions.find((action) => action.type === 'entry');
+  assert.equal(entry.instrument, 'covered_call');
+});
+
+test('executor: opens a two-leg credit spread as one mleg order and closes it as mleg', async () => {
+  const chain = makeOptionChain({
+    underlying: 'AAPL',
+    type: 'call',
+    strikes: [110, 115, 120, 125],
+    premiums: { 110: 1.2, 115: 0.6, 120: 0.25, 125: 0.1 },
+  });
+  const policy = makePolicy({ instrument: { prefer: 'call_credit_spread' } });
+  const spreadConfig = { instruments: { maxOptionPremiumUsd: 2000, maxOptionPremiumPctEquity: 0.5, maxContracts: 3 } };
+  const harness = optionExecutorHarness({
+    brokerOptions: { chain },
+    configOverrides: spreadConfig,
+    specOverrides: { family: 'gapfade' },
+  });
+  const result = await runHarness(harness, { bars: { AAPL: gapUpBars() }, policy });
+  assert.equal(result.denied.length, 0, JSON.stringify(result.denied));
+  assert.equal(harness.broker.submitted.length, 1);
+  const order = harness.broker.submitted[0];
+  assert.equal(order.orderClass, 'mleg');
+  assert.equal(order.type, 'limit');
+  assert.equal(order.legs.length, 2);
+  assert.equal(order.legs[0].side, 'sell');
+  assert.equal(order.legs[1].side, 'buy');
+  assert.equal(order.legs[0].positionIntent, 'sell_to_open');
+  assert.equal(order.legs[1].positionIntent, 'buy_to_open');
+  assert.ok(order.limitPrice > 0, 'mleg limit price is the net credit');
+  const entry = result.actions.find((action) => action.type === 'entry');
+  assert.equal(entry.instrument, 'call_credit_spread');
+  assert.equal(harness.ledger.fills.length, 2, 'both spread legs are booked');
+  assert.equal(harness.ledger.fills[0].groupId, harness.ledger.fills[1].groupId);
+
+  // --- close the spread as one mleg sell/buy-to-close order -------------------
+  const shortOcc = order.legs[0].symbol;
+  const longOcc = order.legs[1].symbol;
+  const exitHarness = optionExecutorHarness({
+    brokerOptions: {
+      chain,
+      premiumBySymbol: { [shortOcc]: 0.1, [longOcc]: 0.05 },
+    },
+    specOverrides: { family: 'gapfade' },
+  });
+  exitHarness.spec = baseSpec({ family: 'gapfade', params: { ...baseSpec().params, targetPct: 0.04, stopPct: 0.02 } });
+  const legsGroup = 'grp-spread-1';
+  exitHarness.ledger = makeLedgerDouble({
+    positions: {
+      [shortOcc]: makeOptionPosition({ contract: { underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 115 }, qtySigned: -1, avgPriceUsd: 0.6, groupId: legsGroup, structure: 'call_credit_spread', option: { underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 115, dte: 12, multiplier: 100 } }),
+      [longOcc]: makeOptionPosition({ contract: { underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 120 }, qtySigned: 1, avgPriceUsd: 0.25, groupId: legsGroup, structure: 'call_credit_spread', option: { underlying: 'AAPL', expiration: '2030-01-18', type: 'call', strikeUsd: 120, dte: 12, multiplier: 100 } }),
+    },
+  });
+  exitHarness.executor = createExecutor({ broker: exitHarness.broker, brakes: exitHarness.brakes, ledger: exitHarness.ledger, config: exitHarness.config, clock: createClock({ now: () => T0 }) });
+  const exitResult = await runHarness(exitHarness, { bars: { AAPL: gapUpBars() } });
+  assert.equal(exitResult.orders.length, 1, JSON.stringify(exitResult.denied));
+  const closeOrder = exitHarness.broker.submitted[0];
+  assert.equal(closeOrder.orderClass, 'mleg');
+  assert.equal(closeOrder.legs.length, 2);
+  const legsBySymbol = Object.fromEntries(closeOrder.legs.map((leg) => [leg.symbol, leg]));
+  assert.equal(legsBySymbol[shortOcc].side, 'buy');
+  assert.equal(legsBySymbol[shortOcc].positionIntent, 'buy_to_close');
+  assert.equal(legsBySymbol[longOcc].side, 'sell');
+  assert.equal(legsBySymbol[longOcc].positionIntent, 'sell_to_close');
+  const exit = exitResult.actions.find((action) => action.type === 'exit');
+  assert.equal(exit.instrument, 'call_credit_spread');
+});
+
+test('executor: short stock entry and buy-to-cover exit, brakes always first', async () => {
+  // Bearish gap-fade playbook: covered call blocked (no shares) -> short stock (whole shares).
+  const harness = optionExecutorHarness({
+    specOverrides: { family: 'gapfade' },
+    configOverrides: { instruments: { maxShortNotionalUsd: 1000 } },
+  });
+  const result = await runHarness(harness, { bars: { AAPL: gapUpBars() } });
+  assert.equal(harness.broker.submitted.length, 1);
+  const order = harness.broker.submitted[0];
+  assert.equal(order.side, 'sell');
+  assert.equal(order.assetClass, 'us_equity');
+  assert.equal(order.positionIntent, undefined, 'short stock is a plain sell');
+  assert.ok(Number.isInteger(order.qty));
+  assert.ok(order.qty >= 1);
+  assert.equal(result.actions.find((action) => action.type === 'entry').assetClass, 'us_equity');
+
+  // Cover the short at its stop (price above entry): buy the exact share count.
+  const coverHarness = optionExecutorHarness({
+    positions: {
+      AAPL: {
+        qty: -10, qtySigned: -10, avgPriceUsd: 100, assetClass: 'us_equity',
+        openedAt: new Date(T0 - HOUR_MS).toISOString(),
+      },
+    },
+    quotes: { AAPL: { bid: 109.9, ask: 110.1, last: 110, ts: T0 } },
+    specOverrides: { family: 'gapfade' },
+  });
+  const coverResult = await runHarness(coverHarness, { bars: { AAPL: gapUpBars() } });
+  assert.equal(coverResult.orders.length, 1);
+  assert.equal(coverHarness.broker.submitted[0].side, 'buy');
+  assert.equal(coverHarness.broker.submitted[0].qty, 10);
+  const exit = coverResult.actions.find((action) => action.type === 'exit');
+  assert.equal(exit.reason, 'stop');
+  assert.equal(coverHarness.brakes.calls[0].order.side, 'buy');
+});
+
+test('executor: falls back to stock when no option is affordable; brakes-first DENY for options', async () => {
+  // Premium $5/share => $500 per contract, above the $25 premium budget -> stock fallback.
+  const expensiveChain = makeOptionChain({ underlying: 'AAPL', type: 'call', strikes: [110], defaultPremium: 5 });
+  const fallbackHarness = optionExecutorHarness({ brokerOptions: { chain: expensiveChain } });
+  const fallbackResult = await runHarness(fallbackHarness, { bars: { AAPL: breakoutBars() } });
+  assert.equal(fallbackHarness.broker.submitted.length, 1);
+  assert.equal(fallbackHarness.broker.submitted[0].assetClass, 'us_equity');
+  assert.equal(fallbackResult.actions.find((action) => action.type === 'entry').assetClass, 'us_equity');
+
+  // A brake DENY must stop the option order before the broker sees it.
+  const denyChain = makeOptionChain({ underlying: 'AAPL', type: 'call', strikes: [110, 115], defaultPremium: 0.1 });
+  const deniedHarness = optionExecutorHarness({
+    brokerOptions: { chain: denyChain },
+    brakesHandler: () => ({ decision: 'DENY', code: 'OPTION_FORBIDDEN', rule: 'D16', reason: 'structure not allowed' }),
+  });
+  const deniedResult = await runHarness(deniedHarness, { bars: { AAPL: breakoutBars() } });
+  assert.equal(deniedHarness.broker.submitted.length, 0);
+  assert.equal(deniedResult.denied[0].code, 'OPTION_FORBIDDEN');
+  const brakeCheck = deniedHarness.brakes.calls[0];
+  assert.equal(brakeCheck.order.assetClass, 'us_option');
+  assert.ok(brakeCheck.order.option);
+  assert.equal(brakeCheck.order.structure, 'long_call');
+  assert.ok(Number.isFinite(brakeCheck.order.notionalUsd));
 });
 
 // ===========================================================================

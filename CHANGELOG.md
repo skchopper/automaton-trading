@@ -10,6 +10,65 @@ existing state migrate with **zero** data changes.
 
 ---
 
+## v3.0.0 — 2026-10-30 — multi-instrument paper trading (margin, shorts, options, spreads)
+
+The population may now use margin, short selling, long calls/puts, covered calls and defined-risk
+vertical spreads, and actively chooses them when its strategy and economics fit. This is a **paper
+account capability expansion**: live trading remains triple-gated by D8, and every order still passes
+the hard brake wall first.
+
+- **Capital and coverage.** Bots were raised from $20 to **$50** each (one-time +$30 capital top-up
+  per living bot, bounded by the account allocation cap and recorded as capital rather than trading
+  P&L; 30 × $50 = $1,500 of the ~$2,000 paper account). Part of the population is re-pointed once at
+  affordable underlyings (**F/SOFI/BAC/INTC**, alongside the existing 10 symbols) so whole-share
+  shorts and sub-$25 option contracts are actually tradable; specs recompile and strategy-derived
+  names refresh without touching ids, ledgers or open positions.
+- **Instruments.**
+  - *Short stock* — whole shares, shortable+marginable assets, mandate cap; buy-to-cover on
+    stop/target/max-hold/signal.
+  - *Long calls/puts* — integer contracts with premium sizing, DTE window, premium stop/target,
+    research-ALERT exit and DTE auto-close.
+  - *Covered calls* — sell-to-open only against ≥100 owned shares (rare at $50/bot; denied otherwise),
+    closed at 50% premium profit/stop/DTE guard.
+  - *Defined-risk verticals* — bull-call, bear-put, bear-call credit and bull-put credit submitted as
+    one multi-leg order, linked by a spread group and closed together.
+  - *Margin* — debt allowed within the mandate and configured equity cap; the ledger supports negative
+    cash with a hard `MARGIN_LIMIT`.
+  - **Naked short options are never constructed and are denied by the brake wall.**
+- **Active selection.** Each strategy family has bullish/bearish/neutral instrument playbooks
+  (momentum/meanrev: stock or calls/puts, short or credit spreads; breakout: calls/puts for leverage;
+  gapfade: shorts/puts/premium selling). The bot's own agent may override with
+  `policy.instrument` (structure + premium/contracts/DTE caps); otherwise the playbook picks the first
+  affordable structure and falls back to stock/short when option premium cannot fit. Option strikes
+  are 2–5% OTM, expiry is nearest inside the DTE window, contracts = floor(budget / premium×100).
+- **Risk wall.** D2 is now the instrument-permission gate (was a blanket no-margin/short/options
+  denial). New hard brakes **D15 SHORT_FORBIDDEN**, **D16 OPTION_FORBIDDEN** (structure, integer
+  contracts/caps, premium caps, covered-share requirement, defined-risk spreads, never naked),
+  **D17 MARGIN_LIMIT**, **D18 EXPIRY_GUARD** (sell-to-close always allowed). D1–D14 keep their
+  meaning; D4 skips equity price/spread ceilings for option orders while retaining the underlying
+  whitelist. The catalogue is **18 hard brakes (D1–D18)**.
+- **Ledger and death.** Signed stock positions, option positions with 100× multiplier and spread
+  groupIds, cash/equity marks including margin debt, gross/net exposure and realized P&L for long and
+  short closes; enriched snapshots and position lists. On death the Reaper liquidates signed stock,
+  long/short options and spread legs (sell/buy-to-close, groupId preserved), absorbs margined estate
+  debt from the treasury and writes the obituary.
+- **Control panel and status.** Positions render as LONG/SHORT stock or CALL/PUT options with
+  strike/expiry/DTE/contracts and spread-group tags; totals show gross/net exposure and margin debt.
+  Agents gain an Instruments badge, an Instrument playbook block and the bot's Instrument plan; the
+  engine header shows options level, shorting, margin multiplier, caps and account options buying
+  power/margin debt. Status adds `instruments` (flags, caps, account, playbooks) and per-agent
+  `instrumentPermissions`, `playbook` and `policy.instrument`.
+- **Config.** New validated `instruments` block (margin/short/options/covered-call/spread flags,
+  equity-percentage and absolute caps, contracts, DTE window/auto-close, option data feed); naked
+  short options are rejected at config load. Paper remains the default mode.
+- **Tests:** 10 suites, **302 tests** — mortality 70, market 43, plugin 42, integration 34,
+  security 53, research 13, rankings 16, control 16, bot-agent 8, instruments 7 — plus research and
+  defect-regression smoke checks, all passing. Independent verification found and re-verified three
+  real v3 defects before release: single-leg option orders were denied because the executor sent the
+  underlying instead of the OCC symbol; Treasurer option marks inflated equity 100× and halted
+  reconciliation; the sim option chain priced further-OTM contracts higher and blocked verticals.
+  All three are fixed and covered by end-to-end regression tests.
+
 ## v2.3.0 — 2026-10-30 — per-bot agents, strategy categories and a richer panel
 
 - **Every bot is now its own agent.** On its own cadence each bot gets a private LLM review whose
@@ -32,7 +91,7 @@ existing state migrate with **zero** data changes.
   the strategy family, and children derive their tier from the mutated genome. Populations seeded
   before the taxonomy are rebalanced once on first start (genome family refreshed, spec recompiled,
   strategy-derived name updated; ids, ledgers, positions and history untouched).
-- **Executor policy consumption (hybrid architecture).** Execution and the 14 brakes stay
+- **Executor policy consumption (hybrid architecture).** Execution and the 18 hard brakes stay
   deterministic so minute-level reactions never wait on a model turn: `stand_down` blocks new
   entries (risk-reducing exits still fire), `sizeMultiplier` shrinks entry notional before every
   existing cap (never grows), `exitPressure: exit` forces a position exit after any research ALERT

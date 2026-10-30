@@ -75,6 +75,19 @@ engine: {
     enabled, configured, provider, model,
     intervalDaySec, intervalSwingSec, maxReviewsPerCycle,
     lastReviewAt, nextDueAt, pausedUntil, pauseReason, runs, errors, lastError, agents
+  },
+  instruments: {
+    enabled, longStock, shortStock, longOptions, shortOptions, coveredCalls, spreads, margin,
+    allowedStructures: ['long_call','long_put','covered_call','bull_call_spread','bear_put_spread',
+                        'call_credit_spread','put_credit_spread'],
+    caps: {maxMarginPctEquity, maxShortPctEquity, maxShortNotionalUsd,
+           maxOptionPremiumPctEquity, maxOptionPremiumUsd, maxContracts,
+           minDTE, maxDTE, autoCloseDTE},
+    optionDataFeed: 'indicative',
+    account: {buyingPowerUsd, optionsBuyingPowerUsd, marginMultiplier, shortingEnabled,
+              optionsTradingLevel, marginDebtUsd, grossExposureUsd, netExposureUsd} | null,
+    treasury: { ...instrument permissions/caps summary } | null,
+    playbooks: {momentum:{family,tier,summary,bullish,bearish,neutral,structures}, meanrev, breakout, gapfade}
   }
 },
 strategyMix: {
@@ -86,9 +99,18 @@ agents: [{
   ...existing,
   strategy: {family, category, tier, typeLabel, className, description,
              categoryLabel, estimatedIntervalSec, timeframe, reviewSec},
+  instrumentPermissions: {longStock, shortStock, longOptions, shortOptions, coveredCalls, spreads,
+                          margin, allowedStructures:[...]},
+  playbook: {family, tier, summary, bullish:[...], bearish:[...], neutral:[...], structures:[...]},
+  positions: [{symbol, assetClass:'us_equity'|'us_option', side:'LONG'|'SHORT'|'CALL'|'PUT',
+               qty, qtySigned, multiplier, groupId, option:{underlying,expiration,type,strikeUsd,dte}|null,
+               avgPriceUsd, lastPriceUsd, marketValueUsd, unrealizedPlUsd, openedAt}],
+  marginDebtUsd, grossExposureUsd, netExposureUsd,
   policy: null | {at, atMs, stance, sizeMultiplier, riskMultiplier, exitPressure, confidence,
-                  thesis, plan:[string], watch:[symbol], reviewSec, stale, reviewCount, nextReviewAt},
-  orders: [{symbol, side, qty, priceUsd, notionalUsd, realizedPlUsd, at, orderId}], // full fill history
+                  thesis, plan:[string], watch:[symbol], instrument:{prefer,maxPremiumUsd,maxContracts,dteMin,dteMax},
+                  reviewSec, stale, reviewCount, nextReviewAt},
+  orders: [{symbol, assetClass, side, positionIntent, qty, priceUsd, notionalUsd, multiplier, option,
+            groupId, realizedPlUsd, at, orderId}], // full fill history
   pnl: { realizedUsd, unrealizedUsd, netUsd, dayPct, weekPct, monthPct },
   plan: {
     summary: string,           // 2-4 sentence strategy explanation

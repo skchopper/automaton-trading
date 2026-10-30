@@ -1,40 +1,116 @@
 /**
- * ledger.js — the per-agent virtual USD ledger.
+ * ledger.js — the per-agent virtual USD ledger (v3.0 multi-instrument).
  *
- * Alpaca has no sub-accounts, so per-agent capital is bookkeeping: this module is the
- * book. Every agent has a cash balance and a position book; fills move cash and realize
- * P&L; costs are attributed by role so "a role must pay for its own inference" is
- * measurable rather than rhetorical.
+ * Generic signed positions keyed by symbol (stock ticker or OCC option symbol):
+ *   - stocks:  signed qty; selling beyond the long opens/increases a short, buying covers.
+ *   - options: integer contracts, multiplier 100; buy = debit, sell = credit; selling
+ *              beyond the long opens a short option position (the BRAKES wall decides
+ *              whether that is a legal covered call / spread leg or a naked short).
+ *   - margin:  cash may go negative only while margin is enabled AND the resulting debt
+ *              stays within `instruments.maxMarginPctEquity * equity`; otherwise the fill
+ *              is refused with MARGIN_LIMIT. Everything else (charge/transfer/pool) keeps
+ *              the strict no-negative-cash invariant.
  *
- * Funding semantics (aligned with the Lead's orchestrator):
- *   - `ensureAgent(id, {endowmentUsd})` declares an endowment for reference and creates
- *     the record with cashUsd = 0. It never adds cash.
- *   - `grant(id, usd)` is a money-creation path (genesis funding).
- *   - `transfer(from, to, usd)` moves existing cash (replication funding, death sweep).
- *   - `'__treasury__'` is a synthetic reserved record holding unallocated capital; the
- *     Reaper sweeps a dead agent's residual cash into it.
+ * Money enters only through `grant` (genesis), `credit` (one-time capital top-up) and
+ * `transfer` (internal moves); `charge` removes costs.
  *
- * Invariants enforced here: cashUsd >= 0, cash + positionsValue = equity, USD at 2dp,
- * quantities at 4dp. `anchorToBrokerEquity()` is called once by the Treasurer so that
- * sum(agent equity) + treasury equity is anchored to broker account equity.
+ * Persistence is backward compatible: legacy positions {qty, avgPriceUsd, openedAt} are
+ * normalised on load (and OCC symbols are recognised as options).
  *
- * Owned by mortality-core. Contract: docs/CONTRACTS.md ("Mortality modules").
+ * Owned by mortality-core. Contract: docs/INSTRUMENTS.md + docs/CONTRACTS.md.
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { AutomatonError, fail } from './contracts.js';
-import { readJsonSync, round2, round4, round8, SYSTEM_CLOCK, writeJsonAtomicSync } from './util.js';
+import { DAY_MS, readJsonSync, round2, round4, round8, SYSTEM_CLOCK, writeJsonAtomicSync } from './util.js';
 import { statePaths } from './config.js';
 
 /** Reserved synthetic account that holds unallocated treasury cash. */
 export const TREASURY_ID = '__treasury__';
 
+/** Standard US equity-option contract multiplier. */
+export const OPTION_MULTIPLIER = 100;
+
+/** Stable local error code for a fill that would exceed the margin budget. */
+export const MARGIN_LIMIT = 'MARGIN_LIMIT';
+
 const NET7D_MS = 7 * 24 * 60 * 60 * 1000;
 const EPSILON = 1e-9;
+const OCC_PATTERN = /^([A-Z][A-Z0-9]{0,5})(\d{6})([CP])(\d{8})$/;
 
 const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const clone = (value) => (value === undefined ? undefined : structuredClone(value));
+
+// ---------------------------------------------------------------------------
+// instrument helpers (exported: brakes/treasurer/tests reuse them)
+// ---------------------------------------------------------------------------
+
+/** True when `symbol` looks like an OCC option contract symbol (e.g. AAPL260116C00150000). */
+export function isOccOptionSymbol(symbol) {
+  return typeof symbol === 'string' && OCC_PATTERN.test(symbol.toUpperCase());
+}
+
+/**
+ * Parse an OCC option symbol into its contract metadata.
+ * @param {string} symbol
+ * @returns {{ underlying: string, expiration: string, type: 'call'|'put',
+ *   strikeUsd: number, multiplier: number, symbol: string }|null}
+ */
+export function parseOccSymbol(symbol) {
+  if (typeof symbol !== 'string') return null;
+  const match = OCC_PATTERN.exec(symbol.toUpperCase());
+  if (!match) return null;
+  const [, root, yymmdd, cp, strikeDigits] = match;
+  const year = 2000 + Number(yymmdd.slice(0, 2));
+  const month = Number(yymmdd.slice(2, 4));
+  const day = Number(yymmdd.slice(4, 6));
+  const stamp = Date.UTC(year, month - 1, day);
+  if (!Number.isFinite(stamp) || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return {
+    symbol: symbol.toUpperCase(),
+    underlying: root,
+    expiration: new Date(stamp).toISOString().slice(0, 10),
+    type: cp === 'C' ? 'call' : 'put',
+    strikeUsd: round4(Number(strikeDigits) / 1000),
+    multiplier: OPTION_MULTIPLIER,
+  };
+}
+
+/** 'us_equity' | 'us_option' from an assetClass hint + symbol (OCC symbols are options). */
+export function normaliseAssetClass(assetClass, symbol) {
+  const raw = String(assetClass ?? '').trim().toLowerCase();
+  if (['option', 'options', 'us_option', 'option_contract', 'us_option_contract'].includes(raw)) {
+    return 'us_option';
+  }
+  if (raw !== '' && !['equity', 'stock', 'us_equity', 'us_stock'].includes(raw)) {
+    // Unknown classes are treated as equity here; the BRAKES D2 gate refuses them.
+    return 'us_equity';
+  }
+  return isOccOptionSymbol(symbol) ? 'us_option' : 'us_equity';
+}
+
+/**
+ * Calendar-day distance to an option expiration date, standard date-based DTE.
+ * @param {string} expiration ISO date ('YYYY-MM-DD') or ISO timestamp
+ * @param {number} nowMs
+ * @returns {number|null}
+ */
+export function optionDaysToExpiry(expiration, nowMs) {
+  const ms = typeof expiration === 'number' ? expiration : Date.parse(String(expiration ?? ''));
+  if (!Number.isFinite(ms)) return null;
+  const nowValue = Number(nowMs);
+  if (!Number.isFinite(nowValue)) return null;
+  const expiry = new Date(ms);
+  const now = new Date(nowValue);
+  const expiryDay = Date.UTC(expiry.getUTCFullYear(), expiry.getUTCMonth(), expiry.getUTCDate());
+  const nowDay = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Math.max(0, Math.round((expiryDay - nowDay) / DAY_MS));
+}
+
+function positiveOrInfinity(value, fallback = Infinity) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 function normalizeAt(at, clock) {
   if (typeof at === 'number' && Number.isFinite(at)) return at;
@@ -64,12 +140,17 @@ export function createLedger({ paths, config, clock } = {}) {
   }
   const ledgerPath = path.resolve(resolved.ledger);
   const currentClock = clock ?? SYSTEM_CLOCK;
+  const instruments = config?.instruments ?? {};
+  const allowMargin = instruments.allowMargin === true;
+  const maxMarginPctEquity = Number.isFinite(Number(instruments.maxMarginPctEquity))
+    ? Number(instruments.maxMarginPctEquity)
+    : 1;
 
   /** @type {{ version: number, anchored: boolean, anchoredAt: string|null, agents: Record<string, object> }} */
   let state = emptyState();
 
   function emptyState() {
-    return { version: 1, anchored: false, anchoredAt: null, agents: {} };
+    return { version: 3, anchored: false, anchoredAt: null, agents: {} };
   }
 
   function newRecord(agentId, { endowmentUsd = 0, at } = {}) {
@@ -83,6 +164,7 @@ export function createLedger({ paths, config, clock } = {}) {
       costsByRole: {},
       grossSpendUsd: 0,
       grossRevenueUsd: 0,
+      creditsUsd: 0,
       trades: 0,
       firstProfitAt: null,
       declaredEndowmentUsd: round2(Math.max(0, Number(endowmentUsd) || 0)),
@@ -91,7 +173,82 @@ export function createLedger({ paths, config, clock } = {}) {
       events: [{ atMs: Date.parse(atIso), kind: 'endowment-declared', amountUsd: round2(Number(endowmentUsd) || 0) }],
       markPrices: {},
       lastUnrealizedUsd: 0,
+      lastMarginDebtUsd: 0,
+      lastGrossExposureUsd: 0,
+      lastNetExposureUsd: 0,
       updatedAt: atIso,
+    };
+  }
+
+  /** Normalise an option metadata object; OCC symbol data fills any gaps. */
+  function buildOptionMetadata(fill, symbol, prior) {
+    const source = isPlainObject(fill.option) ? fill.option : {};
+    const parsed = parseOccSymbol(symbol) ?? {};
+    const underlyingRaw = source.underlying ?? source.root ?? parsed.underlying ?? prior?.option?.underlying ?? null;
+    const underlying = underlyingRaw === null || underlyingRaw === undefined ? null : String(underlyingRaw).toUpperCase();
+    const expiration = source.expiration ?? source.expirationDate ?? parsed.expiration ?? prior?.option?.expiration ?? null;
+    const typeRaw = String(source.type ?? source.right ?? parsed.type ?? prior?.option?.type ?? '').toLowerCase();
+    const type = typeRaw === 'c' ? 'call' : typeRaw === 'p' ? 'put' : typeRaw;
+    const strikeUsdRaw = source.strikeUsd ?? source.strike ?? parsed.strikeUsd ?? prior?.option?.strikeUsd;
+    const strikeUsd = Number(strikeUsdRaw);
+    const multiplierRaw = Number(source.multiplier ?? fill.multiplier ?? parsed.multiplier ?? prior?.option?.multiplier ?? OPTION_MULTIPLIER);
+    const multiplier = Number.isFinite(multiplierRaw) && multiplierRaw > 0 ? multiplierRaw : OPTION_MULTIPLIER;
+    const groupId = fill.groupId ?? source.groupId ?? prior?.option?.groupId ?? prior?.groupId ?? null;
+    const structure = fill.structure ?? source.structure ?? prior?.option?.structure ?? prior?.structure ?? null;
+    if (underlying === null || underlying === '') {
+      fail('CONFIG_INVALID', 'option fills require the underlying symbol', { symbol, assetClass: 'us_option' });
+    }
+    if (!['call', 'put'].includes(type)) {
+      fail('CONFIG_INVALID', 'option fills require option.type "call" or "put"', { symbol, type: typeRaw });
+    }
+    if (!Number.isFinite(strikeUsd) || strikeUsd <= 0) {
+      fail('CONFIG_INVALID', 'option fills require a positive strikeUsd', { symbol, strikeUsd: strikeUsdRaw });
+    }
+    if (typeof expiration !== 'string' || !Number.isFinite(Date.parse(expiration))) {
+      fail('CONFIG_INVALID', 'option fills require an expiration date', { symbol, expiration });
+    }
+    return {
+      underlying,
+      expiration: new Date(Date.parse(expiration)).toISOString().slice(0, 10),
+      type,
+      strikeUsd: round4(strikeUsd),
+      multiplier,
+      groupId: groupId ?? null,
+      structure: structure ?? null,
+    };
+  }
+
+  function normalisePosition(symbol, raw) {
+    const sym = String(symbol ?? '').toUpperCase();
+    const assetClass = normaliseAssetClass(raw?.assetClass, sym);
+    const isOption = assetClass === 'us_option';
+    const parsed = isOption ? parseOccSymbol(sym) : null;
+    const multiplier = isOption
+      ? positiveOrInfinity(raw?.multiplier ?? raw?.option?.multiplier ?? parsed?.multiplier, OPTION_MULTIPLIER)
+      : 1;
+    let option = null;
+    if (isOption) {
+      const base = raw?.option && isPlainObject(raw.option) ? raw.option : {};
+      option = {
+        underlying: String(base.underlying ?? base.root ?? parsed?.underlying ?? '').toUpperCase() || null,
+        expiration: base.expiration ?? parsed?.expiration ?? null,
+        type: String(base.type ?? base.right ?? parsed?.type ?? '').toLowerCase() || null,
+        strikeUsd: Number(base.strikeUsd ?? base.strike ?? parsed?.strikeUsd ?? 0) || null,
+        multiplier,
+        groupId: base.groupId ?? raw?.groupId ?? null,
+        structure: base.structure ?? raw?.structure ?? null,
+      };
+    }
+    return {
+      symbol: sym,
+      assetClass,
+      qty: Number(raw?.qty ?? raw?.qtySigned ?? 0) || 0,
+      avgPriceUsd: round4(Number(raw?.avgPriceUsd ?? raw?.avgEntryPriceUsd ?? 0) || 0),
+      openedAt: typeof raw?.openedAt === 'string' ? raw.openedAt : null,
+      multiplier,
+      option,
+      groupId: raw?.groupId ?? option?.groupId ?? null,
+      structure: raw?.structure ?? option?.structure ?? null,
     };
   }
 
@@ -101,13 +258,13 @@ export function createLedger({ paths, config, clock } = {}) {
       ...newRecord(raw?.agentId, { endowmentUsd: raw?.declaredEndowmentUsd ?? 0, at: atIso }),
       ...raw,
     };
-    record.positions = isPlainObject(record.positions) ? record.positions : {};
-    for (const [symbol, position] of Object.entries(record.positions)) {
-      record.positions[symbol] = {
-        qty: round4(Number(position?.qty) || 0),
-        avgPriceUsd: round4(Number(position?.avgPriceUsd) || 0),
-        openedAt: typeof position?.openedAt === 'string' ? position.openedAt : atIso,
-      };
+    const positions = isPlainObject(record.positions) ? record.positions : {};
+    record.positions = {};
+    for (const [symbol, position] of Object.entries(positions)) {
+      const normalised = normalisePosition(symbol, position);
+      if (normalised.qty === 0) continue;
+      normalised.openedAt = normalised.openedAt ?? atIso;
+      record.positions[normalised.symbol] = normalised;
     }
     // Sub-cent precision matters here: the metabolism charges fractions of a cent per
     // role per cycle, and rounding the accumulator at 2dp on every reload silently
@@ -121,11 +278,15 @@ export function createLedger({ paths, config, clock } = {}) {
     }
     record.grossSpendUsd = round8(Number(record.grossSpendUsd) || 0);
     record.grossRevenueUsd = round8(Number(record.grossRevenueUsd) || 0);
+    record.creditsUsd = round8(Number(record.creditsUsd) || 0);
     record.trades = Number(record.trades) || 0;
     record.fills = Array.isArray(record.fills) ? record.fills : [];
     record.events = Array.isArray(record.events) ? record.events : [];
     record.markPrices = isPlainObject(record.markPrices) ? record.markPrices : {};
     record.declaredEndowmentUsd = round2(Number(record.declaredEndowmentUsd) || 0);
+    record.lastMarginDebtUsd = round2(Number(record.lastMarginDebtUsd) || 0);
+    record.lastGrossExposureUsd = round2(Number(record.lastGrossExposureUsd) || 0);
+    record.lastNetExposureUsd = round2(Number(record.lastNetExposureUsd) || 0);
     return record;
   }
 
@@ -181,11 +342,295 @@ export function createLedger({ paths, config, clock } = {}) {
     return Object.keys(state.agents);
   }
 
+  // -------------------------------------------------------------------------
+  // position valuation
+  // -------------------------------------------------------------------------
+
+  function markFor(record, symbol, prices, fallbackPrice) {
+    const candidate = priceLookup(prices, symbol);
+    if (Number.isFinite(Number(candidate)) && Number(candidate) > 0) return Number(candidate);
+    if (Number.isFinite(Number(fallbackPrice)) && Number(fallbackPrice) > 0) return Number(fallbackPrice);
+    const stored = Number(record.markPrices?.[symbol]);
+    if (Number.isFinite(stored) && stored > 0) return stored;
+    return null;
+  }
+
+  function positionMarketValue(position, mark) {
+    const multiplier = Number(position.multiplier) || 1;
+    return round2((Number(position.qty) || 0) * (Number(mark) || 0) * multiplier);
+  }
+
+  /**
+   * Enrich one stored position for the operator/UI: signed qty, side, asset class,
+   * option metadata with live DTE, mark and unrealized P&L.
+   */
+  function viewPosition(record, position) {
+    const symbol = position.symbol;
+    const mark = markFor(record, symbol, {}, null) ?? (Number(position.avgPriceUsd) || 0);
+    const multiplier = Number(position.multiplier) || 1;
+    const qty = Number(position.qty) || 0;
+    const isOption = position.assetClass === 'us_option';
+    const marketValueUsd = positionMarketValue(position, mark);
+    const costBasisUsd = round2(qty * (Number(position.avgPriceUsd) || 0) * multiplier);
+    const option = isOption && position.option
+      ? {
+          underlying: position.option.underlying ?? null,
+          expiration: position.option.expiration ?? null,
+          type: position.option.type ?? null,
+          strikeUsd: Number(position.option.strikeUsd) || null,
+          multiplier,
+          groupId: position.option.groupId ?? position.groupId ?? null,
+          structure: position.option.structure ?? position.structure ?? null,
+          dte: optionDaysToExpiry(position.option.expiration, currentClock.now()),
+        }
+      : null;
+    return {
+      symbol,
+      assetClass: position.assetClass ?? 'us_equity',
+      qty,
+      qtySigned: qty,
+      avgPriceUsd: Number(position.avgPriceUsd) || 0,
+      lastPriceUsd: mark,
+      marketValueUsd,
+      unrealizedPlUsd: round2(marketValueUsd - costBasisUsd),
+      openedAt: position.openedAt ?? null,
+      side: isOption ? String(position.option?.type ?? 'option').toUpperCase() : qty < 0 ? 'SHORT' : 'LONG',
+      direction: qty < 0 ? 'SHORT' : 'LONG',
+      multiplier,
+      groupId: position.groupId ?? position.option?.groupId ?? null,
+      structure: position.structure ?? position.option?.structure ?? null,
+      option,
+      dte: option?.dte ?? null,
+    };
+  }
+
   /** Position book handed to the EXECUTOR (never account equity/cash). */
   function book(agentId) {
     const record = requireRecord(agentId);
-    return { agentId, positions: clone(record.positions), openOrders: [] };
+    const positions = {};
+    for (const [symbol, position] of Object.entries(record.positions)) {
+      positions[symbol] = viewPosition(record, position);
+    }
+    return { agentId, positions: clone(positions), openOrders: [] };
   }
+
+  /** Long (positive) share count for an equity symbol; used by covered-call checks. */
+  function longSharesOf(agentId, symbol) {
+    const record = requireRecord(agentId);
+    const position = record.positions[String(symbol ?? '').toUpperCase()];
+    if (!position || position.assetClass !== 'us_equity') return 0;
+    return Math.max(0, round4(Number(position.qty) || 0));
+  }
+
+  /** Signed contract count of an option position (negative = short). */
+  function optionContractsOf(agentId, symbol) {
+    const record = requireRecord(agentId);
+    const position = record.positions[String(symbol ?? '').toUpperCase()];
+    if (!position || position.assetClass !== 'us_option') return 0;
+    return Number(position.qty) || 0;
+  }
+
+  /** True when the agent holds at least `shares` long shares of `symbol`. */
+  function hasCoveredShares(agentId, symbol, shares = 100) {
+    return longSharesOf(agentId, symbol) + EPSILON >= Number(shares);
+  }
+
+  // -------------------------------------------------------------------------
+  // fills
+  // -------------------------------------------------------------------------
+
+  /**
+   * Apply a broker fill to the virtual book.
+   *
+   * @param {string} agentId
+   * @param {{ symbol: string, assetClass?: string, side: 'buy'|'sell', qty: number,
+   *   priceUsd: number, multiplier?: number, option?: object|null, groupId?: string|null,
+   *   structure?: string|null, orderId?: string|null, at?: number|string }} fill
+   * @returns {{ realizedPlUsd: number, position: object|null, cashUsd: number, marginDebtUsd: number }}
+   */
+  function applyFill(agentId, fill = {}) {
+    const record = requireRecord(agentId);
+    const symbol = String(fill.symbol ?? '').toUpperCase();
+    if (symbol === '') fail('CONFIG_INVALID', 'applyFill requires a symbol', { agentId });
+    const direction = String(fill.side ?? '').toLowerCase();
+    if (!['buy', 'sell'].includes(direction)) {
+      fail('CONFIG_INVALID', 'applyFill side must be "buy" or "sell"', { agentId, side: fill.side });
+    }
+    const assetClass = normaliseAssetClass(fill.assetClass, symbol);
+    const isOption = assetClass === 'us_option';
+    const price = round4(Number(fill.priceUsd));
+    const rawQty = Number(fill.qty);
+    if (!Number.isFinite(rawQty) || rawQty <= 0) {
+      fail('CONFIG_INVALID', 'fill qty must be > 0', { agentId, qty: fill.qty });
+    }
+    if (isOption && Math.abs(rawQty - Math.round(rawQty)) > 1e-6) {
+      fail('CONFIG_INVALID', 'option fills must be whole contracts', { agentId, qty: rawQty });
+    }
+    const quantity = isOption ? Math.round(rawQty) : round4(rawQty);
+    if (!(quantity > 0)) fail('CONFIG_INVALID', 'fill qty must be > 0', { agentId, qty: quantity });
+    if (!Number.isFinite(price) || price <= 0) {
+      fail('CONFIG_INVALID', 'fill priceUsd must be > 0', { agentId, priceUsd: fill.priceUsd });
+    }
+    const atMs = normalizeAt(fill.at, currentClock);
+    const atIso = new Date(atMs).toISOString();
+
+    const prior = record.positions[symbol] ?? null;
+    const priorQty = prior ? Number(prior.qty) || 0 : 0;
+    const delta = direction === 'buy' ? quantity : -quantity;
+    const multiplier = isOption
+      ? positiveOrInfinity(fill.multiplier ?? fill.option?.multiplier ?? prior?.multiplier, OPTION_MULTIPLIER)
+      : 1;
+    const optionMetadata = isOption ? buildOptionMetadata(fill, symbol, prior) : null;
+    const notionalUsd = round2(quantity * price * multiplier);
+
+    // Whole-share rule for stock shorts (a fractional long is fine; a fractional short is not).
+    const resultingQty = round4(priorQty + delta);
+    if (!isOption && resultingQty < 0 && Math.abs(resultingQty - Math.round(resultingQty)) > 1e-6) {
+      fail('CONFIG_INVALID', 'short stock positions require whole shares', {
+        agentId,
+        symbol,
+        qty: resultingQty,
+      });
+    }
+
+    // ---- position math (signed, average cost) -------------------------------
+    let newQty;
+    let newAvgPriceUsd;
+    let realizedPlUsd = 0;
+    let openedAt = prior?.openedAt ?? atIso;
+    let option = optionMetadata ?? prior?.option ?? null;
+    let groupId = fill.groupId ?? fill.option?.groupId ?? prior?.groupId ?? prior?.option?.groupId ?? null;
+    let structure = fill.structure ?? fill.option?.structure ?? prior?.structure ?? prior?.option?.structure ?? null;
+
+    if (priorQty === 0 || Math.sign(delta) === Math.sign(priorQty)) {
+      // open or add in the same direction: weighted average cost
+      const added = Math.abs(delta);
+      const held = Math.abs(priorQty);
+      const priorAvg = Number(prior?.avgPriceUsd) || price;
+      newQty = round4(priorQty + delta);
+      newAvgPriceUsd = round4((held * priorAvg + added * price) / (held + added));
+      if (priorQty === 0) openedAt = atIso;
+    } else {
+      // opposite direction: close (fully or partially) then possibly reverse
+      const closingQty = Math.min(Math.abs(priorQty), Math.abs(delta));
+      const priorAvg = Number(prior?.avgPriceUsd) || 0;
+      realizedPlUsd = round2((price - priorAvg) * closingQty * multiplier * Math.sign(priorQty));
+      const remainder = round4(priorQty + delta);
+      if (remainder === 0) {
+        newQty = 0;
+        newAvgPriceUsd = 0;
+      } else if (Math.sign(remainder) === Math.sign(priorQty)) {
+        newQty = remainder;
+        newAvgPriceUsd = priorAvg;
+        openedAt = prior?.openedAt ?? atIso;
+      } else {
+        // reversed through zero: the leftover opens a new position at this fill price
+        newQty = remainder;
+        newAvgPriceUsd = price;
+        openedAt = atIso;
+        option = isOption ? optionMetadata : null;
+        groupId = option?.groupId ?? groupId;
+      }
+    }
+
+    // ---- cash + margin ------------------------------------------------------
+    let cashUsd = round8(record.cashUsd + (direction === 'buy' ? -notionalUsd : notionalUsd));
+
+    // Build the tentative position map so margin can be measured on post-fill equity.
+    const tentativePositions = { ...record.positions };
+    if (newQty === 0) delete tentativePositions[symbol];
+    else {
+      tentativePositions[symbol] = {
+        symbol,
+        assetClass,
+        qty: newQty,
+        avgPriceUsd: newAvgPriceUsd,
+        openedAt,
+        multiplier,
+        option,
+        groupId,
+        structure,
+      };
+    }
+    let marginDebtUsd = round2(Math.max(0, -cashUsd));
+    if (marginDebtUsd > EPSILON) {
+      let positionsValue = 0;
+      for (const [sym, position] of Object.entries(tentativePositions)) {
+        const mark = sym === symbol ? price : (markFor(record, sym, {}, null) ?? (Number(position.avgPriceUsd) || 0));
+        positionsValue += (Number(position.qty) || 0) * mark * (Number(position.multiplier) || 1);
+      }
+      const equityUsd = round2(cashUsd + positionsValue);
+      const debt = round2(-cashUsd);
+      if (!allowMargin) {
+        fail(MARGIN_LIMIT, `agent "${agentId}" has no margin permission: fill would borrow ${debt.toFixed(2)} USD`, {
+          agentId,
+          symbol,
+          marginDebtUsd: debt,
+        });
+      }
+      if (!(equityUsd > 0) || debt > round2(maxMarginPctEquity * equityUsd) + 0.005) {
+        fail(MARGIN_LIMIT, `margin limit exceeded: debt ${debt.toFixed(2)} > ${round2(maxMarginPctEquity * equityUsd).toFixed(2)} (${maxMarginPctEquity} of equity ${equityUsd.toFixed(2)})`, {
+          agentId,
+          symbol,
+          marginDebtUsd: debt,
+          equityUsd,
+        });
+      }
+      marginDebtUsd = debt;
+    }
+
+    // ---- commit -------------------------------------------------------------
+    record.cashUsd = cashUsd;
+    record.positions = tentativePositions;
+    record.markPrices = { ...record.markPrices, [symbol]: price };
+    record.realizedPlUsd = round8(record.realizedPlUsd + realizedPlUsd);
+    record.trades += 1;
+    if (direction === 'buy') record.grossSpendUsd = round8(record.grossSpendUsd + notionalUsd);
+    else record.grossRevenueUsd = round8(record.grossRevenueUsd + notionalUsd);
+    const fillRecord = {
+      symbol,
+      assetClass,
+      side: direction,
+      qty: quantity,
+      qtySigned: delta,
+      priceUsd: price,
+      multiplier,
+      notionalUsd,
+      realizedPlUsd,
+      option,
+      groupId,
+      structure,
+      atMs,
+      at: atIso,
+      orderId: fill.orderId ?? null,
+    };
+    record.fills.push(fillRecord);
+    record.events.push({
+      atMs,
+      kind: 'fill',
+      side: direction,
+      amountUsd: direction === 'buy' ? -notionalUsd : notionalUsd,
+      symbol,
+      qty: quantity,
+      realizedPlUsd,
+      assetClass,
+    });
+    if (record.firstProfitAt === null && round2(record.realizedPlUsd - record.costsUsd) > 0) {
+      record.firstProfitAt = atIso;
+    }
+    record.updatedAt = atIso;
+    pruneEvents(record);
+    return {
+      realizedPlUsd,
+      position: record.positions[symbol] ? viewPosition(record, record.positions[symbol]) : null,
+      cashUsd: record.cashUsd,
+      marginDebtUsd,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // costs / transfers / capital
+  // -------------------------------------------------------------------------
 
   /** Attribute a cost (inference, data, hosting) to an agent and a role. */
   function charge(agentId, amountUsd, { category = 'inference', role = 'executor', ref = null, at } = {}) {
@@ -211,113 +656,6 @@ export function createLedger({ paths, config, clock } = {}) {
     record.updatedAt = new Date(atMs).toISOString();
     pruneEvents(record);
     return { balanceUsd: record.cashUsd, record: clone(record) };
-  }
-
-  /**
-   * Apply a broker fill to the virtual book: buys debit cash, sells realize P&L.
-   * Selling more than the book holds is refused (D2: no shorting).
-   *
-   * @returns {{ realizedPlUsd: number, position: object|null }}
-   */
-  function applyFill(agentId, { symbol, side, qty, priceUsd, at, orderId = null } = {}) {
-    const record = requireRecord(agentId);
-    const symbolKey = String(symbol ?? '').toUpperCase();
-    if (symbolKey === '') fail('CONFIG_INVALID', 'applyFill requires a symbol', { agentId });
-    const direction = String(side ?? '').toLowerCase();
-    if (!['buy', 'sell'].includes(direction)) {
-      fail('CONFIG_INVALID', 'applyFill side must be "buy" or "sell"', { agentId, side });
-    }
-    const quantity = round4(Number(qty));
-    const price = round4(Number(priceUsd));
-    if (!Number.isFinite(quantity) || quantity <= 0) fail('CONFIG_INVALID', 'fill qty must be > 0', { agentId, qty });
-    if (!Number.isFinite(price) || price <= 0) fail('CONFIG_INVALID', 'fill priceUsd must be > 0', { agentId, priceUsd });
-    const atMs = normalizeAt(at, currentClock);
-    const atIso = new Date(atMs).toISOString();
-    const notional = round2(quantity * price);
-
-    const existing = record.positions[symbolKey];
-    let realizedPlUsd = 0;
-    let position = null;
-
-    if (direction === 'buy') {
-      if (notional > record.cashUsd + EPSILON) {
-        fail('INSUFFICIENT_CASH', `agent "${agentId}" cannot buy ${symbolKey}: cash is ${record.cashUsd.toFixed(2)}, cost is ${notional.toFixed(2)}`, {
-          agentId,
-          symbol: symbolKey,
-          notionalUsd: notional,
-          cashUsd: record.cashUsd,
-        });
-      }
-      record.cashUsd = round2(record.cashUsd - notional);
-      record.grossSpendUsd = round2(record.grossSpendUsd + notional);
-      const heldQty = round4(Number(existing?.qty) || 0);
-      const heldCost = round4(Number(existing?.avgPriceUsd) || 0) * heldQty;
-      const totalQty = round4(heldQty + quantity);
-      const avgPriceUsd = round4((heldCost + quantity * price) / totalQty);
-      record.positions[symbolKey] = {
-        qty: totalQty,
-        avgPriceUsd,
-        openedAt: existing?.openedAt ?? atIso,
-      };
-      position = clone(record.positions[symbolKey]);
-      record.trades += 1;
-      record.events.push({ atMs, kind: 'fill', side: 'buy', amountUsd: -notional, symbol: symbolKey, qty: quantity });
-    } else {
-      const heldQty = round4(Number(existing?.qty) || 0);
-      if (heldQty <= EPSILON) {
-        fail('BRAKE_DENIED', `agent "${agentId}" cannot sell ${symbolKey}: no position (D2 no shorting)`, {
-          agentId,
-          symbol: symbolKey,
-          positionQty: 0,
-          brake: 'MARGIN_FORBIDDEN',
-        });
-      }
-      if (quantity - heldQty > EPSILON) {
-        fail('BRAKE_DENIED', `agent "${agentId}" cannot sell ${quantity} ${symbolKey}: only ${heldQty} held (D2 no shorting)`, {
-          agentId,
-          symbol: symbolKey,
-          positionQty: heldQty,
-          brake: 'MARGIN_FORBIDDEN',
-        });
-      }
-      const avgPriceUsd = round4(Number(existing?.avgPriceUsd) || 0);
-      realizedPlUsd = round2((price - avgPriceUsd) * quantity);
-      record.cashUsd = round2(record.cashUsd + notional);
-      record.realizedPlUsd = round2(record.realizedPlUsd + realizedPlUsd);
-      record.grossRevenueUsd = round2(record.grossRevenueUsd + notional);
-      const remainingQty = round4(heldQty - quantity);
-      if (remainingQty <= EPSILON) delete record.positions[symbolKey];
-      else record.positions[symbolKey] = { ...existing, qty: remainingQty, avgPriceUsd };
-      position = record.positions[symbolKey] ? clone(record.positions[symbolKey]) : null;
-      record.trades += 1;
-      record.events.push({
-        atMs,
-        kind: 'fill',
-        side: 'sell',
-        amountUsd: notional,
-        symbol: symbolKey,
-        qty: quantity,
-        realizedPlUsd,
-      });
-      if (record.firstProfitAt === null && round2(record.realizedPlUsd - record.costsUsd) > 0) {
-        record.firstProfitAt = atIso;
-      }
-    }
-
-    record.fills.push({
-      symbol: symbolKey,
-      side: direction,
-      qty: quantity,
-      priceUsd: price,
-      notionalUsd: notional,
-      realizedPlUsd,
-      atMs,
-      at: atIso,
-      orderId,
-    });
-    record.updatedAt = atIso;
-    pruneEvents(record);
-    return { realizedPlUsd, position };
   }
 
   /**
@@ -367,45 +705,125 @@ export function createLedger({ paths, config, clock } = {}) {
     }
     const atMs = normalizeAt(at, currentClock);
     const record = ensureRecord(agentId, { endowmentUsd: 0, at: atMs });
-    record.cashUsd = round2(record.cashUsd + amount);
+    record.cashUsd = round8(record.cashUsd + amount);
     record.events.push({ atMs, kind: 'grant', amountUsd: amount, reason });
     record.updatedAt = new Date(atMs).toISOString();
     pruneEvents(record);
+    return { balanceUsd: record.cashUsd };
   }
 
-  /** Mark an agent at current prices and return the equity decomposition. */
+  /**
+   * One-time capital top-up (the v3 $20 → $50 migration): creates cash like a genesis
+   * grant but is recorded as configured capital, never as trading P&L.
+   */
+  function credit(agentId, amountUsd, { category = 'capital', reason = 'capital-topup', at } = {}) {
+    if (typeof agentId !== 'string' || agentId === '') {
+      fail('CONFIG_INVALID', 'credit requires a non-empty agentId', { agentId });
+    }
+    const amount = round2(Number(amountUsd));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      fail('CONFIG_INVALID', 'credit amount must be a positive finite number', { amountUsd });
+    }
+    const atMs = normalizeAt(at, currentClock);
+    const record = ensureRecord(agentId, { endowmentUsd: 0, at: atMs });
+    record.cashUsd = round8(record.cashUsd + amount);
+    record.creditsUsd = round8((Number(record.creditsUsd) || 0) + amount);
+    record.events.push({ atMs, kind: 'credit', amountUsd: amount, category, reason });
+    record.updatedAt = new Date(atMs).toISOString();
+    pruneEvents(record);
+    return { balanceUsd: record.cashUsd, creditsUsd: record.creditsUsd };
+  }
+
+  // -------------------------------------------------------------------------
+  // valuation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mark an agent at current prices and return the equity decomposition.
+   * Stocks: qty * price. Options: contracts * premium * multiplier. Signed positions
+   * contribute signed market value; unrealized P&L uses the signed cost basis.
+   */
   function equity(agentId, prices = {}) {
     const record = requireRecord(agentId);
     let positionsValueUsd = 0;
     let costBasisUsd = 0;
+    let unrealizedPlUsd = 0;
+    let grossExposureUsd = 0;
+    let netExposureUsd = 0;
     const marks = {};
     for (const [symbol, position] of Object.entries(record.positions)) {
-      const heldQty = Number(position.qty) || 0;
-      if (heldQty === 0) continue;
-      const candidate = priceLookup(prices, symbol);
-      const mark = Number.isFinite(Number(candidate)) && Number(candidate) > 0
-        ? Number(candidate)
-        : Number(record.markPrices?.[symbol]) > 0
-          ? Number(record.markPrices[symbol])
-          : Number(position.avgPriceUsd) || 0;
+      const qty = Number(position.qty) || 0;
+      if (qty === 0) continue;
+      const multiplier = Number(position.multiplier) || 1;
+      const mark = markFor(record, symbol, prices, null) ?? (Number(position.avgPriceUsd) || 0);
       marks[symbol] = mark;
-      positionsValueUsd += heldQty * mark;
-      costBasisUsd += heldQty * (Number(position.avgPriceUsd) || 0);
+      const marketValue = qty * mark * multiplier;
+      positionsValueUsd += marketValue;
+      netExposureUsd += marketValue;
+      grossExposureUsd += Math.abs(marketValue);
+      costBasisUsd += qty * (Number(position.avgPriceUsd) || 0) * multiplier;
+      unrealizedPlUsd += (mark - (Number(position.avgPriceUsd) || 0)) * qty * multiplier;
     }
     const roundedPositionsValue = round2(positionsValueUsd);
-    const unrealizedPlUsd = round2(positionsValueUsd - costBasisUsd);
+    const roundedUnrealized = round2(unrealizedPlUsd);
     const equityUsd = round2(record.cashUsd + roundedPositionsValue);
+    const marginDebtUsd = round2(Math.max(0, -record.cashUsd));
     record.markPrices = { ...record.markPrices, ...marks };
-    record.lastUnrealizedUsd = unrealizedPlUsd;
+    record.lastUnrealizedUsd = roundedUnrealized;
+    record.lastMarginDebtUsd = marginDebtUsd;
+    record.lastGrossExposureUsd = round2(grossExposureUsd);
+    record.lastNetExposureUsd = round2(netExposureUsd);
     record.updatedAt = currentClock.iso();
-    const netPlUsd = round2(record.realizedPlUsd - record.costsUsd + unrealizedPlUsd);
+    const netPlUsd = round2(record.realizedPlUsd - record.costsUsd + roundedUnrealized);
     if (record.firstProfitAt === null && netPlUsd > 0) record.firstProfitAt = currentClock.iso();
     return {
       equityUsd,
       cashUsd: record.cashUsd,
       positionsValueUsd: roundedPositionsValue,
-      unrealizedPlUsd,
+      unrealizedPlUsd: roundedUnrealized,
+      marginDebtUsd,
+      grossExposureUsd: round2(grossExposureUsd),
+      netExposureUsd: round2(netExposureUsd),
+      longExposureUsd: round2(Math.max(0, netExposureUsd)),
+      shortExposureUsd: round2(Math.max(0, -netExposureUsd)),
     };
+  }
+
+  /** Grouped (spread) P&L view: leg symbols, open contracts and realized P&L per groupId. */
+  function groups(agentId) {
+    const record = requireRecord(agentId);
+    /** @type {Record<string, object>} */
+    const out = {};
+    for (const fill of record.fills) {
+      if (!fill.groupId) continue;
+      const group = (out[fill.groupId] ??= {
+        groupId: fill.groupId,
+        structure: fill.structure ?? null,
+        legs: [],
+        realizedPlUsd: 0,
+        trades: 0,
+        openContracts: 0,
+      });
+      if (fill.structure) group.structure = fill.structure;
+      if (!group.legs.includes(fill.symbol)) group.legs.push(fill.symbol);
+      group.realizedPlUsd = round2(group.realizedPlUsd + (Number(fill.realizedPlUsd) || 0));
+      group.trades += 1;
+    }
+    for (const position of Object.values(record.positions)) {
+      if (!position.groupId) continue;
+      const group = (out[position.groupId] ??= {
+        groupId: position.groupId,
+        structure: position.structure ?? null,
+        legs: [],
+        realizedPlUsd: 0,
+        trades: 0,
+        openContracts: 0,
+      });
+      if (!group.legs.includes(position.symbol)) group.legs.push(position.symbol);
+      if (position.structure) group.structure = position.structure;
+      group.openContracts += Math.abs(Number(position.qty) || 0);
+    }
+    return Object.values(out);
   }
 
   /** Trailing 7-day net: realized P&L (window) + current unrealized − costs (window). */
@@ -416,28 +834,54 @@ export function createLedger({ paths, config, clock } = {}) {
     let costs = 0;
     for (const event of record.events) {
       if (!(Number(event.atMs) >= cutoff)) continue;
-      if (event.kind === 'fill' && event.side === 'sell') realized += Number(event.realizedPlUsd) || 0;
+      if (event.kind === 'fill' && (event.realizedPlUsd ?? 0) !== 0) realized += Number(event.realizedPlUsd) || 0;
       if (event.kind === 'cost') costs += Number(event.amountUsd) || 0;
     }
     return round2(realized - costs + (Number(record.lastUnrealizedUsd) || 0));
   }
 
-  /** Snapshot used for obituaries and status views (no broker reads). */
+  /** Snapshot used for obituaries, status views and the operator UI (no broker reads). */
   function snapshot(agentId) {
     const record = requireRecord(agentId);
+    const positions = clone(record.positions);
+    /** @type {object[]} */
+    const positionsList = [];
+    let positionsValueUsd = 0;
+    let grossExposureUsd = 0;
+    let netExposureUsd = 0;
+    for (const position of Object.values(record.positions)) {
+      const view = viewPosition(record, position);
+      positionsList.push(view);
+      positionsValueUsd += view.marketValueUsd;
+      grossExposureUsd += Math.abs(view.marketValueUsd);
+      netExposureUsd += view.marketValueUsd;
+    }
+    const marginDebtUsd = round2(Math.max(0, -record.cashUsd));
     return {
       cashUsd: record.cashUsd,
-      positions: clone(record.positions),
+      positions,
+      positionsList,
+      positionsValueUsd: round2(positionsValueUsd),
       realizedPlUsd: record.realizedPlUsd,
       unrealizedPlUsd: round2(Number(record.lastUnrealizedUsd) || 0),
       costsUsd: record.costsUsd,
       grossSpendUsd: record.grossSpendUsd,
       grossRevenueUsd: record.grossRevenueUsd,
+      creditsUsd: round2(Number(record.creditsUsd) || 0),
       trades: record.trades,
       net7dUsd: net7d(agentId),
       firstProfitAt: record.firstProfitAt,
       endowmentUsd: record.declaredEndowmentUsd,
       startedAt: record.startedAt,
+      marginDebtUsd,
+      grossExposureUsd: round2(grossExposureUsd),
+      netExposureUsd: round2(netExposureUsd),
+      longShares: Object.fromEntries(
+        Object.entries(record.positions)
+          .filter(([, position]) => position.assetClass === 'us_equity')
+          .map(([symbol, position]) => [symbol, round4(Math.max(0, Number(position.qty) || 0))]),
+      ),
+      groups: groups(agentId),
     };
   }
 
@@ -448,7 +892,8 @@ export function createLedger({ paths, config, clock } = {}) {
 
   /**
    * Recent fills for the operator/UI: newest first, bounded, with everything needed to show
-   * "past activity" (side, qty, price, notional, realized P&L, timestamp, order id).
+   * "past activity" (side, qty, price, notional, realized P&L, timestamp, order id,
+   * assetClass/option metadata for v3).
    * @param {string} agentId
    * @param {{ limit?: number }} [options]
    */
@@ -465,7 +910,7 @@ export function createLedger({ paths, config, clock } = {}) {
       const mark = Number(record.markPrices?.[symbol]) > 0
         ? Number(record.markPrices[symbol])
         : Number(position.avgPriceUsd) || 0;
-      positionsValueUsd += (Number(position.qty) || 0) * mark;
+      positionsValueUsd += (Number(position.qty) || 0) * mark * (Number(position.multiplier) || 1);
     }
     return round2(record.cashUsd + positionsValueUsd);
   }
@@ -535,21 +980,26 @@ export function createLedger({ paths, config, clock } = {}) {
     has,
     ids,
     book,
+    longSharesOf,
+    optionContractsOf,
+    hasCoveredShares,
     charge,
     applyFill,
     transfer,
     grant,
+    credit,
     equity,
     net7d,
     snapshot,
     roleCosts,
     history,
+    groups,
     pool,
     isAnchored,
     anchorToBrokerEquity,
     save,
     load,
-    /** Absolute path of the persisted ledger file (diagnostics only). */
+    /** @returns {string} absolute path of the persisted ledger file (diagnostics only). */
     get path() {
       return ledgerPath;
     },

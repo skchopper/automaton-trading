@@ -11,7 +11,7 @@ interval** in the agent table.
 
 Chosen architecture (user-approved): **Hybrid** — each population bot has its own isolated *agent
 brain* (own persona/context, own memory/policy journal, own decisions) reviewed on its cadence, while
-a per-bot execution layer acts inside that policy and the 14 brakes. Review budget: **~200
+a per-bot execution layer acts inside that policy and the 18 hard brakes (D1–D18). Review budget: **~200
 reviews/hour** (swing bots hourly; day bots every 5 minutes).
 
 ## Strategy taxonomy (`src/strategy-types.js`, Lead)

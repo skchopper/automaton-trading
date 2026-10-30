@@ -170,7 +170,7 @@ Each living agent gets its own **isolated** hourly news briefing (`docs/RESEARCH
 - **What it can do**: advise the Executor only. `AVOID`/`ALERT`/negative-sentiment/2+ risks veto
   a *new entry* (`research_veto`); positive sentiment scales the order size down (never up);
   `ALERT`/strong negative sentiment pushes an exit (`research_alert`). Every order still passes
-  the 14 brakes. Set `research.influence:false` for shadow mode (briefings logged, no effect).
+  the 18 hard brakes. Set `research.influence:false` for shadow mode (briefings logged, no effect).
 - **What it costs**: `research.costPerRunUsd` (default $0.001) is charged to **that agent's**
   ledger per successful briefing (category `research`, role `prospector`), so research shortens
   the agent's runway. Malformed/absent LLM answers are logged with no charge.
@@ -204,7 +204,7 @@ Each living agent gets its own **isolated** hourly news briefing (`docs/RESEARCH
 | Resume after stop | `node bin/automaton.mjs clear-kill`, then `run` again. The loop is not resurrected automatically. |
 | Inspect what the wall blocks | `node bin/automaton.mjs brakes --symbol AAPL --notional 500` — prints the decision + rule that would fire. |
 | Account/keys compromised | Stop the loop, stop the Reaper process, revoke the keys in the Alpaca dashboard. The plugin does not store keys. |
-| Going live | Edit `automaton.config.json` or env: `mode=live`, `allowLive=true`, then `node bin/automaton.mjs arm-live --confirm "ARM LIVE"` (creates `LIVE_ARMED`). Then start. All 14 brakes still apply; there is no margin, shorting, options, or transfers. |
+| Going live | Edit `automaton.config.json` or env: `mode=live`, `allowLive=true`, then `node bin/automaton.mjs arm-live --confirm "ARM LIVE"` (creates `LIVE_ARMED`). Then start. All 18 hard brakes still apply, including the v3.0 instrument gates D2/D15–D18 (paper-only shorting/options/margin; live remains triple-gated). |
 | Disarm live | Delete `automaton-data/LIVE_ARMED`, set `mode=paper` (or stop the loop first). |
 | Stale/orphaned Reaper after an app upgrade | The control panel shows the Reaper row (pid, alive, heartbeat). A Reaper without a matching heartbeat is from an older generation and `Start` refuses to reuse it: press **Operator: stop Reaper** (two-step confirm) in the panel, then Start again. If the Host cannot signal it, run this once in your own terminal: `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*reaper-process.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }` |
 
@@ -253,7 +253,7 @@ What this means in practice:
 - **Every ~60 s** the engine: fetches the shared market snapshot (1-minute IEX bars + latest IEX
   quotes for the 10 symbols), runs the Treasurer, then the Executor evaluates each bot's signal on
   the 1-minute bar series (momentum z-score, mean-reversion z, breakout vs prior 20-bar high, gap
-  fade), checks all 14 brakes, and places at most one order per bot per cycle. `maxDailyOrders: 12`
+  fade), checks all 18 hard brakes, and places at most one order per bot per cycle. `maxDailyOrders: 12`
   caps how often a bot may trade per day.
 - **Bar-based rules stay correct:** every rule expressed in bars (`maxHoldBars`) is now measured in
   *1-minute bars* (e.g. a 12-bar time stop = 12 minutes). The agent plan on the dashboard states the
@@ -351,6 +351,72 @@ applies next cycle, so minute-level reactions never wait on a model turn.
   = Day · intraday (1-minute lane). Genesis mixes a new population ~50/50; existing populations are
   rebalanced once on first start (genome family + strategy name refreshed, specs recompiled; ids,
   ledgers, positions and trade history are never touched).
+
+## 8d. Multi-instrument paper trading (v3.0)
+
+The population may now use margin, short selling, long calls/puts, defined-risk vertical spreads and
+covered calls. **Paper only**: live trading remains triple-gated by D8. The hard brake wall still runs
+before every order; the expansion changed D2 from a blanket denial into an instrument-permission gate
+plus new hard rules D15–D18.
+
+```json
+"population": { "initial": 30, "cap": 60 },
+"endowmentUsd": 50,
+"instruments": {
+  "enabled": true,
+  "allowMargin": true, "maxMarginPctEquity": 1,
+  "allowShort": true, "maxShortPctEquity": 1, "maxShortNotionalUsd": 25, "shortableOnly": true,
+  "allowOptions": true, "allowCoveredCalls": true, "allowSpreads": true,
+  "maxOptionPremiumPctEquity": 0.25, "maxOptionPremiumUsd": 25, "maxContracts": 3,
+  "minDTE": 2, "maxDTE": 14, "autoCloseDTE": 1,
+  "allowNakedShortOptions": false, "optionDataFeed": "indicative"
+}
+```
+
+- **Capital**: bots were raised from $20 to $50 (one-time +$30 capital top-up per alive bot, bounded by
+  the allocation cap; the top-up is credited to the bot's ledger and its endowment basis so it is not
+  counted as trading profit). 30 × $50 = $1,500 of the ~$2,000 paper account.
+- **Instruments**:
+  - *Long stock* — as before.
+  - *Short stock* — whole shares only, shortable+marginable assets, mandate short cap; buy-to-cover on
+    stop/target/max-hold/signal. Fractional shorts are rejected.
+  - *Long call/put* — debit premium, integer contracts, DTE window; exits on premium stop/target,
+    research ALERT, or the DTE auto-close.
+  - *Covered call* — sell-to-open only when the bot already holds ≥100 whole shares; closed at 50%
+    premium profit, stop, or the DTE guard. At $50/bot this is rare by design (100 shares of a typical
+    stock costs far more), and the brake denies it without the shares.
+  - *Vertical spreads* — bull-call, bear-put, bear-call credit and bull-put credit, two legs, same
+    underlying/expiry, defined maximum loss, submitted as one multi-leg order and closed together.
+  - **Naked short options are never allowed** (config validation rejects them).
+- **Active use**: every family has a bullish/bearish/neutral instrument playbook (momentum/meanrev
+  swing: stock or calls/puts, short or credit spreads; breakout day: calls/puts for leverage; gapfade
+  day: shorts/puts/premium selling). The bot's own agent may choose the structure explicitly via
+  `policy.instrument`; otherwise the playbook picks the first affordable structure and falls back to
+  stock/short when option premium cannot fit the cap. Option selection: nearest expiry inside the DTE
+  window, OTM strikes 2–5%, contracts = floor(option budget / premium×100), budget =
+  min(25% equity, $25/order, mandate cap) minus open option premium.
+- **Data/account facts (paper)**: options trading level 3, shorting enabled, margin multiplier 4.
+  Option contracts come from `/v2/options/contracts`, marks/quotes from
+  `/v1beta1/options/snapshots/{underlying}?feed=indicative`, orders use `position_intent` and mleg
+  `order_class` for spreads. The account exposes `buying_power`, `options_buying_power`,
+  `shorting_enabled`, `options_trading_level`.
+- **Risk rules**: D15 short sale (shorting enabled, shortable+marginable asset, whole shares, mandate
+  notional cap); D16 options (enabled structure, integer contracts ≤ maxContracts, premium ≤
+  maxOptionPremiumPctEquity×equity and ≤ per-order cap, DTE window; covered calls require 100+ shares;
+  spreads exactly 2 defined-risk legs; naked shorts denied); D17 margin (debt after order ≤ mandate and
+  ≤ maxMarginPctEquity×equity); D18 expiry guard (no opening below minDTE; close by autoCloseDTE;
+  sell-to-close always allowed). D1–D14 keep their meaning (D2 is the instrument gate); D4 skips equity price/spread ceilings for
+  option orders (premium caps replace them) while keeping the underlying whitelist.
+- **Death**: the Reaper liquidates signed stock and option positions (including spread groups) before
+  transferring residual cash and writing the obituary; shorts are bought back, options closed
+  sell/buy-to-close. Death is still outside the engine.
+- **Disable**: set `instruments.enabled: false` (v2 long-stock-only behaviour; short/options/margin
+  denied). Individual flags (`allowShort`, `allowOptions`, `allowSpreads`, `allowCoveredCalls`,
+  `allowMargin`) can be turned off independently. Restart the Host after config changes.
+- **Operator risk warning**: this is a capability expansion in a paper account. Margin, short selling
+  and short-dated options can lose more than the bot's cash in a real account; keep `mode=paper`,
+  `allowLive=false`, and treat the configured caps as hard limits. Live trading is not enabled by this
+  change.
 
 ## 9. Troubleshooting
 

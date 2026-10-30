@@ -85,16 +85,132 @@ export function classifyTreasuryState({ equityUsd, floorUsd, runwayHours }) {
   return 'CRITICAL';
 }
 
-/** Position marks derived from broker positions (marketValue/qty), overridden by quotes. */
+function positiveOrInfinity(value, fallback = Infinity) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Derive an agent's per-mandate instrument permissions and caps from
+ * `config.instruments` and the agent's current equity (docs/INSTRUMENTS.md).
+ *
+ * Missing `config.instruments` = v2 behaviour: long stock only, no short/options/margin.
+ *
+ * @param {object} config
+ * @param {number} equityUsd
+ * @returns {{ longStock: boolean, shortStock: boolean, longOptions: boolean,
+ *   shortOptions: boolean, coveredCalls: boolean, spreads: boolean, margin: boolean,
+ *   allowedStructures: string[], maxShortNotionalUsd: number, maxOptionPremiumUsd: number,
+ *   maxContracts: number, maxMarginUsd: number }}
+ */
+export function deriveInstrumentPermissions(config, equityUsd = 0) {
+  const raw = config?.instruments ?? {};
+  const enabled = raw.enabled !== false;
+  const allowMargin = enabled && raw.allowMargin === true;
+  const allowShort = enabled && raw.allowShort === true;
+  const allowOptions = enabled && raw.allowOptions === true;
+  const allowCoveredCalls = allowOptions && raw.allowCoveredCalls !== false;
+  const allowSpreads = allowOptions && raw.allowSpreads !== false;
+  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const equity = Math.max(0, Number(equityUsd) || 0);
+
+  const allowedStructures = [];
+  if (allowOptions) allowedStructures.push('long_call', 'long_put');
+  if (allowCoveredCalls) allowedStructures.push('covered_call');
+  if (allowSpreads) {
+    allowedStructures.push('call_credit_spread', 'put_credit_spread', 'bull_call_spread', 'bear_put_spread');
+  }
+
+  const maxShortNotionalUsd = round2(
+    Math.min(
+      positiveOrInfinity(raw.maxShortNotionalUsd),
+      num(raw.maxShortPctEquity, 1) * equity,
+    ),
+  );
+  const maxOptionPremiumUsd = round2(
+    Math.min(
+      positiveOrInfinity(raw.maxOptionPremiumUsd),
+      num(raw.maxOptionPremiumPctEquity, 0.25) * equity,
+    ),
+  );
+  const maxMarginUsd = round2(
+    Math.min(
+      positiveOrInfinity(raw.maxMarginUsd),
+      num(raw.maxMarginPctEquity, 1) * equity,
+    ),
+  );
+  const maxContractsRaw = Number(raw.maxContracts);
+  const maxContracts = allowOptions && Number.isFinite(maxContractsRaw) && maxContractsRaw > 0
+    ? Math.floor(maxContractsRaw)
+    : 0;
+
+  return {
+    longStock: true,
+    shortStock: allowShort,
+    longOptions: allowOptions,
+    shortOptions: allowOptions && (allowCoveredCalls || allowSpreads),
+    coveredCalls: allowCoveredCalls,
+    spreads: allowSpreads,
+    margin: allowMargin,
+    allowedStructures,
+    maxShortNotionalUsd: allowShort ? maxShortNotionalUsd : 0,
+    maxOptionPremiumUsd: allowOptions ? maxOptionPremiumUsd : 0,
+    maxContracts,
+    maxMarginUsd: allowMargin ? maxMarginUsd : 0,
+  };
+}
+
+/** Operator/status summary of the instrument regime (no secrets; account fields pass through). */
+export function instrumentSummary(config, account = null) {
+  const raw = config?.instruments ?? {};
+  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const accountView = {};
+  for (const key of [
+    'buyingPowerUsd',
+    'optionsBuyingPowerUsd',
+    'marginMultiplier',
+    'shortingEnabled',
+    'optionsTradingLevel',
+    'marginDebtUsd',
+    'regtBuyingPowerUsd',
+  ]) {
+    if (account && account[key] !== undefined && account[key] !== null) {
+      accountView[key] = typeof account[key] === 'boolean' ? account[key] : round2(account[key]);
+    }
+  }
+  return {
+    enabled: raw.enabled !== false,
+    allowMargin: raw.allowMargin === true,
+    allowShort: raw.allowShort === true,
+    allowOptions: raw.allowOptions === true,
+    allowCoveredCalls: raw.allowCoveredCalls !== false,
+    allowSpreads: raw.allowSpreads !== false,
+    maxMarginPctEquity: num(raw.maxMarginPctEquity, 1),
+    maxShortPctEquity: num(raw.maxShortPctEquity, 1),
+    maxOptionPremiumPctEquity: num(raw.maxOptionPremiumPctEquity, 0.25),
+    maxContracts: Number.isFinite(Number(raw.maxContracts)) ? Math.floor(Number(raw.maxContracts)) : 0,
+    minDTE: num(raw.minDTE, 2),
+    maxDTE: num(raw.maxDTE, 14),
+    autoCloseDTE: num(raw.autoCloseDTE, 1),
+    optionDataFeed: raw.optionDataFeed ?? 'indicative',
+    allowNakedShortOptions: false,
+    account: accountView,
+  };
+}
+
+/** Position marks derived from broker positions (marketValue/qty/multiplier), overridden by quotes. */
 function marksFromPositions(brokerPositions, prices = {}) {
   const marks = isPlainObject(prices) ? { ...prices } : {};
   for (const position of brokerPositions ?? []) {
     const symbol = String(position?.symbol ?? '').toUpperCase();
     if (symbol === '') continue;
-    const qty = Number(position?.qty);
+    const qty = Number(position?.qtySigned ?? position?.qty);
+    const multiplier = position?.assetClass === 'us_option' ? Number(position?.multiplier) || 100 : 1;
     const marketValue = Number(position?.marketValueUsd);
-    if (Number.isFinite(qty) && qty !== 0 && Number.isFinite(marketValue) && marketValue > 0) {
-      marks[symbol] = round4(Math.abs(marketValue / qty));
+    if (Number.isFinite(qty) && qty !== 0 && Number.isFinite(marketValue) && marketValue !== 0) {
+      // Options are quoted per share but valued at contracts × premium × 100; normalize by both so
+      // a $4.68 call never marks as $468 (the 100x equity inflation that halted reconciliation).
+      marks[symbol] = round4(Math.abs(marketValue / (qty * multiplier)));
     }
   }
   return marks;
@@ -126,12 +242,22 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
   }
 
   function mapAccount(account) {
-    return {
+    const view = {
       equityUsd: round2(Number(account?.equityUsd) || 0),
       cashUsd: round2(Number(account?.cashUsd) || 0),
       buyingPowerUsd: round2(Number(account?.buyingPowerUsd) || 0),
       status: String(account?.status ?? 'UNKNOWN'),
     };
+    // v3: options/short/margin account facts (pass-through only, never invented).
+    for (const key of ['optionsBuyingPowerUsd', 'regtBuyingPowerUsd']) {
+      if (account && Number.isFinite(Number(account[key]))) view[key] = round2(Number(account[key]));
+    }
+    if (account && Number.isFinite(Number(account.marginMultiplier))) view.marginMultiplier = Number(account.marginMultiplier);
+    if (account && typeof account.shortingEnabled === 'boolean') view.shortingEnabled = account.shortingEnabled;
+    if (account && Number.isFinite(Number(account.optionsTradingLevel))) view.optionsTradingLevel = Number(account.optionsTradingLevel);
+    if (account && Number.isFinite(Number(account.marginDebtUsd))) view.marginDebtUsd = round2(Number(account.marginDebtUsd));
+    if (account && typeof account.currency === 'string') view.currency = account.currency;
+    return view;
   }
 
   async function fetchBrokerState() {
@@ -172,6 +298,7 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
 
   function buildMandate(view, { allowExitOnly, at, atMs, ordersToday, accountEquityUsd, allocatedEquityUsd }) {
     const cap = sizeCapFor(view.equityUsd);
+    const instruments = deriveInstrumentPermissions(config, view.equityUsd);
     return {
       agentId: view.agentId,
       issuedAt: at,
@@ -187,6 +314,9 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       // Account-level context for the D13 order-time allocation wall (never account cash).
       accountEquityUsd: Number.isFinite(accountEquityUsd) ? round2(accountEquityUsd) : null,
       allocatedEquityUsd: Number.isFinite(allocatedEquityUsd) ? round2(allocatedEquityUsd) : null,
+      // v3: the agent's own equity (executor sizing) + instrument permissions/caps.
+      equityUsd: round2(view.equityUsd),
+      instruments,
     };
   }
 
@@ -213,6 +343,10 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       halted: true,
       haltReasons: ['broker_unavailable'],
       replication: { surplusOk: false, runwayOk: false, populationOk: false, allocationOk: false },
+      instruments: instrumentSummary(config, cachedAccount ?? null),
+      marginDebtUsd: 0,
+      grossExposureUsd: 0,
+      netExposureUsd: 0,
       errors,
     };
   }
@@ -301,6 +435,11 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
           ordersToday,
           roleCosts: ledger.roleCosts(id),
           positions: book.positions,
+          // v3: exposure/margin + the instrument permissions this agent would receive.
+          marginDebtUsd: eq.marginDebtUsd ?? 0,
+          grossExposureUsd: eq.grossExposureUsd ?? 0,
+          netExposureUsd: eq.netExposureUsd ?? 0,
+          instruments: deriveInstrumentPermissions(config, eq.equityUsd),
         });
       } catch (error) {
         errors.push({ scope: 'agent', agentId: id, error: errorInfo(error) });
@@ -400,10 +539,15 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
         verdicts,
         halted,
         haltReasons,
+        instruments: instrumentSummary(config, account),
       });
     } catch (error) {
       errors.push({ scope: 'persist-treasury', error: errorInfo(error) });
     }
+
+    const marginDebtUsd = round2(sum(agentViews.map((view) => Number(view.marginDebtUsd) || 0)));
+    const grossExposureUsd = round2(sum(agentViews.map((view) => Number(view.grossExposureUsd) || 0)));
+    const netExposureUsd = round2(sum(agentViews.map((view) => Number(view.netExposureUsd) || 0)));
 
     const result = {
       at,
@@ -428,6 +572,10 @@ export function createTreasurer({ broker, ledger, registry, journal, config, pat
       replication,
       population: registry.population(),
       marks,
+      instruments: instrumentSummary(config, account),
+      marginDebtUsd,
+      grossExposureUsd,
+      netExposureUsd,
       errors,
     };
     lastTick = result;

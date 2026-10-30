@@ -27,6 +27,7 @@ obituary the living read.
 | Richer agent detail | Strategy & plan (summary, entry/exit/risk rules, next step, triggers, position plan, next research), full transaction history, ranking badges, day/week/month P&L |
 | Strategy taxonomy | Per-bot **strategy type** + **estimated trading interval** columns, category tabs (All / Swing · mid-long / Day · intraday with counts) and category-coloured chips |
 | Per-bot agent brains | Each bot has its own agent brain (isolated per-bot reviews): a **Bot agent** section (stance, size/risk multipliers, confidence, thesis, plan, watch list, review count, last/next review, stale warning) plus a small engine-level bridge line |
+| Multi-instrument v3.0 | Margin, short selling, long options, defined-risk spreads and covered calls: LONG/SHORT/CALL/PUT position rendering (strike, expiry, DTE, contracts, spread group), per-bot Instruments badges, Instrument playbook, policy instrument plan, and an engine header instruments/exposure line |
 
 Everything is dependency-free ESM with no build step; the browser module is loaded as
 plain JavaScript (`./client`). `dsh.client.inject` orders the client half after the real
@@ -46,8 +47,10 @@ from the parent, e.g. `Momentum AAPL`) and **Trading (spec)** (the compiled hypo
 Builder actually trades — it can differ from the genome, shown with a `≠` marker), the
 **Strategy type** chip (`Momentum swing` / `Mean-reversion swing` / `Intraday breakout` /
 `Day-trade gap fade`, colour-coded by category), the **Est. interval** (`~30s` / `~5m` /
-`~1h` …), research badge, equity, USD/percent P&L, day P&L, net-7d, a runway bar, treasury
-state, alive/dead/condemned status plus cause, and a positions/trades count.
+`~1h` …), a compact **Instruments** badge (`Stk` / `Short` / `Opt` / `Spreads` /
+`Margin`, tooltip lists the allowed structures), research badge, equity, USD/percent P&L,
+day P&L, net-7d, a runway bar, treasury state, alive/dead/condemned status plus cause, and
+a positions/trades count.
 
 Above the table, **category tabs** filter the population by strategy class:
 `All (n) / Swing · mid-long (n) / Day · intraday (n)` — counts come from
@@ -60,16 +63,19 @@ stacked below on narrow ones; `Esc` or the × closes it):
 - header: name, status, generation, born/died, cause, note, parent/mutation, equity,
   cash, positions value, endowment, day/net-7d P&L, realized/unrealized P&L, runway,
   drawdown, first-profit time, compiled-spec timestamp;
-- **Current holdings** table: symbol, qty, avg price, last price, market value,
-  unrealized P&L, opened-at (empty state "No open positions.");
+- **Current holdings** table: LONG/SHORT stock and CALL/PUT option rows — side chip, qty
+  (contracts for options), avg/premium, market value, unrealized P&L, option strike,
+  expiry + DTE, spread-group tag, and a totals line with gross/net exposure and margin
+  debt when reported (empty state "No open positions.");
 - **Past activity**: the last fills newest-first — side, symbol, qty, price, notional,
   realized P&L, time (empty state "No trades yet · market closed.");
 - **Strategy parameters** for both the inherited **genome** and the compiled **spec**
   (lookback / entryZ / exitZ / stop / target / max-hold / size / session), with a warning
   when the compiled spec differs, and a note when an agent has no compiled spec yet;
-- **Strategy & plan**, **Transactions**, **ranking badges**, the **Bot agent** section and
-  the research section — see “Agent detail: strategy & plan, transactions, rankings” and
-  “Strategy types & per-bot agent brains” below;
+- **Strategy & plan**, **Transactions**, **ranking badges**, the **Bot agent** section
+  (including the chosen instrument plan), the **Instrument playbook** block and the
+  research section — see the “Agent detail”, “Strategy types & per-bot agent brains” and
+  “Multi-instrument paper trading (v3.0)” sections below;
 - **Role costs** per role (treasurer / prospector / builder / executor / replicator /
   reaper).
 
@@ -144,6 +150,42 @@ warning (the executor then falls back to the last valid policy or the baseline).
 state: "bot agent has not reviewed yet (first review pending)". `GET /automaton/state`
 carries `strategyMix`, `engine.agents`, each agent's `strategy` and `policy`; every new
 field is optional so the panel still renders on older engine builds.
+
+### Multi-instrument paper trading (v3.0)
+
+The bots may use **margin, short selling, long options, defined-risk spreads and covered
+calls** in paper trading (live is still triple-gated; the **18 hard brakes (D1–D18)** —
+including the instrument gates D2/D15–D18 — remain authoritative and run first). Structures: single-leg
+`long_call`/`long_put`, `covered_call` (needs ≥100 long shares), and two-leg vertical
+spreads (`call_credit_spread`, `put_credit_spread`, `bull_call_spread`,
+`bear_put_spread`) submitted as one mleg order and linked by an internal `groupId`.
+Naked short options are never allowed; `minDTE ≥ 1` (default window 2–14, auto-close at
+≤1 DTE).
+
+- **Positions**: the detail holdings table renders LONG/SHORT stock (SHORT in a warning
+  tone with negative qty) and CALL/PUT options with strike, expiry, DTE, contracts,
+  multiplier-marked market value, and the spread group tag. A totals line aggregates
+  stock/option counts, spread groups, gross/net exposure and margin debt when the engine
+  reports them.
+- **Instruments badge**: each agent row shows `Stk · Short · Opt · Spreads · Margin`
+  derived from `agent.instrumentPermissions` (or `agent.instruments`), with the allowed
+  structures in the tooltip and the playbook hint when present.
+- **Instrument playbook**: the detail pane shows the family playbook
+  (`agent.playbook`): bullish / bearish / neutral structures plus the full structure list
+  (unknown structure keys render raw).
+- **Policy instrument plan**: the Bot agent section shows the chosen plan
+  (`agent.policy.instrument`): prefer (`auto` or a structure label), max premium, max
+  contracts and the DTE window.
+- **Engine header**: a small instruments line from `status.instruments` —
+  `Options L3 · Short · Margin 4x · caps: options ≤25% eq · short ≤100% eq · max contracts
+  3 · DTE 2–14` — plus account options buying power, margin debt and gross/net exposure
+  when available; a soft "instrument status not reported yet" note otherwise.
+- **Status fields**: `GET /automaton/state` passes `instruments` through, and agent
+  positions may carry `assetClass`, `side` (LONG/SHORT/CALL/PUT), `qtySigned`, `option
+  {underlying,strikeUsd,expiration,dte,type}`, `multiplier` and `groupId`; the account may
+  carry `optionsBuyingPowerUsd`, `marginMultiplier`, `shortingEnabled`,
+  `optionsTradingLevel`, `marginDebtUsd`, `grossExposureUsd`, `netExposureUsd`. Every new
+  field is optional, so older snapshots render the empty states.
 
 ### Research sidecar — isolated hourly analyst
 
@@ -315,6 +357,16 @@ so the new client module + routes load), verify:
 11. Bot-agent bridge: the header line shows "Bot agents · configured · provider/model ·
     Day ~5m · Swing ~1h · runs/errors · next review" once `engine.agents` is present, and
     the generic "bot-agent bridge not configured yet" note otherwise.
+12. Instruments: the header shows the multi-instrument line (Options level, Short, Margin
+    multiplier, caps, options BP / margin debt / gross-net exposure) and each agent row
+    shows the Instruments badge; the holdings table renders LONG/SHORT stock and CALL/PUT
+    options with strike/expiry/DTE/contracts and spread-group tags, with the totals line
+    for exposure/margin debt.
+13. Instrument playbook + plan: a selected agent shows the family playbook
+    (bullish/bearish/neutral structures) and the Bot agent section shows the chosen
+    instrument plan (prefer + premium/contracts/DTE caps); with an engine that has no
+    v3.0 fields yet the panel shows the soft "instrument status not reported yet" /
+    "no instrument permissions yet" / "no instrument playbook" empty states.
 
 ## Configuration
 
@@ -359,7 +411,7 @@ stays in the engine's layered config.
 | `automaton_tick` | Run exactly one cycle now; returns trace + refreshed status. |
 | `automaton_agents` | Population rows with generation, equity, runway, state, cause; optional genomes. |
 | `automaton_obituaries` | Newest-first death journal, `limit` (1–200) and `cause` filter. |
-| `automaton_brakes` | The 14 brake rules (D1–D14), kill-switch/live-armed state, and an **operator dry-run** pre-trade check when `symbol` is given. Advisory only — places no order. |
+| `automaton_brakes` | The 18 hard brake rules (D1–D18), kill-switch/live-armed state, and an **operator dry-run** pre-trade check when `symbol` is given. Advisory only — places no order. |
 | `automaton_simulate` | Accelerated deterministic mortality simulation (`cycles`, `population`, `seed`), no broker/network. |
 | `automaton_config` | Effective redacted config + layer sources; no credential material. |
 | `automaton_emergency_stop` | Requires `confirm: "STOP"`. Arms the `KILL_SWITCH` marker (checked before every order/cycle), stops the loop, leaves the Reaper running. |
@@ -385,10 +437,11 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
   terminal — a deliberate operator escape hatch for orphaned stale-generation Reapers,
   never exposed to agents. An alive Reaper without a version-2 heartbeat makes
   `engine.start()` refuse with `REAPER_UNAVAILABLE` until the operator stops it.
-- **14 brakes in code, not prompts.** No transfers/withdrawals, no margin/shorting/options,
-  session window, symbol/size/order caps, daily-loss and drawdown death rules, proof-or-nothing
-  builds, population cap, kill switch, external Reaper isolation, allocation cap, and
-  one-way death (no resurrection). See `docs/ARCHITECTURE.md`.
+- **18 hard brakes in code, not prompts.** No transfers/withdrawals (D1); instruments are
+  gated by D2/D15–D18 (short sale, options incl. never naked short options, margin debt,
+  expiry/assignment guard); session window, symbol/size/order caps, daily-loss and drawdown
+  death rules, proof-or-nothing builds, population cap, kill switch, external Reaper
+  isolation, allocation cap, and one-way death (no resurrection). See `docs/ARCHITECTURE.md`.
 - **Controls are local-only.** `POST /automaton/control` is loopback-only and is the only
   write surface the UI has. `start`/`stop`/`emergency-stop` map exactly to
   `engine.start` / `engine.stop` / `engine.emergencyStop`; `emergency-stop` and the
@@ -409,9 +462,17 @@ Errors are mapped to stable codes (`LIVE_NOT_ARMED`, `CONFIRM_REQUIRED`,
   no UI button can clear it.
 - **Research is advisory.** The per-agent analyst has no order tool, no wallet access and
   no shared memory; its briefing can only veto/resize/exit through the agent's own
-  executor, and every order still passes the 14 brakes. If the LLM is unavailable
+  executor, and every order still passes the 18 hard brakes. If the LLM is unavailable
   (`configured:false`) trading continues deterministically and stale briefings are ignored.
   Research cost is charged to the agent's own ledger like any other inference cost.
+- **Multi-instrument expansion is paper-only and capped.** Margin, shorting, options,
+  covered calls and defined-risk spreads are enabled in paper mode; live stays
+  triple-gated. The brakes gate every instrument order first (D15 short sale, D16 options
+  incl. no naked short options, D17 margin cap, D18 expiry/assignment guard), and the
+  panel only displays the caps from `status.instruments` (e.g. options ≤25% of equity,
+  shorting ≤100% of equity, max contracts 3, DTE 2–14) — it cannot place, size or modify an
+  order. Short/option/margin figures shown are informational; the engine and the external
+  Reaper remain the source of truth.
 - **Secrets:** never returned by tools, the state route, or the dashboard. `configView`
   exposes only the env-file path and credential source signature. LLM failures are logged
   as scrubbed, structured errors — never credentials or full provider payloads.
@@ -432,10 +493,10 @@ file in-process with `node test/plugin.test.js` or disable test isolation as sho
 
 Layout: `index.js` (Host tools + state/control routes + engine lifecycle + validator for
 research/reward settings + the operator-only Reaper stop helper; passes `rankings`,
-`strategyMix`, `rewards` and `engine.agents` through from the engine status), `client.js`
-(shared dashboard: sidebar entry + keyed `main` panel + settings page; names/genome-vs-spec/
-holdings/activity/research/cadence/rewards/leaderboards/plan/transactions/strategy-type/
-bot-agent-policy mapping are pure functions exported as `helpers` for tests),
-`locale/{en,zh}.json` (plugin metadata), `icon.svg`, `test/plugin.test.js`, `src/**`
-(engine implemented by the core project).
+`strategyMix`, `instruments`, `rewards` and `engine.agents` through from the engine
+status), `client.js` (shared dashboard: sidebar entry + keyed `main` panel + settings
+page; names/genome-vs-spec/holdings/activity/research/cadence/rewards/leaderboards/plan/
+transactions/strategy-type/bot-agent-policy/instrument-positions/playbook mapping are
+pure functions exported as `helpers` for tests), `locale/{en,zh}.json` (plugin metadata),
+`icon.svg`, `test/plugin.test.js`, `src/**` (engine implemented by the core project).
 

@@ -102,7 +102,7 @@ The review is written to `automaton-data/agents/<agentId>.jsonl` and returns a v
 `stance` (`trade`/`cautious`/`stand_down`), a size multiplier (0.2–1, only shrinks), an exit-pressure
 flag, confidence, thesis and plan. The Executor consumes the fresh policy next cycle: stand-down
 blocks new entries (exits still fire), size shrinks entries before every cap, exit pressure forces a
-position exit after any research ALERT. Execution and the 14 brakes remain deterministic so
+position exit after any research ALERT. Execution and the 18 hard brakes remain deterministic so
 minute-level reactions never wait on a model turn — the bot agent is the persistent "brain", the
 executor is the reflex. Reviews are charged to the bot (category `agent`) and survive restarts.
 Full contract: `docs/BOT-AGENTS.md`.
@@ -111,6 +111,20 @@ Full contract: `docs/BOT-AGENTS.md`.
 bots are day/intraday (1-minute lane). The tier is derived from the strategy family, replication
 inherits it from the mutated child genome, and genesis mixes a new population ~50/50. Status exposes
 the taxonomy per agent and a population `strategyMix` for the panel's category tabs.
+
+### Multi-instrument execution (v3.0)
+
+The population may express a strategy through more than long stock: **short stock, long calls/puts,
+covered calls and defined-risk vertical spreads**, with **margin** enabled inside hard caps. The
+instrument is chosen by the bot's own agent (`policy.instrument`) or its deterministic family
+playbook; the executor picks expiry/strikes within the DTE window, sizes by option-premium budget
+(25% of equity / $25 per order / mandate cap), and falls back to stock/short when options do not fit.
+Covered calls require 100 owned shares (rare at $50/bot, and denied without them); naked short
+options are never constructed and are denied by the brake wall. Every order is checked by brakes
+D2/D15–D18 (instrument permission, short sale, options structure/premium/DTE, margin debt,
+expiry guard) and booked into the signed/multi-asset ledger (option multiplier 100, spread groupId).
+On death the Reaper liquidates signed stock, options and spread legs before settling the estate.
+Full contract: `docs/INSTRUMENTS.md`; operations: `docs/RUNBOOK.md` §8d.
 
 ---
 
